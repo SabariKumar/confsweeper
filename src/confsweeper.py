@@ -48,7 +48,7 @@ def read_csv(input_csv: os.PathLike | str, write_uuids: bool = True) -> pd.DataF
             for _ in smi_df["smiles"]
         ]
         smi_df["uuid"] = uuids
-        smi_df.to_csv(input_csv.with_name(f"{basename}_uuids"), index=False)
+        smi_df.to_csv(input_csv.with_name(f"{basename}_uuids.csv"), index=False)
     return smi_df
 
 
@@ -62,6 +62,7 @@ def get_embed_params() -> rdkit.Chem.rdDistGeom.EmbedParameters:
     """
     params = ETKDGv3()
     params.useRandomCoords = True
+    return params
 
 
 def get_hardware_opts(
@@ -148,7 +149,7 @@ def get_mol_PE(
 
     to_remove = [x for x in range(n_confs) if x not in conf_ids]
     for id_ in to_remove:
-        mol.RemoveConfomer(id_)
+        mol.RemoveConformer(id_)
 
     writer = Chem.SDWriter(os.path.join(output_dir, uuid + ".sdf"))
 
