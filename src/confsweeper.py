@@ -104,6 +104,7 @@ def get_mol_PE(
     mace_calc,
     n_confs: int = 1000,
     cutoff_dist: float = 0.1,
+    save_lowest_energy: bool = False,
 ):
     """
     Save a multiSDF for a single smiles string.
@@ -117,6 +118,7 @@ def get_mol_PE(
         mace_calc : ASE MACE calculator from get_mace_calc
         n_confs: int : Number of confomers to use
         cutoff_dist: float : Distance threshold for Butina clustering
+        save_lowest_energy: bool : Save only the lowest energy conformer
     """
     mol = Chem.AddHs(Chem.MolFromSmiles(smi))
     embed.EmbedMolecules(
@@ -125,7 +127,7 @@ def get_mol_PE(
     coords = []
     for conf in mol.GetConformers():
         coords.append(conf.GetPositions())
-    coords = torch.tensor(coords)  # (N_CONFS, n_atoms, 3)
+    coords = torch.tensor(np.array(coords))  # (N_CONFS, n_atoms, 3)
     dists = torch.cdist(
         torch.flatten(coords, start_dim=1), torch.flatten(coords, start_dim=1), p=1.0
     ) / (3 * n_confs)
@@ -152,24 +154,36 @@ def get_mol_PE(
         mol.RemoveConformer(id_)
 
     writer = Chem.SDWriter(os.path.join(output_dir, uuid + ".sdf"))
-
-    for conf_id, ase_mol in zip(conf_ids, ase_mols):
-        mpe = ase_mol.get_potential_energy()
-        conf = mol.GetConformer(conf_id)
-        conf.SetDoubleProp("MACE_ENERGY", mpe)
-        mol.SetDoubleProp("MACE_ENERGY", mpe)
+    if save_lowest_energy:
+        energies = []
+        for conf_id, ase_mol in zip(conf_ids, ase_mols):
+            energies.append(ase_mol.get_potential_energy())
+        min_conf = conf_ids[energies.index(min(energies))]
+        conf = mol.GetConformer(min_conf)
+        conf.SetDoubleProp("MACE_ENERGY", min(energies))
+        mol.SetDoubleProp("MACE_ENERGY", min(energies))
         writer.write(mol, confId=conf_id)
+    else:
+        for conf_id, ase_mol in zip(conf_ids, ase_mols):
+            mpe = ase_mol.get_potential_energy()
+            conf = mol.GetConformer(conf_id)
+            conf.SetDoubleProp("MACE_ENERGY", mpe)
+            mol.SetDoubleProp("MACE_ENERGY", mpe)
+            writer.write(mol, confId=conf_id)
 
 
 @click.command()
 @click.option("--smi_csv")
 @click.option("--output_dir")
-def run_PE_calc(smi_csv: pd.DataFrame, output_dir: os.PathLike | str):
+@click.option("--save_lowest_energy", default=False)
+def run_PE_calc(
+    smi_csv: pd.DataFrame, output_dir: os.PathLike | str, save_lowest_energy: bool
+):
     params = get_embed_params()
     hardware_opts = get_hardware_opts()
     macemp = get_mace_calc()
     smi_df = read_csv(smi_csv)
-    for smi, uuid_ in tqdm(zip(smi_df["smiles"], smi_df["uuid"])):
+    for smi, uuid_ in tqdm(zip(smi_df["smiles"], smi_df["uuid"]), total=len(smi_df)):
         get_mol_PE(
             smi=smi,
             uuid=uuid_,
@@ -177,6 +191,7 @@ def run_PE_calc(smi_csv: pd.DataFrame, output_dir: os.PathLike | str):
             params=params,
             hardware_opts=hardware_opts,
             mace_calc=macemp,
+            save_lowest_energy=save_lowest_energy,
         )
 
 
