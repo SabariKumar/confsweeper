@@ -12,7 +12,6 @@ import nvmolkit
 import nvmolkit.embedMolecules as embed
 import pandas as pd
 import rdkit
-import scipy
 import torch
 from ase.build import molecule
 from mace.calculators import mace_mp
