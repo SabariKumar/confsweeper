@@ -128,7 +128,7 @@ def get_mol_PE(
     coords = torch.tensor(coords)  # (N_CONFS, n_atoms, 3)
     dists = torch.cdist(
         torch.flatten(coords, start_dim=1), torch.flatten(coords, start_dim=1), p=1.0
-    ) / (3 * 1000)
+    ) / (3 * n_confs)
     clusters = ClusterData(
         dists.numpy(),
         n_confs,
