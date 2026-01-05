@@ -52,7 +52,7 @@ numpy = "*"
 pandas = ">=2.3.2, <3"
 ase = ">=3.26.0, <4"
 pre-commit = ">=4.3.0, <5"
-pfestivus = {path = ".", editable = true}
+confsweeper = {path = ".", editable = true}
 isort = ">=6.0.1, <7"
 black = ">=25.1.0, <26"
 networkx = "*"
