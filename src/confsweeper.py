@@ -66,9 +66,9 @@ def get_embed_params() -> rdkit.Chem.rdDistGeom.EmbedParameters:
 
 
 def get_hardware_opts(
-    preprocessingThreads: int = 8,
+    preprocessingThreads: int = 16,
     batch_size: int = 500,
-    batchesPerGpu: int = 5,
+    batchesPerGpu: int = 16,
     gpuIds: List = [0],
 ) -> nvmolkit.types.HardwareOptions:
     """

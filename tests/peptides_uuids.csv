@@ -1,0 +1,7 @@
+smiles,sequence_name,uuid
+C[C@@H]1NC(=O)[C@@H]2CCCN2C(=O)[C@H](C)NC(=O)[C@H](CC(N)=O)NC1=O,N.A.P.A,bdd640fb06674ad19c80317fa3b1799d
+O=C1N[C@@H](CO)C(=O)N2CCC[C@H]2C(=O)N[C@@H](Cc2ccccc2)C(=O)N[C@H]1CS,P.F.C.S,23b8c1e9392446debeb13b9046685257
+CC[C@H](C)[C@@H]1NC(=O)[C@@H](Cc2ccccc2)NC(=O)CNC(=O)[C@H](CC(N)=O)NC1=O,f.I.N.G,bd9c66b3ad3c4d6d9a3d1fa7bc8960a9
+CC[C@H](C)[C@@H]1NC(=O)[C@H](C(C)C)NC(=O)[C@H]([C@@H](C)O)NC(=O)[C@H](C(C)C)NC1=O,I.V.T.V,972a846916414f828b9d2434e465e150
+C[C@@H]1NC(=O)[C@H](CCC(N)=O)NC(=O)[C@H](CC(N)=O)NC(=O)[C@H](CS)NC1=O,Q.A.C.N,17fc695a07a04a6e8822e8f36c031199
+CC(C)[C@H]1C(=O)N(C)[C@@H]([C@@H](C)O)C(=O)N(C)[C@@H](C(C)C)C(=O)N[C@@H](CCC(N)=O)C(=O)N1C,MeV.MeT.MeV.Q,9a1de644815e46d1bb8faa1837f8a88b
