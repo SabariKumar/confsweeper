@@ -2,7 +2,7 @@ import os
 import random
 import uuid
 from pathlib import Path
-from typing import List
+from typing import Callable, List, Tuple
 
 import ase
 import click
@@ -66,9 +66,9 @@ def get_embed_params() -> rdkit.Chem.rdDistGeom.EmbedParameters:
 
 
 def get_hardware_opts(
-    preprocessingThreads: int = 16,
+    preprocessingThreads: int = 4,
     batch_size: int = 500,
-    batchesPerGpu: int = 16,
+    batchesPerGpu: int = 2,
     gpuIds: List = [0],
 ) -> nvmolkit.types.HardwareOptions:
     """
@@ -78,6 +78,8 @@ def get_hardware_opts(
         batch_size: int : Molecules per batch
         batchesPerGpu: int : Concurrent batches on a single GPU
         gpuIds: List[int] : GPU CUDA IDs to use
+    Returns:
+        nvmolkit.types.HardwareOptions : NVMolKit hardware params
     """
 
     return HardwareOptions(
@@ -91,34 +93,36 @@ def get_hardware_opts(
 def get_mace_calc():
     """
     Convenience hook for subbing in different mace models.
+    Params:
+        None
+    Returns:
+        Callable: MACE calculator object
     """
     return mace_mp()
 
 
 def get_mol_PE(
     smi: str,
-    uuid: str,
-    output_dir: os.PathLike | str,
     params,
     hardware_opts,
     mace_calc,
     n_confs: int = 1000,
     cutoff_dist: float = 0.1,
-    save_lowest_energy: bool = False,
-):
+) -> Tuple:
     """
     Save a multiSDF for a single smiles string.
     Energy saved as "MACE_ENERGY" in the SDF for each conformer.
     Params:
         smi: str : input smiles string
-        uuid: str : molecule uuid
-        save_dir: os.PathLike | str : sdf save directory
         params : ETKDG params from get_embed_params
         hardware_opts : nvmolkit hardware options from get_hardware_opts
         mace_calc : ASE MACE calculator from get_mace_calc
         n_confs: int : Number of confomers to use
         cutoff_dist: float : Distance threshold for Butina clustering
-        save_lowest_energy: bool : Save only the lowest energy conformer
+    Returns:
+        rdkit.Chem.Mol : input mol object
+        List : list of valid rdkit conformer ids
+        List : list of ASE mol objects
     """
     mol = Chem.AddHs(Chem.MolFromSmiles(smi))
     embed.EmbedMolecules(
@@ -152,6 +156,28 @@ def get_mol_PE(
     to_remove = [x for x in range(n_confs) if x not in conf_ids]
     for id_ in to_remove:
         mol.RemoveConformer(id_)
+    return mol, conf_ids, ase_mols
+
+
+def write_sdf(
+    mol: rdkit.Chem.Mol,
+    conf_ids: List,
+    ase_mols: List,
+    id: str,
+    output_dir: os.PathLike | str,
+    save_lowest_energy: bool,
+) -> None:
+    """
+    Wrapper function to enable separation of conformer generation
+    Params:
+        mol: rdkit.Chem.Mol : input mol object
+        conf_ids: List : list of valid rdkit conformer ids
+        ase_mols: List : list of ASE mol objects
+        id: str : molecule uuid
+        save_dir: os.PathLike | str : sdf save directory
+    Returns:
+        None
+    """
 
     writer = Chem.SDWriter(os.path.join(output_dir, uuid + ".sdf"))
     if save_lowest_energy:
@@ -162,6 +188,7 @@ def get_mol_PE(
         conf = mol.GetConformer(min_conf)
         conf.SetDoubleProp("MACE_ENERGY", min(energies))
         mol.SetDoubleProp("MACE_ENERGY", min(energies))
+        mol.SetProp("id", id)
         writer.write(mol, confId=conf_id)
     else:
         for conf_id, ase_mol in zip(conf_ids, ase_mols):
@@ -169,6 +196,7 @@ def get_mol_PE(
             conf = mol.GetConformer(conf_id)
             conf.SetDoubleProp("MACE_ENERGY", mpe)
             mol.SetDoubleProp("MACE_ENERGY", mpe)
+            mol.SetProp("id", id)
             writer.write(mol, confId=conf_id)
 
 
@@ -184,13 +212,21 @@ def run_PE_calc(
     macemp = get_mace_calc()
     smi_df = read_csv(smi_csv)
     for smi, uuid_ in tqdm(zip(smi_df["smiles"], smi_df["uuid"]), total=len(smi_df)):
-        get_mol_PE(
+        mol, conf_ids, ase_mols = get_mol_PE(
             smi=smi,
             uuid=uuid_,
             output_dir=output_dir,
             params=params,
             hardware_opts=hardware_opts,
             mace_calc=macemp,
+            save_lowest_energy=save_lowest_energy,
+        )
+        write_sdf(
+            mol=mol,
+            conf_ids=conf_ids,
+            ase_mols=ase_mols,
+            id=uuid_,
+            output_dir=output_dir,
             save_lowest_energy=save_lowest_energy,
         )
 

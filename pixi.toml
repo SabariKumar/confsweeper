@@ -1,6 +1,6 @@
 [workspace]
 authors = ["Sabari Kumar <sabarinkumar@gmail.com>"]
-channels = ["dglteam/label/th24_cu124", "conda-forge", "https://prefix.dev/conda-forge",]
+channels = ["dglteam/label/th24_cu124", "conda-forge", "https://prefix.dev/conda-forge", ]
 name = "confsweeper"
 platforms = ["linux-64"]
 version = "0.1.0"
@@ -12,55 +12,32 @@ cuda = "12"
 
 [dependencies]
 python = ">=3.11, <3.13"
-#rdkit = ">=2023.9.5, <2025.3.4"
 rdkit = "*"
 pytorch-gpu = "==2.5.1"
-# cuda-version = "11.8.*"
 torch-scatter = "==2.1.1"
 pytorch_cluster = "==1.6.3"
 dgl = {version = ">2.0.0", channel="dglteam/label/th24_cu124"}
 jupyterlab = ">=4.5.1,<5"
 openbabel = ">=3.1.1,<4"
-transformers = ">=4.56.1,<5"
-accelerate = ">=1.10.1,<2"
-datasets = ">=4.0.0,<5"
-lightning = ">=2.5.5,<3"
-tensorboard = ">=2.20.0,<3"
 click = ">=8.2.1,<9"
 pytest = ">=8.4.2,<9"
 pyyaml = ">=6.0.2,<7"
-mdanalysis = ">=2.9.0,<3"
-marimo = ">=0.16.5,<0.17"
-pdbfixer = "*"
-openmmforcefields = "*"
-openmm = ">=8.3.1,<9"
-mdtraj = ">=1.11.0,<2"
-openff-toolkit = ">=0.17.1,<0.18"
-biopython = ">=1.85,<2"
-pyvista = ">=0.46.3,<0.47"
-plotly = ">=6.4.0,<7"
-molscrub = ">=0.2.2,<0.3"
-gemmi = ">=0.7.3,<0.8"
-pdb2pqr = ">=3.6.1,<4"
 ipykernel = ">=7.1.0,<8"
 nvmolkit = ">=0.3.0,<0.4"
+crest = ">=3.0.2,<4"
+numba = ">=0.63.1,<0.64"
 
 [pypi-dependencies]
-#rdkit = ">=2025.3.5, <2026"
-#rdkit = ">=2023.9.5, <2025.3.4"
+confsweeper = {path = ".", editable = true}
 numpy = "*"
 pandas = ">=2.3.2, <3"
 ase = ">=3.26.0, <4"
 pre-commit = ">=4.3.0, <5"
-confsweeper = {path = ".", editable = true}
 isort = ">=6.0.1, <7"
 black = ">=25.1.0, <26"
 networkx = "*"
 cclib = ">=1.8.1, <2"
-meeko = "*"
 mace-torch = ">=0.3.14, <0.4"
-# torch = { version = "==2.5.1", index = "https://download.pytorch.org/whl/cu124" }
-# torchvision = { version = ">=0.20.1", index = "https://download.pytorch.org/whl/cu124" }
 
 [activation.env]
 CONDA_OVERRIDE_CUDA = "12.2"
