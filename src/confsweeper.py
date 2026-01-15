@@ -214,12 +214,9 @@ def run_PE_calc(
     for smi, uuid_ in tqdm(zip(smi_df["smiles"], smi_df["uuid"]), total=len(smi_df)):
         mol, conf_ids, ase_mols = get_mol_PE(
             smi=smi,
-            uuid=uuid_,
-            output_dir=output_dir,
             params=params,
             hardware_opts=hardware_opts,
             mace_calc=macemp,
-            save_lowest_energy=save_lowest_energy,
         )
         write_sdf(
             mol=mol,
