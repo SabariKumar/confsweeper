@@ -1,16 +1,16 @@
 # Performs benchmarking on geom-drugs to find the number of
 # conformers recovered using confsweeper for different n_confs.
-
 import json
 import pickle
 from collections import Counter
+from copy import deepcopy
 
 import click
 import numpy as np
 import pandas as pd
 import rdkit
 from rdkit import Chem
-from rdkit.Chem import rdMolDescriptors
+from rdkit.Chem import rdMolAlign, rdMolDescriptors
 from tqdm import tqdm
 
 from confsweeper import *
@@ -116,8 +116,8 @@ def pairwise_rmsd(a: torch.Tensor, b: torch.Tensor):
 
 def calc_coverage(
     selected_pickle: dict,
-    n_confs: int = 1000,
-    butina_thresh: float = 0.1,
+    n_confs: int = 10000,
+    butina_thresh: float = 0.001,
     cutoff_dist: float = 0.5,
 ) -> Tuple:
 
@@ -150,32 +150,53 @@ def calc_coverage(
             cutoff_dist=butina_thresh,
         )
         # Check if each conformer is within 0.5 A rmsd to a conf in drugs_selected_pickle
-        geom_coords = torch.tensor(
-            np.array(
-                [
-                    _["rd_mol"].GetConformer().GetPositions()
-                    for _ in list(selected_pickle.values())[0]["conformers"]
-                ]
-            )
-        )
-        cs_pos = []
-        for conf in conf_ids:
-            cs_pos.append(mol.GetConformer(conf).GetPositions())
-        cs_pos = torch.tensor(np.array(cs_pos))
-        rmsds = pairwise_rmsd(cs_pos, geom_coords)
-        # TODO: Check whether multiple confsweeper confs match one geom -> adjust Butina thresh!
-        # Just see if multiple True on geom axis
-        # Count number of zeros, ones, and more than ones - any more than ones means that
-        # butina threshold is probably too high.
-        matches = rmsds < cutoff_dist
-        matches_ = matches.sum(axis=1).int()
-        matches_counts = torch.bincount(matches_)
-        coverage = matches_counts[1] / len(matches_)
+        matches = []
+        rmsds = []
+        for dat in list(selected_pickle.values())[0]["conformers"]:
+            geom_cid = dat["rd_mol"].GetConformer().GetId()
+            mol_ = deepcopy(mol)
+            match = 0
+            for cid in conf_ids:
+                rmsd = rdMolAlign.AlignMol(mol_, dat["rd_mol"], cid, geom_cid)
+                rmsds.append(rmsd)
+                if rmsd < cutoff_dist:
+                    match += 1
+            matches.append(match)
+        matches = torch.tensor(matches)
+        matches_counts = torch.bincount(matches)
+        coverage = matches_counts[1] / len(matches)
         coverages.append(coverage)
         if matches_counts[2:].any():
             multiple_matches.append(True)
         else:
             multiple_matches.append(False)
+
+        # geom_coords = torch.tensor(
+        #     np.array(
+        #         [
+        #             _["rd_mol"].GetConformer().GetPositions()
+        #             for _ in list(selected_pickle.values())[0]["conformers"]
+        #         ]
+        #     )
+        # )
+        # cs_pos = []
+        # for conf in conf_ids:
+        #     cs_pos.append(mol.GetConformer(conf).GetPositions())
+        # cs_pos = torch.tensor(np.array(cs_pos))
+        # rmsds = pairwise_rmsd(cs_pos, geom_coords)
+        # # TODO: Check whether multiple confsweeper confs match one geom -> adjust Butina thresh!
+        # # Just see if multiple True on geom axis
+        # # Count number of zeros, ones, and more than ones - any more than ones means that
+        # # butina threshold is probably too high.
+        # matches = rmsds < cutoff_dist
+        # matches_ = matches.sum(axis=1).int()
+        # matches_counts = torch.bincount(matches_)
+        # coverage = matches_counts[1] / len(matches_)
+        # coverages.append(coverage)
+        # if matches_counts[2:].any():
+        #     multiple_matches.append(True)
+        # else:
+        #     multiple_matches.append(False)
 
     return coverage, multiple_matches
 
