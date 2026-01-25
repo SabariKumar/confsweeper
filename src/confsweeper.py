@@ -15,6 +15,7 @@ import rdkit
 import torch
 from ase.build import molecule
 from mace.calculators import mace_mp
+from nvmolkit import clustering
 from nvmolkit.types import HardwareOptions
 from rdkit import Chem
 from rdkit.Chem.rdDistGeom import ETKDGv3
@@ -108,6 +109,7 @@ def get_mol_PE(
     mace_calc,
     n_confs: int = 1000,
     cutoff_dist: float = 0.1,
+    gpu_clustering: bool = True,
 ) -> Tuple:
     """
     Save a multiSDF for a single smiles string.
@@ -135,27 +137,64 @@ def get_mol_PE(
     dists = torch.cdist(
         torch.flatten(coords, start_dim=1), torch.flatten(coords, start_dim=1), p=1.0
     ) / (3 * n_confs)
-    clusters = ClusterData(
-        dists.numpy(),
-        n_confs,
-        cutoff_dist,
-        isDistData=True,
-        distFunc=None,
-        reordering=True,
-    )
-    rep_coords = [coords[clusters[x][0]].numpy() for x in range(len(clusters))]
-    conf_ids = [clusters[x][0] for x in range(len(clusters))]
-    atoms = [atom.GetAtomicNum() for atom in mol.GetAtoms()]
-    ase_mols = [
-        ase.Atoms(positions=rep_coord, numbers=atoms) for rep_coord in rep_coords
-    ]
-    for ase_mol in ase_mols:
-        ase_mol.calc = mace_calc
-        ase_mol.get_potential_energy()
+    if gpu_clustering:
+        # TODO: refactor to support dists on multiple gpus
+        clusters = clustering.butina(dists.to("cuda:0"), cutoff=cutoff_dist)
+        cluster_confs = {}
+        for cluster_id in set(clusters.tolist()):
+            conf_ids = np.argwhere(clusters == cluster_id).flatten()
+            geoms = []
+            for conf in conf_ids:
+                geoms.append(mol.GetConformer(int(conf)).GetPositions())
+            geoms = np.array(geoms)
+            geoms = np.abs(geoms - geoms.mean(axis=0))
+            cluster_confs[cluster_id] = int(
+                conf_ids[int(np.argmin([np.sum(x) for x in geoms]))]
+            )  # Conf id with minimum MAE to centroid
 
-    to_remove = [x for x in range(n_confs) if x not in conf_ids]
-    for id_ in to_remove:
-        mol.RemoveConformer(id_)
+        if len(set(cluster_confs.values())) == len(cluster_confs.values()):
+            raise ValueError(
+                "Duplicate conformer centroids found; reduce cutoff distance and rerun!"
+            )
+
+        rep_coords = [
+            mol.GetConformer(x).GetPositions() for x in cluster_confs.values()
+        ]
+        atoms = [atom.GetAtomicNum() for atom in mol.GetAtoms()]
+        ase_mols = [
+            ase.Atoms(positions=rep_coord, numbers=atoms) for rep_coord in rep_coords
+        ]
+        for ase_mol in ase_mols:
+            ase_mol.calc = mace_mp()
+            ase_mol.get_potential_energy()
+
+        to_remove = [x for x in range(1000) if x not in list(cluster_confs.values())]
+        for id_ in to_remove:
+            mol.RemoveConformer(id_)
+
+    else:
+        clusters = ClusterData(
+            dists.numpy(),
+            n_confs,
+            cutoff_dist,
+            isDistData=True,
+            distFunc=None,
+            reordering=True,
+        )
+        rep_coords = [coords[clusters[x][0]].numpy() for x in range(len(clusters))]
+        conf_ids = [clusters[x][0] for x in range(len(clusters))]
+        atoms = [atom.GetAtomicNum() for atom in mol.GetAtoms()]
+        ase_mols = [
+            ase.Atoms(positions=rep_coord, numbers=atoms) for rep_coord in rep_coords
+        ]
+        for ase_mol in ase_mols:
+            ase_mol.calc = mace_calc
+            ase_mol.get_potential_energy()
+
+        to_remove = [x for x in range(n_confs) if x not in conf_ids]
+        for id_ in to_remove:
+            mol.RemoveConformer(id_)
+
     return mol, conf_ids, ase_mols
 
 

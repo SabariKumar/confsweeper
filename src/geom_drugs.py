@@ -9,8 +9,12 @@ import click
 import numpy as np
 import pandas as pd
 import rdkit
+import spyrmsd
 from rdkit import Chem
 from rdkit.Chem import rdMolAlign, rdMolDescriptors
+from spyrmsd import io, rmsd
+from spyrmsd.molecule import Molecule
+from spyrmsd.rmsd import rmsdwrapper
 from tqdm import tqdm
 
 from confsweeper import *
@@ -116,9 +120,10 @@ def pairwise_rmsd(a: torch.Tensor, b: torch.Tensor):
 
 def calc_coverage(
     selected_pickle: dict,
-    n_confs: int = 10000,
+    n_confs: int = 5000,
     butina_thresh: float = 0.001,
-    cutoff_dist: float = 0.5,
+    cutoff_dist: float = 0.05,
+    use_spyrmsd: bool = True,
 ) -> Tuple:
 
     """
@@ -136,7 +141,11 @@ def calc_coverage(
     """
 
     params = get_embed_params()
-    hardware_opts = get_hardware_opts()
+    hardware_opts = get_hardware_opts(
+        preprocessingThreads=8,
+        batch_size=1000,
+        batchesPerGpu=2,
+    )
     macemp = get_mace_calc()
     coverages = []
     multiple_matches = []
@@ -157,7 +166,12 @@ def calc_coverage(
             mol_ = deepcopy(mol)
             match = 0
             for cid in conf_ids:
-                rmsd = rdMolAlign.AlignMol(mol_, dat["rd_mol"], cid, geom_cid)
+                if use_spyrmsd:
+                    ref = Molecule.from_rdkit(Chem.Mol(mol_, confId=cid))
+                    comp = Molecule.from_rdkit(dat["rd_mol"])
+                    rmsd = rmsdwrapper(ref, comp)[0]
+                else:
+                    rmsd = rdMolAlign.AlignMol(mol_, dat["rd_mol"], cid, geom_cid)
                 rmsds.append(rmsd)
                 if rmsd < cutoff_dist:
                     match += 1
