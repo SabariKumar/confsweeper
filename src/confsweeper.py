@@ -139,7 +139,7 @@ def get_mol_PE(
     ) / (3 * n_confs)
     if gpu_clustering:
         # TODO: refactor to support dists on multiple gpus
-        clusters = clustering.butina(dists.to("cuda:0"), cutoff=cutoff_dist)
+        clusters = clustering.butina(dists.to("cuda:0"), cutoff=cutoff_dist).numpy()
         cluster_confs = {}
         for cluster_id in set(clusters.tolist()):
             conf_ids = np.argwhere(clusters == cluster_id).flatten()
@@ -152,7 +152,7 @@ def get_mol_PE(
                 conf_ids[int(np.argmin([np.sum(x) for x in geoms]))]
             )  # Conf id with minimum MAE to centroid
 
-        if len(set(cluster_confs.values())) == len(cluster_confs.values()):
+        if len(set(cluster_confs.values())) != len(cluster_confs.values()):
             raise ValueError(
                 "Duplicate conformer centroids found; reduce cutoff distance and rerun!"
             )
@@ -171,6 +171,7 @@ def get_mol_PE(
         to_remove = [x for x in range(1000) if x not in list(cluster_confs.values())]
         for id_ in to_remove:
             mol.RemoveConformer(id_)
+        conf_ids = cluster_confs.values()
 
     else:
         clusters = ClusterData(
@@ -218,7 +219,7 @@ def write_sdf(
         None
     """
 
-    writer = Chem.SDWriter(os.path.join(output_dir, uuid + ".sdf"))
+    writer = Chem.SDWriter(os.path.join(output_dir, id + ".sdf"))
     if save_lowest_energy:
         energies = []
         for conf_id, ase_mol in zip(conf_ids, ase_mols):
