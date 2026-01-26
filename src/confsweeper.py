@@ -1,6 +1,8 @@
+import contextlib
 import os
 import random
 import uuid
+import warnings
 from pathlib import Path
 from typing import Callable, List, Tuple
 
@@ -21,6 +23,9 @@ from rdkit import Chem
 from rdkit.Chem.rdDistGeom import ETKDGv3
 from rdkit.ML.Cluster.Butina import ClusterData
 from tqdm import tqdm
+
+warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
 
 RANDOM_SEED = 42
 rd = random.Random()
@@ -69,7 +74,7 @@ def get_embed_params() -> rdkit.Chem.rdDistGeom.EmbedParameters:
 def get_hardware_opts(
     preprocessingThreads: int = 4,
     batch_size: int = 500,
-    batchesPerGpu: int = 2,
+    batchesPerGpu: int = 1,
     gpuIds: List = [0],
 ) -> nvmolkit.types.HardwareOptions:
     """
@@ -161,17 +166,22 @@ def get_mol_PE(
             mol.GetConformer(x).GetPositions() for x in cluster_confs.values()
         ]
         atoms = [atom.GetAtomicNum() for atom in mol.GetAtoms()]
-        ase_mols = [
-            ase.Atoms(positions=rep_coord, numbers=atoms) for rep_coord in rep_coords
-        ]
-        for ase_mol in ase_mols:
+        pe = []
+
+        for coords in rep_coords:
+            ase_mol = ase.Atoms(positions=coords, numbers=atoms)
+            # The below pops list elements to avoid CUDA memory overflow errors.
+            # NOTE THAT ORDER IS REVERSED!!!
             ase_mol.calc = mace_mp()
-            ase_mol.get_potential_energy()
+            pe.append(ase_mol.get_potential_energy())
+            del ase_mol
+            torch.cuda.empty_cache()
 
         to_remove = [x for x in range(1000) if x not in list(cluster_confs.values())]
         for id_ in to_remove:
             mol.RemoveConformer(id_)
         conf_ids = cluster_confs.values()
+        return mol, conf_ids, pe
 
     else:
         clusters = ClusterData(
@@ -188,21 +198,23 @@ def get_mol_PE(
         ase_mols = [
             ase.Atoms(positions=rep_coord, numbers=atoms) for rep_coord in rep_coords
         ]
+        pe = []
         for ase_mol in ase_mols:
-            ase_mol.calc = mace_calc
-            ase_mol.get_potential_energy()
+            with open(os.devnull, "w") as devnull:
+                with contextlib.redirect_stdout(devnull):
+                    ase_mol.calc = mace_calc
+                    pe.append(ase_mol.get_potential_energy())
 
         to_remove = [x for x in range(n_confs) if x not in conf_ids]
         for id_ in to_remove:
             mol.RemoveConformer(id_)
-
-    return mol, conf_ids, ase_mols
+        return mol, conf_ids, pe
 
 
 def write_sdf(
     mol: rdkit.Chem.Mol,
     conf_ids: List,
-    ase_mols: List,
+    pe: List,
     id: str,
     output_dir: os.PathLike | str,
     save_lowest_energy: bool,
@@ -212,7 +224,7 @@ def write_sdf(
     Params:
         mol: rdkit.Chem.Mol : input mol object
         conf_ids: List : list of valid rdkit conformer ids
-        ase_mols: List : list of ASE mol objects
+        pe: List : list of ASE mol objects
         id: str : molecule uuid
         save_dir: os.PathLike | str : sdf save directory
     Returns:
@@ -221,21 +233,17 @@ def write_sdf(
 
     writer = Chem.SDWriter(os.path.join(output_dir, id + ".sdf"))
     if save_lowest_energy:
-        energies = []
-        for conf_id, ase_mol in zip(conf_ids, ase_mols):
-            energies.append(ase_mol.get_potential_energy())
-        min_conf = conf_ids[energies.index(min(energies))]
+        min_conf = conf_ids[pe.index(min(pe))]
         conf = mol.GetConformer(min_conf)
-        conf.SetDoubleProp("MACE_ENERGY", min(energies))
-        mol.SetDoubleProp("MACE_ENERGY", min(energies))
+        conf.SetDoubleProp("MACE_ENERGY", min(pe))
+        mol.SetDoubleProp("MACE_ENERGY", min(pe))
         mol.SetProp("id", id)
         writer.write(mol, confId=conf_id)
     else:
-        for conf_id, ase_mol in zip(conf_ids, ase_mols):
-            mpe = ase_mol.get_potential_energy()
+        for conf_id, pe_ in zip(conf_ids, pe):
             conf = mol.GetConformer(conf_id)
-            conf.SetDoubleProp("MACE_ENERGY", mpe)
-            mol.SetDoubleProp("MACE_ENERGY", mpe)
+            conf.SetDoubleProp("MACE_ENERGY", pe_)
+            mol.SetDoubleProp("MACE_ENERGY", pe_)
             mol.SetProp("id", id)
             writer.write(mol, confId=conf_id)
 
@@ -252,7 +260,7 @@ def run_PE_calc(
     macemp = get_mace_calc()
     smi_df = read_csv(smi_csv)
     for smi, uuid_ in tqdm(zip(smi_df["smiles"], smi_df["uuid"]), total=len(smi_df)):
-        mol, conf_ids, ase_mols = get_mol_PE(
+        mol, conf_ids, pe = get_mol_PE(
             smi=smi,
             params=params,
             hardware_opts=hardware_opts,
@@ -261,7 +269,7 @@ def run_PE_calc(
         write_sdf(
             mol=mol,
             conf_ids=conf_ids,
-            ase_mols=ase_mols,
+            pe=pe,
             id=uuid_,
             output_dir=output_dir,
             save_lowest_energy=save_lowest_energy,

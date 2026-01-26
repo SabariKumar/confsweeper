@@ -1,7 +1,9 @@
 # Performs benchmarking on geom-drugs to find the number of
 # conformers recovered using confsweeper for different n_confs.
+
 import json
 import pickle
+import sys
 from collections import Counter
 from copy import deepcopy
 
@@ -17,7 +19,13 @@ from spyrmsd.molecule import Molecule
 from spyrmsd.rmsd import rmsdwrapper
 from tqdm import tqdm
 
-from confsweeper import *
+sys.path.insert(1, "/home/sabari/confsweeper")
+import warnings
+
+from src.confsweeper import *
+
+warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
 
 
 def get_max_rotatable_bonds(
@@ -120,9 +128,9 @@ def pairwise_rmsd(a: torch.Tensor, b: torch.Tensor):
 
 def calc_coverage(
     selected_pickle: dict,
-    n_confs: int = 5000,
-    butina_thresh: float = 0.001,
-    cutoff_dist: float = 0.05,
+    n_confs: int = 1000,
+    butina_thresh: float = 0.1,
+    cutoff_rmsd: float = 0.05,
     use_spyrmsd: bool = True,
 ) -> Tuple:
 
@@ -150,18 +158,19 @@ def calc_coverage(
     coverages = []
     multiple_matches = []
     for smi in tqdm(selected_pickle.keys()):
-        mol, conf_ids, ase_mols = get_mol_PE(
+        mol, conf_ids, pe = get_mol_PE(
             smi=smi,
             params=params,
             hardware_opts=hardware_opts,
             mace_calc=macemp,
             n_confs=n_confs,
             cutoff_dist=butina_thresh,
+            gpu_clustering=True,
         )
         # Check if each conformer is within 0.5 A rmsd to a conf in drugs_selected_pickle
         matches = []
         rmsds = []
-        for dat in list(selected_pickle.values())[0]["conformers"]:
+        for dat in selected_pickle[smi]["conformers"]:
             geom_cid = dat["rd_mol"].GetConformer().GetId()
             mol_ = deepcopy(mol)
             match = 0
@@ -173,7 +182,7 @@ def calc_coverage(
                 else:
                     rmsd = rdMolAlign.AlignMol(mol_, dat["rd_mol"], cid, geom_cid)
                 rmsds.append(rmsd)
-                if rmsd < cutoff_dist:
+                if rmsd < cutoff_rmsd:
                     match += 1
             matches.append(match)
         matches = torch.tensor(matches)
