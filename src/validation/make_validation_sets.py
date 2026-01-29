@@ -69,8 +69,21 @@ def get_max_rotatable(
         None
     """
     rot_bonds = {}
-    for smi in tqdm(summary_dict.keys()):
-        rot_bonds[smi] = get_rotatable_bonds(smi)
+    errors = []
+    for smi in tqdm(
+        summary_dict.keys(), desc="Calculating rotatable bonds for full dataset "
+    ):
+        try:
+            rot_bonds[smi] = get_rotatable_bonds(smi)
+        except:
+            errors.append(smi)
+
+    with open(
+        os.path.join(validation_pickle_dir, f"{summary_prefix}_errors.txt"),
+        "w",
+    ) as outfile:
+        for smi in errors:
+            outfile.write(f"{smi}\n")
 
     max_rotatable = Counter(rot_bonds).most_common(
         10000
@@ -78,7 +91,10 @@ def get_max_rotatable(
 
     selected_rotatable = {}
     selected_pickles = {}
-    for ind, smi in tqdm([(ind, x[0]) for ind, x in enumerate(max_rotatable)]):
+    for ind, smi in tqdm(
+        [(ind, x[0]) for ind, x in enumerate(max_rotatable)],
+        desc="Checking for valid geom-drugs pickle ",
+    ):
         if len(selected_rotatable) < 1000:
             path = summary_dict[smi].get("pickle_path", None)
             if path is not None:
@@ -95,11 +111,29 @@ def get_max_rotatable(
     for key in selected_pickles.keys():
         del summary_dict[key]
 
-    key_ = random.sample(list(summary_dict.keys()), 1000)
-    val_ = [summary_dict[x] for x in key_]
-    random_pickles = dict(zip(key_, val_))
-    for smi in tqdm(random_pickles.keys()):
-        random_pickles[smi]["rotatablebonds"] = get_rotatable_bonds(smi)
+    random_smis = random.sample(list(summary_dict.keys()), 10000)
+    # val_ = [summary_dict[x] for x in key_]
+    random_pickles = {}
+    for smi in tqdm(random_smis, desc="Calculating rotatble bonds for random sample "):
+        if len(random_pickles) <= 1000:
+            try:
+                path = summary_dict[smi].get("pickle_path", None)
+                if path is not None:
+                    path = os.path.join(geom_drugs_dir, path)
+                    with open(path, "rb") as picklefile:
+                        random_pickles[smi] = pickle.load(picklefile)
+                    random_pickles[smi]["rotatablebonds"] = get_rotatable_bonds(smi)
+            except:
+                errors.append(smi)
+
+    with open(
+        os.path.join(
+            validation_pickle_dir, f"{summary_prefix}_random_sample_errors.txt"
+        ),
+        "w",
+    ) as outfile:
+        for smi in errors:
+            outfile.write(f"{smi}\n")
 
     with open(
         os.path.join(validation_pickle_dir, f"{summary_prefix}_maxrotatable.pickle"),
@@ -113,23 +147,33 @@ def get_max_rotatable(
         pickle.dump(random_pickles, outfile)
 
     if make_plots:
-        for pre_, set_ in {"max_rotatable": selected_pickles, "random": random_pickles}:
+        for pre_, set_ in {
+            "max_rotatable": selected_pickles,
+            "random": random_pickles,
+        }.items():
             n_rot_ = []
             n_heavy_ats = []
-            for smi in random_pickles.keys():
+            for smi in set_.keys():
                 n_rot_.append(set_[smi]["rotatablebonds"])
                 n_heavy_ats.append(
-                    rdMolDescriptors.CalcNumHeavyAtoms(Chem.MolFromSmiles(set_[smi]))
+                    rdMolDescriptors.CalcNumHeavyAtoms(Chem.MolFromSmiles(smi))
                 )
             n_rot_ = np.array(n_rot_)
             plt.hist(n_rot_, bins="auto")
             plt.title("Number of Rotatable Bonds")
             plt.savefig(
-                os.path.join(make_plots, f"{pre_}_rotatable_bond_distribution.svg")
+                os.path.join(
+                    make_plots,
+                    f"{summary_prefix}_{pre_}_rotatable_bond_distribution.svg",
+                )
             )
             plt.hist(n_heavy_ats, bins="auto")
             plt.title("Number of Heavy Atoms")
-            plt.savefig(os.path.join(make_plots, f"{pre_}_heavy_atom_distribution.svg"))
+            plt.savefig(
+                os.path.join(
+                    make_plots, f"{summary_prefix}_{pre_}_heavy_atom_distribution.svg"
+                )
+            )
 
 
 def get_all_rot(summary_file_dict: dict) -> None:

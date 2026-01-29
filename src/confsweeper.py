@@ -16,7 +16,7 @@ import pandas as pd
 import rdkit
 import torch
 from ase.build import molecule
-from mace.calculators import mace_mp
+from mace.calculators import mace_mp, mace_off
 from nvmolkit import clustering
 from nvmolkit.types import HardwareOptions
 from rdkit import Chem
@@ -104,7 +104,7 @@ def get_mace_calc():
     Returns:
         Callable: MACE calculator object
     """
-    return mace_mp()
+    return mace_off(model="medium", device="cuda", default_dtype="float32")
 
 
 def get_mol_PE(
@@ -170,9 +170,7 @@ def get_mol_PE(
 
         for coords in rep_coords:
             ase_mol = ase.Atoms(positions=coords, numbers=atoms)
-            # The below pops list elements to avoid CUDA memory overflow errors.
-            # NOTE THAT ORDER IS REVERSED!!!
-            ase_mol.calc = mace_mp()
+            ase_mol.calc = mace_calc
             pe.append(ase_mol.get_potential_energy())
             del ase_mol
             torch.cuda.empty_cache()

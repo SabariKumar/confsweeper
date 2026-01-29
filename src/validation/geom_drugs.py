@@ -187,7 +187,10 @@ def calc_coverage(
             matches.append(match)
         matches = torch.tensor(matches)
         matches_counts = torch.bincount(matches)
-        coverage = matches_counts[1] / len(matches)
+        if len(matches_counts) > 1:
+            coverage = matches_counts[1] / len(matches)
+        else:
+            coverage = 0
         coverages.append(coverage)
         if matches_counts[2:].any():
             multiple_matches.append(True)

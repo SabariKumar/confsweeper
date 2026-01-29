@@ -28,6 +28,10 @@ crest = ">=3.0.2,<4"
 numba = ">=0.63.1,<0.64"
 spyrmsd = ">=0.9.0,<0.10"
 cuequivariance-torch = ">=0.8.1,<0.9"
+datamol = ">=0.12.5,<0.13"
+ipywidgets = ">=8.1.8,<9"
+nglview = ">=4.0,<5"
+gudhi = ">=3.11.0,<4"
 
 [pypi-dependencies]
 confsweeper = {path = ".", editable = true}
