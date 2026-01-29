@@ -87,3 +87,5 @@ SECRETS.py
 /output/
 /results/
 /wandb/
+.ipynb
+.ipynb_checkpoints
