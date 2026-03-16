@@ -323,6 +323,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/linux-64/zlib-ng-2.2.5-hde8ca8f_1.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/zstandard-0.25.0-py312h5253ce2_1.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/zstd-1.5.7-hb78ec9c_6.conda
+      - pypi: https://files.pythonhosted.org/packages/00/b7/e3bf5133d697a08128598c8d0abc5e16377b51465a33756de24fa7dee953/aiosqlite-0.22.1-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/3e/9b/9b55b4d4855743de61ba91566d03b2560285ed8fc0387b9cf914795d4abf/ase-3.27.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/6d/f3/360fa4182e36e9875fabcf3a9717db9d27a8d11870f21cff97725c54f35b/black-25.12.0-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/dc/76/96b7ffc917962e6f74bff1ec850838796f58bedceac6f610834898af6462/cclib-1.8.1-py3-none-any.whl
@@ -345,6 +346,7 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/46/bf/0993b5a056759ba65145effe3a79dd5a939d4a070eaa5da2ee3180fbb13f/orjson-3.11.5-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/cc/20/ff623b09d963f88bfde16306a54e12ee5ea43e9b597108672ff3a408aad6/pathspec-0.12.1-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/82/e4/f2a338abfb5a6b9e2a48dc4acaa9df0bd94126df336ab403178f6a7a901a/periodictable-2.0.2-py3-none-any.whl
+      - pypi: https://files.pythonhosted.org/packages/29/7f/ae7a32f125c6165941ed5c547bff7e6fbd385658fc6e490c2ee73c78c4c2/pickleDB-0.9.2.tar.gz
       - pypi: https://files.pythonhosted.org/packages/5d/19/fd3ef348460c80af7bb4669ea7926651d1f95c23ff2df18b9d24bab4f3fa/pre_commit-4.5.1-py2.py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/ee/8c/83087ebc47ab0396ce092363001fa37c17153119ee282700c0713a195853/prettytable-3.17.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/90/cc/bb6395c3f2b6bb739b1d3fc0e71f94e6a1c2e256df496237cbfd13cd74a6/python_hostlist-2.3.0.tar.gz
@@ -377,6 +379,24 @@ packages:
   purls: []
   size: 8191
   timestamp: 1744137672556
+- pypi: https://files.pythonhosted.org/packages/00/b7/e3bf5133d697a08128598c8d0abc5e16377b51465a33756de24fa7dee953/aiosqlite-0.22.1-py3-none-any.whl
+  name: aiosqlite
+  version: 0.22.1
+  sha256: 21c002eb13823fad740196c5a2e9d8e62f6243bd9e7e4a1f87fb5e44ecb4fceb
+  requires_dist:
+  - attribution==1.8.0 ; extra == 'dev'
+  - black==25.11.0 ; extra == 'dev'
+  - build>=1.2 ; extra == 'dev'
+  - coverage[toml]==7.10.7 ; extra == 'dev'
+  - flake8==7.3.0 ; extra == 'dev'
+  - flake8-bugbear==24.12.12 ; extra == 'dev'
+  - flit==3.12.0 ; extra == 'dev'
+  - mypy==1.19.0 ; extra == 'dev'
+  - ufmt==2.8.0 ; extra == 'dev'
+  - usort==1.0.8.post1 ; extra == 'dev'
+  - sphinx==8.1.3 ; extra == 'docs'
+  - sphinx-mdinclude==0.6.2 ; extra == 'docs'
+  requires_python: '>=3.9'
 - conda: https://conda.anaconda.org/conda-forge/noarch/anyio-4.12.0-pyhcf101f3_0.conda
   sha256: 830fc81970cd9d19869909b9b16d241f4d557e4f201a1030aa6ed87c6aa8b930
   md5: 9958d4a1ee7e9c768fe8f4fb51bd07ea
@@ -3651,6 +3671,10 @@ packages:
   - pkg:pypi/pexpect?source=hash-mapping
   size: 53561
   timestamp: 1733302019362
+- pypi: https://files.pythonhosted.org/packages/29/7f/ae7a32f125c6165941ed5c547bff7e6fbd385658fc6e490c2ee73c78c4c2/pickleDB-0.9.2.tar.gz
+  name: pickledb
+  version: 0.9.2
+  sha256: ec6973e65d7d112849e78ce522840aa908efb2523470bb8ce5c7942310192240
 - conda: https://conda.anaconda.org/conda-forge/linux-64/pillow-12.0.0-py312h898c6c0_1.conda
   sha256: b087b123b727f26840c39e417aa64c58cfdb5509a33b5606e4b3a7a149a4ce3c
   md5: 11211a7e278e7dd5ce6e643c1bea2d14

@@ -44,6 +44,8 @@ black = ">=25.1.0, <26"
 networkx = "*"
 cclib = ">=1.8.1, <2"
 mace-torch = ">=0.3.14, <0.4"
+pickledb = { version = ">=0.9, <1", extras = ["sqlite"] }
+aiosqlite = ">=0.20, <1"
 
 [activation.env]
 CONDA_OVERRIDE_CUDA = "12.2"
