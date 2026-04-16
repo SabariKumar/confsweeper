@@ -166,26 +166,27 @@ def get_mol_PE(
     ) / (3 * n_confs)
     if gpu_clustering:
         # TODO: refactor to support dists on multiple gpus
-        clusters, centroids = clustering.butina(
+        # butina returns a tuple of AsyncGpuResult objects when return_centroids=True
+        clusters_result, centroids_result = clustering.butina(
             dists.to("cuda:0"), cutoff=cutoff_dist, return_centroids=True
-        ).numpy()
-        centroids = centroids.numpy()
-        rep_coords = [mol.GetConformer(x).GetPositions() for x in centroids.values()]
+        )
+        # centroids is a 1-D array of conformer indices, one per cluster
+        centroid_ids = centroids_result.numpy().tolist()
+        rep_coords = [mol.GetConformer(x).GetPositions() for x in centroid_ids]
         atoms = [atom.GetAtomicNum() for atom in mol.GetAtoms()]
         pe = []
 
-        for coords in rep_coords:
-            ase_mol = ase.Atoms(positions=coords, numbers=atoms)
+        for conf_coords in rep_coords:
+            ase_mol = ase.Atoms(positions=conf_coords, numbers=atoms)
             ase_mol.calc = mace_calc
             pe.append(ase_mol.get_potential_energy())
             del ase_mol
             torch.cuda.empty_cache()
 
-        to_remove = [x for x in range(n_confs) if x not in list(centroids.values())]
+        to_remove = [x for x in range(n_confs) if x not in centroid_ids]
         for id_ in to_remove:
             mol.RemoveConformer(id_)
-        conf_ids = centroids.values()
-        return mol, conf_ids, pe
+        return mol, centroid_ids, pe
 
     else:
         clusters = ClusterData(
