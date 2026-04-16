@@ -10,6 +10,7 @@ from rdkit.Chem.rdDistGeom import EmbedParameters
 
 from confsweeper import (
     get_embed_params,
+    get_embed_params_macrocycle,
     get_hardware_opts,
     get_mol_PE,
     read_csv,
@@ -43,6 +44,43 @@ def test_get_embed_params_type():
 def test_get_embed_params_random_coords():
     params = get_embed_params()
     assert params.useRandomCoords is True
+
+
+# ---------------------------------------------------------------------------
+# get_embed_params_macrocycle
+# ---------------------------------------------------------------------------
+
+
+def test_get_embed_params_macrocycle_type():
+    params = get_embed_params_macrocycle()
+    assert isinstance(params, EmbedParameters)
+
+
+def test_get_embed_params_macrocycle_random_coords():
+    params = get_embed_params_macrocycle()
+    assert params.useRandomCoords is True
+
+
+def test_get_embed_params_macrocycle_torsions_enabled():
+    params = get_embed_params_macrocycle()
+    assert params.useMacrocycleTorsions is True
+
+
+def test_get_embed_params_macrocycle_14config_enabled():
+    params = get_embed_params_macrocycle()
+    assert params.useMacrocycle14config is True
+
+
+def test_get_embed_params_macrocycle_small_ring_torsions_enabled():
+    params = get_embed_params_macrocycle()
+    assert params.useSmallRingTorsions is True
+
+
+def test_get_embed_params_macrocycle_differs_from_default():
+    # useSmallRingTorsions is the key addition — off by default in ETKDGv3
+    default = get_embed_params()
+    macro = get_embed_params_macrocycle()
+    assert macro.useSmallRingTorsions != default.useSmallRingTorsions
 
 
 # ---------------------------------------------------------------------------

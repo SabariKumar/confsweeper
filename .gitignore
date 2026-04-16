@@ -10,6 +10,7 @@ docs/reference/*
 
 # Python ignores
 __pycache__/
+*.pyc
 *.py[cod]
 *$py.class
 .Python
@@ -89,3 +90,4 @@ SECRETS.py
 /wandb/
 .ipynb
 .ipynb_checkpoints
+sandbox/
