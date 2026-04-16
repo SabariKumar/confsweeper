@@ -144,27 +144,11 @@ def get_mol_PE(
     ) / (3 * n_confs)
     if gpu_clustering:
         # TODO: refactor to support dists on multiple gpus
-        clusters = clustering.butina(dists.to("cuda:0"), cutoff=cutoff_dist).numpy()
-        cluster_confs = {}
-        for cluster_id in set(clusters.tolist()):
-            conf_ids = np.argwhere(clusters == cluster_id).flatten()
-            geoms = []
-            for conf in conf_ids:
-                geoms.append(mol.GetConformer(int(conf)).GetPositions())
-            geoms = np.array(geoms)
-            geoms = np.abs(geoms - geoms.mean(axis=0))
-            cluster_confs[cluster_id] = int(
-                conf_ids[int(np.argmin([np.sum(x) for x in geoms]))]
-            )  # Conf id with minimum MAE to centroid
-
-        if len(set(cluster_confs.values())) != len(cluster_confs.values()):
-            raise ValueError(
-                "Duplicate conformer centroids found; reduce cutoff distance and rerun!"
-            )
-
-        rep_coords = [
-            mol.GetConformer(x).GetPositions() for x in cluster_confs.values()
-        ]
+        clusters, centroids = clustering.butina(
+            dists.to("cuda:0"), cutoff=cutoff_dist, return_centroids=True
+        ).numpy()
+        centroids = centroids.numpy()
+        rep_coords = [mol.GetConformer(x).GetPositions() for x in centroids.values()]
         atoms = [atom.GetAtomicNum() for atom in mol.GetAtoms()]
         pe = []
 
@@ -175,10 +159,10 @@ def get_mol_PE(
             del ase_mol
             torch.cuda.empty_cache()
 
-        to_remove = [x for x in range(1000) if x not in list(cluster_confs.values())]
+        to_remove = [x for x in range(n_confs) if x not in list(centroids.values())]
         for id_ in to_remove:
             mol.RemoveConformer(id_)
-        conf_ids = cluster_confs.values()
+        conf_ids = centroids.values()
         return mol, conf_ids, pe
 
     else:

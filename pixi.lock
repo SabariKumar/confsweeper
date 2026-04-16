@@ -209,7 +209,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/noarch/notebook-shim-0.2.4-pyhd8ed1ab_1.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/numba-0.63.1-py312hd1dde6f_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/numpy-2.2.6-py312h72c5963_0.conda
-      - conda: https://conda.anaconda.org/conda-forge/linux-64/nvmolkit-0.3.0-py312h8f89117_1.conda
+      - conda: https://conda.anaconda.org/conda-forge/linux-64/nvmolkit-0.4.0-py312h8f89117_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/openbabel-3.1.1-py312hbfe4552_9.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/openjpeg-2.5.4-h55fea9a_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/openldap-2.6.10-he970967_0.conda
@@ -822,7 +822,7 @@ packages:
 - pypi: ./
   name: confsweeper
   version: 0.0.1
-  sha256: e31593f65c10ad03528511eb6c4969d7b6d84fc3118a12a8ff743e3e9284c688
+  sha256: 491abd4c49f23c2a90eccfa857de641b84b50da9c8daa5b2674206308463e6e0
   requires_python: '>=3.11'
   editable: true
 - conda: https://conda.anaconda.org/conda-forge/linux-64/contourpy-1.3.3-py312hd9148b4_3.conda
@@ -3410,33 +3410,33 @@ packages:
   - pkg:pypi/numpy?source=hash-mapping
   size: 8490501
   timestamp: 1747545073507
-- conda: https://conda.anaconda.org/conda-forge/linux-64/nvmolkit-0.3.0-py312h8f89117_1.conda
-  sha256: 6b51431849286685e84947ecc75a555f80daee6cdca239212fece427cbffdd15
-  md5: e2e8b057b8eba033d4225782f84136cb
+- conda: https://conda.anaconda.org/conda-forge/linux-64/nvmolkit-0.4.0-py312h8f89117_0.conda
+  sha256: 80705cc034fd38c2cdfc867434621f13aa7b1fdf7db7a161fbc2cbaedd709dd9
+  md5: f9dba4e2742333ad03df560a1a11b8e1
   depends:
   - numpy
   - python
   - pytorch
   - rdkit ==2025.9.3
   - libgcc >=14
-  - cuda-version >=12.9,<13
   - __glibc >=2.17,<3.0.a0
   - libstdcxx >=14
+  - cuda-version >=12.9,<13
   - _openmp_mutex >=4.5
-  - libcublas >=12.9.1.4,<13.0a0
-  - cuda-nvtx >=12.9.79,<13.0a0
   - python_abi 3.12.* *_cp312
-  - cuda-cudart >=12.9.79,<13.0a0
+  - libboost-python >=1.86.0,<1.87.0a0
   - libboost >=1.86.0,<1.87.0a0
+  - cuda-cudart >=12.9.79,<13.0a0
+  - cuda-nvtx >=12.9.79,<13.0a0
   - libcurand >=10.3.10.19,<11.0a0
   - libcusolver >=11.7.5.82,<12.0a0
-  - libboost-python >=1.86.0,<1.87.0a0
+  - libcublas >=12.9.1.4,<13.0a0
   license: Apache-2.0
   license_family: APACHE
   purls:
   - pkg:pypi/nvmolkit?source=hash-mapping
-  size: 7633631
-  timestamp: 1765389784590
+  size: 8604122
+  timestamp: 1771966121763
 - conda: https://conda.anaconda.org/conda-forge/linux-64/openbabel-3.1.1-py312hbfe4552_9.conda
   sha256: c1dda107511a20b043dfe94c562cf607833cbd29ffcf612ed4b65b5b04fa8a24
   md5: ee90095bf561ca94b55283643200bd9b

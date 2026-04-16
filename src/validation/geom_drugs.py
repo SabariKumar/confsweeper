@@ -4,6 +4,7 @@
 import json
 import pickle
 import sys
+import warnings
 from collections import Counter
 from copy import deepcopy
 
@@ -19,10 +20,7 @@ from spyrmsd.molecule import Molecule
 from spyrmsd.rmsd import rmsdwrapper
 from tqdm import tqdm
 
-sys.path.insert(1, "/home/sabari/confsweeper")
-import warnings
-
-from src.confsweeper import *
+from confsweeper import *
 
 warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)

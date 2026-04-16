@@ -3,7 +3,10 @@
 # (https://github.com/MolecularAI/PepINVENT/blob/master/data/query_peptide_preparation/CHUCKLES_representation.ipynb)
 #
 import itertools
+import math
 import os
+import re
+from typing import List
 
 import click
 import numpy as np
@@ -15,7 +18,7 @@ from rdkit.Chem import AllChem, Draw
 from rdkit.Chem.MolStandardize import rdMolStandardize
 from tqdm import tqdm
 
-from src.confsweeper import *
+from confsweeper import *
 
 
 class PeptideBuilder:
@@ -216,7 +219,7 @@ class PeptideBuilder:
             peptide_with_topology = self.linear(peptide_chuckles)
 
         elif topology == "Head-To-Tail":
-            peptide_with_topology = self.ead_to_tail(peptide_chuckles)
+            peptide_with_topology = self.head_to_tail(peptide_chuckles)
 
         elif topology == "Sidechain-To-Tail":
             if cyclization_info:
@@ -264,7 +267,6 @@ class PeptideBuilder:
         self,
         amino_acids: List,
         topology: str,
-        masking_positions: List,
         cyclization_info=None,
     ):
         """Builds the peptide from a list of amino acids"""
@@ -285,7 +287,7 @@ class PeptideBuilder:
 def make_peptides(
     amino_acid_lib_file: os.PathLike | str,
     peptide_save_dir: os.PathLike | str,
-    max_length: int = 12,
+    max_length: int = 10,
     topologies: List[str] = ["Head-To-Tail"],
 ) -> None:
     """
@@ -298,16 +300,29 @@ def make_peptides(
     """
     pb = PeptideBuilder()
     aa_lib = pd.read_csv(amino_acid_lib_file, comment="#")
+    errs = []
+    err_lens = []
+    err_tops = []
     for length in range(4, max_length + 1):
         init_aa_seqs = itertools.permutations(aa_lib["Smiles"], length)
         smis = []
         seqs = []
         topology = []
-        for seq in tqdm(init_aa_seqs, desc=f"Building macrocycles of length {length}"):
+        for seq in tqdm(
+            init_aa_seqs,
+            desc=f"Building macrocycles of length {length}",
+            total=math.perm(len(aa_lib), length),
+        ):
             for top in topologies:
-                smis.append(pb.build_peptide(seq, topology=top))
-                topology.append(top)
-                seqs.append(seq)
+                try:
+                    smi = pb.build_peptide(seq, topology=top)
+                    smis.append(smi)
+                    topology.append(top)
+                    seqs.append(seq)
+                except:
+                    errs.append(seq)
+                    err_lens.append(length)
+                    err_tops.append(top)
         lens = [length] * len(smis)
         pd.DataFrame(
             {
@@ -318,6 +333,16 @@ def make_peptides(
             }
         ).to_csv(
             os.path.join(peptide_save_dir, f"macrocyc_peptide_{length}.csv"),
+            index=False,
+        )
+        pd.DataFrame(
+            {
+                "error_aa_seq": errs,
+                "topology": err_tops,
+                "length": err_lens,
+            }
+        ).to_csv(
+            os.path.join(peptide_save_dir, f"macrocyc_peptide_errors.csv"),
             index=False,
         )
 
