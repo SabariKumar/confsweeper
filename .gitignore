@@ -11,6 +11,7 @@ docs/reference/*
 # Python ignores
 __pycache__/
 src/validation/__pycache__/
+src/validation/__pycache__/*.pyc
 *.pyc
 *.py[cod]
 *$py.class
