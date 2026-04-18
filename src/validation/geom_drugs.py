@@ -152,7 +152,7 @@ def calc_coverage(
         batch_size=1000,
         batchesPerGpu=2,
     )
-    macemp = get_mace_calc()
+    macemp = get_uma_calc()
     coverages = []
     multiple_matches = []
     for smi in tqdm(selected_pickle.keys()):
@@ -160,7 +160,7 @@ def calc_coverage(
             smi=smi,
             params=params,
             hardware_opts=hardware_opts,
-            mace_calc=macemp,
+            calc=macemp,
             n_confs=n_confs,
             cutoff_dist=butina_thresh,
             gpu_clustering=True,

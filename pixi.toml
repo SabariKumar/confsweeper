@@ -13,9 +13,7 @@ cuda = "12"
 [dependencies]
 python = ">=3.11, <3.13"
 rdkit = "*"
-pytorch-gpu = "==2.5.1"
-torch-scatter = "==2.1.1"
-pytorch_cluster = "==1.6.3"
+pytorch-gpu = ">=2.8.0,<2.9"
 dgl = {version = ">2.0.0", channel="dglteam/label/th24_cu124"}
 jupyterlab = ">=4.5.1,<5"
 openbabel = ">=3.1.1,<4"
@@ -36,16 +34,28 @@ gudhi = ">=3.11.0,<4"
 [pypi-dependencies]
 confsweeper = {path = ".", editable = true}
 numpy = "*"
-pandas = ">=2.3.2, <3"
+pandas = ">=2.3.2"
 ase = ">=3.26.0, <4"
 pre-commit = ">=4.3.0, <5"
 isort = ">=6.0.1, <7"
 black = ">=25.1.0, <26"
 networkx = "*"
 cclib = ">=1.8.1, <2"
-mace-torch = ">=0.3.14, <0.4"
 pickledb = { version = ">=0.9, <1", extras = ["sqlite"] }
 aiosqlite = ">=0.20, <1"
+
+# fairchem-core and mace-torch conflict on e3nn, so each backend lives in its
+# own feature with a separate solve-group.
+[feature.uma.pypi-dependencies]
+fairchem-core = ">=2.19.0, <3"
+
+[feature.mace.pypi-dependencies]
+mace-torch = ">=0.3.14, <0.4"
+
+# default uses UMA; `pixi run -e mace ...` for the MACE backend
+[environments]
+default = {features = ["uma"], solve-group = "default"}
+mace = {features = ["mace"], solve-group = "mace"}
 
 [activation.env]
 CONDA_OVERRIDE_CUDA = "12.2"

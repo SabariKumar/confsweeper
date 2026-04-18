@@ -15,6 +15,7 @@ from confsweeper import (
     get_mol_PE,
     read_csv,
     run_PE_calc,
+    write_sdf,
 )
 
 TESTS_DIR = Path(__file__).parent
@@ -91,8 +92,8 @@ def test_get_embed_params_macrocycle_differs_from_default():
 def test_get_hardware_opts_defaults():
     opts = get_hardware_opts()
     assert opts.batchSize == 500
-    assert opts.preprocessingThreads == 16
-    assert opts.batchesPerGpu == 16
+    assert opts.preprocessingThreads == 4
+    assert opts.batchesPerGpu == 1
     assert opts.gpuIds == [0]
 
 
@@ -158,16 +159,16 @@ def test_get_mol_PE_creates_sdf(tmp_path, mol_pe_mocks):
     params = get_embed_params()
     hardware_opts = get_hardware_opts()
     mock_calc = MagicMock()
+    mock_calc.get_potential_energy = MagicMock(return_value=-100.0)
 
-    get_mol_PE(
+    mol, conf_ids, pe = get_mol_PE(
         smi=ETHANE_SMILES,
-        uuid=TEST_UUID,
-        output_dir=tmp_path,
         params=params,
         hardware_opts=hardware_opts,
-        mace_calc=mock_calc,
+        calc=mock_calc,
         n_confs=5,
     )
+    write_sdf(mol, conf_ids, pe, TEST_UUID, tmp_path, save_lowest_energy=False)
 
     sdf_path = tmp_path / f"{TEST_UUID}.sdf"
     assert sdf_path.exists()
@@ -185,17 +186,16 @@ def test_get_mol_PE_save_lowest_energy(tmp_path, mol_pe_mocks):
     params = get_embed_params()
     hardware_opts = get_hardware_opts()
     mock_calc = MagicMock()
+    mock_calc.get_potential_energy = MagicMock(return_value=-100.0)
 
-    get_mol_PE(
+    mol, conf_ids, pe = get_mol_PE(
         smi=ETHANE_SMILES,
-        uuid=TEST_UUID,
-        output_dir=tmp_path,
         params=params,
         hardware_opts=hardware_opts,
-        mace_calc=mock_calc,
+        calc=mock_calc,
         n_confs=5,
-        save_lowest_energy=True,
     )
+    write_sdf(mol, conf_ids, pe, TEST_UUID, tmp_path, save_lowest_energy=True)
 
     sdf_path = tmp_path / f"{TEST_UUID}.sdf"
     assert sdf_path.exists()
@@ -217,7 +217,7 @@ def test_run_PE_calc_cli(tmp_path):
     output_dir = tmp_path / "output"
     output_dir.mkdir()
 
-    with patch("confsweeper.get_mace_calc", return_value=MagicMock()), patch(
+    with patch("confsweeper.get_uma_calc", return_value=MagicMock()), patch(
         "confsweeper.embed.EmbedMolecules", side_effect=_mock_embed
     ), patch.object(ase.Atoms, "get_potential_energy", return_value=-100.0):
 

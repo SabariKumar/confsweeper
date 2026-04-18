@@ -10,7 +10,7 @@ EV_TO_KCAL = 23.0609
 def compare_geometries(
     mol_a: ase.Atoms,
     mol_b: ase.Atoms,
-    mace_calc,
+    calc,
     rmsd_threshold: float = 0.125,
     energy_threshold: float = 6.0,
 ) -> tuple[bool, float, float]:
@@ -21,7 +21,7 @@ def compare_geometries(
     Params:
         mol_a: ase.Atoms : first geometry
         mol_b: ase.Atoms : second geometry
-        mace_calc: MACE calculator instance
+        calc: ASE calculator instance
         rmsd_threshold: float : max allowed RMSD in Angstroms (default 0.125)
         energy_threshold: float : max allowed energy difference in kcal/mol (default 6.0)
     Returns:
@@ -47,12 +47,12 @@ def compare_geometries(
     rmsd_val = rmsdwrapper(ref, comp, minimize=True, strip=False, symmetry=False)[0]
 
     # MACE potential energies
-    mol_a.calc = mace_calc
+    mol_a.calc = calc
     energy_a = mol_a.get_potential_energy()
     mol_a.calc = None
     torch.cuda.empty_cache()
 
-    mol_b.calc = mace_calc
+    mol_b.calc = calc
     energy_b = mol_b.get_potential_energy()
     mol_b.calc = None
     torch.cuda.empty_cache()

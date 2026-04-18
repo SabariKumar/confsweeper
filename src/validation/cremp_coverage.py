@@ -9,17 +9,39 @@ Supports sweeping n_confs: pass multiple values via --n_confs to process each
 molecule at all requested conformer counts in a single pass (one pickle load per
 molecule regardless of how many n_confs values are swept).
 
-Checkpoint behavior: if output_csv already exists, any (sequence, n_confs) pair
-already present is skipped. Interrupted runs resume automatically.
+Sampling modes
+--------------
+etkdg (default)
+    Standard nvmolkit ETKDGv3 → GPU Butina → MACE scoring.
+
+etkdg+torsional
+    Pool A: same as etkdg.
+    Pool B: backbone dihedral-constrained DG (CPU ETKDGv3), (phi, psi) targets
+            sampled from the CREMP Ramachandran prior.
+    Merge:  Pool B conformers are MACE-scored and filtered to energies within
+            mean(A) + 2*std(A).  A single Butina pass de-duplicates the combined
+            A+B pool before coverage is measured.
+
+Checkpoint behavior: if output_csv already exists, any (sequence, n_confs,
+sampling_mode) triple already present is skipped. Interrupted runs resume
+automatically.
 
 Usage:
+    # ETKDG only
     python cremp_coverage.py \\
         --subset_csv   data/processed/cremp/validation_subset.csv \\
         --pickle_dir   data/raw/cremp/pickle \\
         --output_csv   data/processed/cremp/coverage.csv \\
-        --n_confs      500,1000,2000 \\
-        --butina_thresh 0.1 \\
-        --rmsd_cutoff  1.0
+        --n_confs      500,1000,2000
+
+    # ETKDG + torsional sampling
+    python cremp_coverage.py \\
+        --subset_csv   data/processed/cremp/validation_subset.csv \\
+        --pickle_dir   data/raw/cremp/pickle \\
+        --output_csv   data/processed/cremp/coverage.csv \\
+        --n_confs      1000 \\
+        --torsional_sampling \\
+        --torsional_n_samples 200
 """
 
 import csv
@@ -29,18 +51,23 @@ import sys
 import warnings
 from pathlib import Path
 
+import ase
 import click
 import numpy as np
+import torch
 from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).parents[2]))
 
+from nvmolkit import clustering
+
 from confsweeper import (
     get_embed_params_macrocycle,
     get_hardware_opts,
-    get_mace_calc,
     get_mol_PE,
+    get_uma_calc,
 )
+from torsional_sampling import load_ramachandran_grids, sample_constrained_confs
 from validation.cremp import calc_coverage, iter_validation_mols
 
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -57,6 +84,7 @@ OUTPUT_COLUMNS = [
     "num_monomers",
     "num_heavy_atoms",
     "n_confs",
+    "sampling_mode",
     "n_generated_confs",
     "n_ref_confs",
     "coverage",
@@ -64,16 +92,19 @@ OUTPUT_COLUMNS = [
     "median_min_rmsd",
 ]
 
-ERROR_COLUMNS = ["sequence", "n_confs", "error"]
+ERROR_COLUMNS = ["sequence", "n_confs", "sampling_mode", "error"]
 
 
-def _load_checkpoint(output_csv: str) -> set[tuple[str, int]]:
-    """Returns set of (sequence, n_confs) pairs already in output_csv."""
+def _load_checkpoint(output_csv: str) -> set[tuple[str, int, str]]:
+    """Returns set of (sequence, n_confs, sampling_mode) triples already in output_csv."""
     done = set()
     if os.path.exists(output_csv):
         with open(output_csv, newline="") as f:
             for row in csv.DictReader(f):
-                done.add((row["sequence"], int(row["n_confs"])))
+                mode = (
+                    row.get("sampling_mode") or "etkdg"
+                )  # back-compat: missing or empty → etkdg
+                done.add((row["sequence"], int(row["n_confs"]), mode))
     return done
 
 
@@ -85,6 +116,36 @@ def _append_row(path: str, row: dict, columns: list[str]) -> None:
         if write_header:
             writer.writeheader()
         writer.writerow(row)
+
+
+def _mace_score_conf_ids(mol, conf_ids: list[int], mace_calc) -> list[float]:
+    """Return MACE potential energies for a list of conformer IDs."""
+    atoms = [atom.GetAtomicNum() for atom in mol.GetAtoms()]
+    energies = []
+    for cid in conf_ids:
+        coords = mol.GetConformer(cid).GetPositions()
+        ase_mol = ase.Atoms(positions=coords, numbers=atoms)
+        ase_mol.calc = mace_calc
+        energies.append(ase_mol.get_potential_energy())
+        del ase_mol
+        torch.cuda.empty_cache()
+    return energies
+
+
+def _butina_on_conf_ids(mol, conf_ids: list[int], cutoff: float) -> list[int]:
+    """Run GPU Butina on a subset of conformers; return centroid conformer IDs."""
+    coords = torch.tensor(
+        np.array([mol.GetConformer(cid).GetPositions() for cid in conf_ids])
+    )
+    n = len(conf_ids)
+    dists = torch.cdist(torch.flatten(coords, 1), torch.flatten(coords, 1), p=1.0) / (
+        3 * n
+    )
+    _, centroids_result = clustering.butina(
+        dists.to("cuda:0"), cutoff=cutoff, return_centroids=True
+    )
+    centroid_positions = centroids_result.numpy().tolist()
+    return [conf_ids[p] for p in centroid_positions]
 
 
 @click.command()
@@ -139,6 +200,40 @@ def _append_row(path: str, row: dict, columns: list[str]) -> None:
     type=float,
     help="Pre-filter multiplier: tensor RMSD cutoff = rmsd_cutoff * filter_factor",
 )
+@click.option(
+    "--torsional_sampling",
+    is_flag=True,
+    default=False,
+    help="Enable torsional sampling (Pool B) in addition to standard ETKDG (Pool A)",
+)
+@click.option(
+    "--torsional_n_samples",
+    default=200,
+    show_default=True,
+    type=int,
+    help="Number of (phi, psi) samples to draw for Pool B per molecule",
+)
+@click.option(
+    "--torsional_strategy",
+    default="uniform",
+    show_default=True,
+    type=click.Choice(["uniform", "inverse"]),
+    help="Ramachandran sampling strategy: 'uniform' (all accessible cells equally) "
+    "or 'inverse' (oversample rare cells)",
+)
+@click.option(
+    "--torsional_energy_sigma",
+    default=2.0,
+    show_default=True,
+    type=float,
+    help="Pool B energy filter: keep conformers with energy < mean(A) + k*std(A)",
+)
+@click.option(
+    "--ramachandran_grids",
+    default="data/processed/cremp/ramachandran_grids.npz",
+    show_default=True,
+    help="Path to CREMP Ramachandran grids .npz (required with --torsional_sampling)",
+)
 def run_coverage_benchmark(
     subset_csv,
     pickle_dir,
@@ -148,10 +243,16 @@ def run_coverage_benchmark(
     butina_thresh,
     rmsd_cutoff,
     filter_factor,
+    torsional_sampling,
+    torsional_n_samples,
+    torsional_strategy,
+    torsional_energy_sigma,
+    ramachandran_grids,
 ):
     """Benchmark confsweeper conformer coverage against CREMP reference conformers."""
     n_confs_values = [int(x.strip()) for x in n_confs.split(",")]
-    logger.info("n_confs sweep: %s", n_confs_values)
+    sampling_mode = "etkdg+torsional" if torsional_sampling else "etkdg"
+    logger.info("n_confs sweep: %s  sampling_mode: %s", n_confs_values, sampling_mode)
 
     os.makedirs(os.path.dirname(output_csv) or ".", exist_ok=True)
     os.makedirs(os.path.dirname(errors_csv) or ".", exist_ok=True)
@@ -159,14 +260,20 @@ def run_coverage_benchmark(
     done = _load_checkpoint(output_csv)
     if done:
         logger.info(
-            "Resuming: %d (sequence, n_confs) pairs already processed", len(done)
+            "Resuming: %d (sequence, n_confs, sampling_mode) triples already processed",
+            len(done),
         )
+
+    grids = None
+    if torsional_sampling:
+        grids = load_ramachandran_grids(ramachandran_grids)
+        logger.info("Loaded Ramachandran grids from %s", ramachandran_grids)
 
     params = get_embed_params_macrocycle()
     hardware_opts = get_hardware_opts(
         preprocessingThreads=8, batch_size=1000, batchesPerGpu=2
     )
-    mace_calc = get_mace_calc()
+    mace_calc = get_uma_calc()
 
     mol_iter = iter_validation_mols(subset_csv, pickle_dir)
 
@@ -174,23 +281,60 @@ def run_coverage_benchmark(
         n_ref_confs = ref_mol.GetNumConformers()
 
         for n in n_confs_values:
-            if (sequence, n) in done:
+            if (sequence, n, sampling_mode) in done:
                 continue
 
             try:
-                gen_mol, gen_conf_ids, _pe = get_mol_PE(
+                # --- Pool A: standard ETKDG → Butina → MACE ---
+                gen_mol, gen_conf_ids_a, pe_a = get_mol_PE(
                     smi=smiles,
                     params=params,
                     hardware_opts=hardware_opts,
-                    mace_calc=mace_calc,
+                    calc=mace_calc,
                     n_confs=n,
                     cutoff_dist=butina_thresh,
                     gpu_clustering=True,
                 )
-                gen_conf_ids = list(gen_conf_ids)
+                gen_conf_ids_a = list(gen_conf_ids_a)
 
-                if len(gen_conf_ids) == 0:
+                if len(gen_conf_ids_a) == 0:
                     raise ValueError("EmbedMolecules produced 0 conformers")
+
+                gen_conf_ids = gen_conf_ids_a
+
+                # --- Pool B: torsional sampling ---
+                if torsional_sampling and grids is not None:
+                    pool_b_ids = sample_constrained_confs(
+                        gen_mol,
+                        grids,
+                        n_samples=torsional_n_samples,
+                        strategy=torsional_strategy,
+                        seed=42,
+                    )
+
+                    if pool_b_ids:
+                        # MACE-score Pool B and filter by Pool A energy envelope
+                        pe_b = _mace_score_conf_ids(gen_mol, pool_b_ids, mace_calc)
+                        e_mean = float(np.mean(pe_a))
+                        e_std = float(np.std(pe_a))
+                        threshold = e_mean + torsional_energy_sigma * e_std
+                        filtered_b_ids = [
+                            cid for cid, e in zip(pool_b_ids, pe_b) if e <= threshold
+                        ]
+                        logger.debug(
+                            "%s: Pool B %d embedded, %d pass energy filter (threshold %.3f eV)",
+                            sequence,
+                            len(pool_b_ids),
+                            len(filtered_b_ids),
+                            threshold,
+                        )
+
+                        if filtered_b_ids:
+                            # Single Butina pass on combined A+B to de-duplicate
+                            combined_ids = gen_conf_ids_a + filtered_b_ids
+                            gen_conf_ids = _butina_on_conf_ids(
+                                gen_mol, combined_ids, cutoff=butina_thresh
+                            )
 
                 coverage, min_rmsds = calc_coverage(
                     ref_mol=ref_mol,
@@ -216,6 +360,7 @@ def run_coverage_benchmark(
                     "num_monomers": meta["num_monomers"],
                     "num_heavy_atoms": meta["num_heavy_atoms"],
                     "n_confs": n,
+                    "sampling_mode": sampling_mode,
                     "n_generated_confs": len(gen_conf_ids),
                     "n_ref_confs": n_ref_confs,
                     "coverage": round(coverage, 6),
@@ -223,13 +368,24 @@ def run_coverage_benchmark(
                     "median_min_rmsd": round(median_min_rmsd, 4),
                 }
                 _append_row(output_csv, row, OUTPUT_COLUMNS)
-                done.add((sequence, n))
+                done.add((sequence, n, sampling_mode))
 
             except Exception as e:
-                logger.warning("Error processing %s at n_confs=%d: %s", sequence, n, e)
+                logger.warning(
+                    "Error processing %s at n_confs=%d mode=%s: %s",
+                    sequence,
+                    n,
+                    sampling_mode,
+                    e,
+                )
                 _append_row(
                     errors_csv,
-                    {"sequence": sequence, "n_confs": n, "error": str(e)},
+                    {
+                        "sequence": sequence,
+                        "n_confs": n,
+                        "sampling_mode": sampling_mode,
+                        "error": str(e),
+                    },
                     ERROR_COLUMNS,
                 )
 

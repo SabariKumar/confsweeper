@@ -16,7 +16,6 @@ import pandas as pd
 import rdkit
 import torch
 from ase.build import molecule
-from mace.calculators import mace_mp, mace_off
 from nvmolkit import clustering
 from nvmolkit.types import HardwareOptions
 from rdkit import Chem
@@ -118,40 +117,67 @@ def get_hardware_opts(
     )
 
 
-def get_mace_calc():
+def get_uma_calc(model: str = "uma-s-1", task: str = "omol"):
     """
-    Convenience hook for subbing in different mace models.
+    Return a FairChem UMA ASE calculator (default: UMA-S, omol task).
+
+    The omol task head is trained on the OMol25 dataset (organic molecules,
+    DFT-level) and is the appropriate choice for peptide conformer scoring.
+
     Params:
-        None
+        model : FairChem checkpoint name or path (default "uma-s-1")
+        task  : task head to use (default "omol")
     Returns:
-        Callable: MACE calculator object
+        ASE calculator compatible with ase_mol.get_potential_energy()
     """
-    return mace_off(model="medium", device="cuda", default_dtype="float32")
+    from fairchem.core import FAIRChemCalculator
+
+    return FAIRChemCalculator(checkpoint_path=model, task_name=task)
+
+
+def get_mace_calc(model: str = "medium"):
+    """
+    Return a MACE-OFF ASE calculator.  Requires the optional mace extra:
+        pip install confsweeper[mace]   or   pixi install -e mace
+
+    Params:
+        model : MACE-OFF model size — "small", "medium", or "large"
+    Returns:
+        ASE calculator compatible with ase_mol.get_potential_energy()
+    """
+    try:
+        from mace.calculators import mace_off
+    except ImportError:
+        raise ImportError(
+            "mace-torch is not installed. "
+            "Install the optional extra: pip install confsweeper[mace] "
+            "or pixi install -e mace"
+        ) from None
+    return mace_off(model=model, device="cuda", default_dtype="float32")
 
 
 def get_mol_PE(
     smi: str,
     params,
     hardware_opts,
-    mace_calc,
+    calc,
     n_confs: int = 1000,
     cutoff_dist: float = 0.1,
     gpu_clustering: bool = True,
 ) -> Tuple:
     """
-    Save a multiSDF for a single smiles string.
-    Energy saved as "MACE_ENERGY" in the SDF for each conformer.
+    Embed conformers for a SMILES string, cluster with Butina, and score with an ASE calculator.
     Params:
         smi: str : input smiles string
         params : ETKDG params from get_embed_params
         hardware_opts : nvmolkit hardware options from get_hardware_opts
-        mace_calc : ASE MACE calculator from get_mace_calc
-        n_confs: int : Number of confomers to use
+        calc : ASE calculator (e.g. from get_uma_calc() or get_mace_calc())
+        n_confs: int : Number of conformers to embed
         cutoff_dist: float : Distance threshold for Butina clustering
     Returns:
-        rdkit.Chem.Mol : input mol object
-        List : list of valid rdkit conformer ids
-        List : list of ASE mol objects
+        rdkit.Chem.Mol : mol with Butina-representative conformers
+        List : conformer IDs of Butina representatives
+        List : potential energies (eV) for each representative
     """
     mol = Chem.AddHs(Chem.MolFromSmiles(smi))
     embed.EmbedMolecules(
@@ -178,7 +204,7 @@ def get_mol_PE(
 
         for conf_coords in rep_coords:
             ase_mol = ase.Atoms(positions=conf_coords, numbers=atoms)
-            ase_mol.calc = mace_calc
+            ase_mol.calc = calc
             pe.append(ase_mol.get_potential_energy())
             del ase_mol
             torch.cuda.empty_cache()
@@ -207,7 +233,7 @@ def get_mol_PE(
         for ase_mol in ase_mols:
             with open(os.devnull, "w") as devnull:
                 with contextlib.redirect_stdout(devnull):
-                    ase_mol.calc = mace_calc
+                    ase_mol.calc = calc
                     pe.append(ase_mol.get_potential_energy())
 
         to_remove = [x for x in range(n_confs) if x not in conf_ids]
@@ -243,7 +269,7 @@ def write_sdf(
         conf.SetDoubleProp("MACE_ENERGY", min(pe))
         mol.SetDoubleProp("MACE_ENERGY", min(pe))
         mol.SetProp("id", id)
-        writer.write(mol, confId=conf_id)
+        writer.write(mol, confId=min_conf)
     else:
         for conf_id, pe_ in zip(conf_ids, pe):
             conf = mol.GetConformer(conf_id)
@@ -262,14 +288,14 @@ def run_PE_calc(
 ):
     params = get_embed_params()
     hardware_opts = get_hardware_opts()
-    macemp = get_mace_calc()
+    uma_calc = get_uma_calc()
     smi_df = read_csv(smi_csv)
     for smi, uuid_ in tqdm(zip(smi_df["smiles"], smi_df["uuid"]), total=len(smi_df)):
         mol, conf_ids, pe = get_mol_PE(
             smi=smi,
             params=params,
             hardware_opts=hardware_opts,
-            mace_calc=macemp,
+            calc=uma_calc,
         )
         write_sdf(
             mol=mol,

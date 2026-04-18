@@ -88,8 +88,8 @@ class TestLoadCheckpoint:
                 | {"sequence": "a.V.G.L", "n_confs": "1000"}
             )
         done = _load_checkpoint(str(csv_path))
-        assert ("A.V.G.L", 500) in done
-        assert ("a.V.G.L", 1000) in done
+        assert ("A.V.G.L", 500, "etkdg") in done
+        assert ("a.V.G.L", 1000, "etkdg") in done
 
     def test_n_confs_parsed_as_int(self, tmp_path):
         csv_path = tmp_path / "out.csv"
@@ -100,8 +100,8 @@ class TestLoadCheckpoint:
                 {c: "" for c in OUTPUT_COLUMNS} | {"sequence": "X", "n_confs": "2000"}
             )
         done = _load_checkpoint(str(csv_path))
-        assert ("X", 2000) in done
-        assert ("X", "2000") not in done  # must be int
+        assert ("X", 2000, "etkdg") in done
+        assert ("X", "2000", "etkdg") not in done  # must be int
 
 
 # ---------------------------------------------------------------------------
@@ -138,7 +138,7 @@ class TestAppendRow:
 
 
 def _mock_get_mol_PE(
-    smi, params, hardware_opts, mace_calc, n_confs, cutoff_dist, gpu_clustering
+    smi, params, hardware_opts, calc, n_confs, cutoff_dist, gpu_clustering
 ):
     """Returns a mol with n_confs conformers and dummy PE values."""
     mol = _make_mol(smi, min(n_confs, 3))
@@ -178,7 +178,7 @@ class TestRunCoverageBenchmark:
 
         with patch("validation.cremp_coverage.get_embed_params_macrocycle"), patch(
             "validation.cremp_coverage.get_hardware_opts"
-        ), patch("validation.cremp_coverage.get_mace_calc"), patch(
+        ), patch("validation.cremp_coverage.get_uma_calc"), patch(
             "validation.cremp_coverage.get_mol_PE", side_effect=_mock_get_mol_PE
         ):
             result = runner.invoke(run_coverage_benchmark, args)
@@ -235,7 +235,7 @@ class TestRunCoverageBenchmark:
         runner = CliRunner()
         with patch("validation.cremp_coverage.get_embed_params_macrocycle"), patch(
             "validation.cremp_coverage.get_hardware_opts"
-        ), patch("validation.cremp_coverage.get_mace_calc"), patch(
+        ), patch("validation.cremp_coverage.get_uma_calc"), patch(
             "validation.cremp_coverage.get_mol_PE", side_effect=counting_mock
         ):
             runner.invoke(
@@ -268,7 +268,7 @@ class TestRunCoverageBenchmark:
         runner = CliRunner()
         with patch("validation.cremp_coverage.get_embed_params_macrocycle"), patch(
             "validation.cremp_coverage.get_hardware_opts"
-        ), patch("validation.cremp_coverage.get_mace_calc"), patch(
+        ), patch("validation.cremp_coverage.get_uma_calc"), patch(
             "validation.cremp_coverage.get_mol_PE", side_effect=RuntimeError("GPU OOM")
         ):
             runner.invoke(
@@ -313,7 +313,7 @@ class TestRunCoverageBenchmark:
         runner = CliRunner()
         with patch("validation.cremp_coverage.get_embed_params_macrocycle"), patch(
             "validation.cremp_coverage.get_hardware_opts"
-        ), patch("validation.cremp_coverage.get_mace_calc"), patch(
+        ), patch("validation.cremp_coverage.get_uma_calc"), patch(
             "validation.cremp_coverage.get_mol_PE", side_effect=fail_first
         ):
             result = runner.invoke(
