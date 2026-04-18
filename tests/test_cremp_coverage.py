@@ -329,6 +329,8 @@ class TestRunCoverageBenchmark:
                     errors_csv,
                     "--n_confs",
                     "1000",
+                    "--max_workers",
+                    "1",
                 ],
             )
 

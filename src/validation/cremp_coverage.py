@@ -48,7 +48,10 @@ import csv
 import logging
 import os
 import sys
+import threading
+import time
 import warnings
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import ase
@@ -90,6 +93,8 @@ OUTPUT_COLUMNS = [
     "coverage",
     "mean_min_rmsd",
     "median_min_rmsd",
+    "time_gpu_s",
+    "time_coverage_s",
 ]
 
 ERROR_COLUMNS = ["sequence", "n_confs", "sampling_mode", "error"]
@@ -234,6 +239,13 @@ def _butina_on_conf_ids(mol, conf_ids: list[int], cutoff: float) -> list[int]:
     show_default=True,
     help="Path to CREMP Ramachandran grids .npz (required with --torsional_sampling)",
 )
+@click.option(
+    "--max_workers",
+    default=4,
+    show_default=True,
+    type=int,
+    help="Number of parallel worker threads",
+)
 def run_coverage_benchmark(
     subset_csv,
     pickle_dir,
@@ -248,6 +260,7 @@ def run_coverage_benchmark(
     torsional_strategy,
     torsional_energy_sigma,
     ramachandran_grids,
+    max_workers,
 ):
     """Benchmark confsweeper conformer coverage against CREMP reference conformers."""
     n_confs_values = [int(x.strip()) for x in n_confs.split(",")]
@@ -275,119 +288,113 @@ def run_coverage_benchmark(
     )
     mace_calc = get_uma_calc()
 
-    mol_iter = iter_validation_mols(subset_csv, pickle_dir)
+    # _gpu_lock: nvmolkit and MACE are not thread-safe — serialise all GPU work.
+    # _write_lock: serialise CSV writes and done-set updates.
+    _gpu_lock = threading.Lock()
+    _write_lock = threading.Lock()
 
-    for sequence, smiles, ref_mol, meta in tqdm(mol_iter, desc="molecules"):
-        n_ref_confs = ref_mol.GetNumConformers()
+    def _compute_and_write(
+        sequence, smiles, ref_mol, meta, n, gen_mol, gen_conf_ids, time_gpu_s
+    ):
+        """CPU-bound half: spyrmsd coverage then write result. Runs in parallel."""
+        t0 = time.perf_counter()
+        coverage, min_rmsds = calc_coverage(
+            ref_mol=ref_mol,
+            gen_mol=gen_mol,
+            gen_conf_ids=gen_conf_ids,
+            rmsd_cutoff=rmsd_cutoff,
+            filter_factor=filter_factor,
+        )
+        time_coverage_s = time.perf_counter() - t0
 
-        for n in n_confs_values:
-            if (sequence, n, sampling_mode) in done:
-                continue
+        finite_rmsds = [r for r in min_rmsds if r != float("inf")]
+        mean_min_rmsd = float(np.mean(finite_rmsds)) if finite_rmsds else float("nan")
+        median_min_rmsd = (
+            float(np.median(finite_rmsds)) if finite_rmsds else float("nan")
+        )
+        row = {
+            "sequence": sequence,
+            "smiles": smiles,
+            "topology": meta["topology"],
+            "atom_bin": meta["atom_bin"],
+            "num_monomers": meta["num_monomers"],
+            "num_heavy_atoms": meta["num_heavy_atoms"],
+            "n_confs": n,
+            "n_generated_confs": len(gen_conf_ids),
+            "n_ref_confs": ref_mol.GetNumConformers(),
+            "coverage": round(coverage, 6),
+            "mean_min_rmsd": round(mean_min_rmsd, 4),
+            "median_min_rmsd": round(median_min_rmsd, 4),
+            "time_gpu_s": round(time_gpu_s, 3),
+            "time_coverage_s": round(time_coverage_s, 3),
+        }
+        with _write_lock:
+            _append_row(output_csv, row, OUTPUT_COLUMNS)
+            done.add((sequence, n))
 
-            try:
-                # --- Pool A: standard ETKDG → Butina → MACE ---
-                gen_mol, gen_conf_ids_a, pe_a = get_mol_PE(
-                    smi=smiles,
-                    params=params,
-                    hardware_opts=hardware_opts,
-                    calc=mace_calc,
-                    n_confs=n,
-                    cutoff_dist=butina_thresh,
-                    gpu_clustering=True,
-                )
-                gen_conf_ids_a = list(gen_conf_ids_a)
+    coverage_futures = []
 
-                if len(gen_conf_ids_a) == 0:
-                    raise ValueError("EmbedMolecules produced 0 conformers")
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        mol_iter = iter_validation_mols(subset_csv, pickle_dir)
+        for sequence, smiles, ref_mol, meta in tqdm(mol_iter, desc="molecules"):
+            for n in n_confs_values:
+                if (sequence, n) in done:
+                    continue
+                try:
+                    # GPU work: serialised so nvmolkit/MACE are never called concurrently.
+                    t0 = time.perf_counter()
+                    with _gpu_lock:
+                        gen_mol, gen_conf_ids, _ = get_mol_PE(
+                            smi=smiles,
+                            params=params,
+                            hardware_opts=hardware_opts,
+                            mace_calc=mace_calc,
+                            n_confs=n,
+                            cutoff_dist=butina_thresh,
+                            gpu_clustering=True,
+                        )
+                    time_gpu_s = time.perf_counter() - t0
+                    gen_conf_ids = list(gen_conf_ids)
 
-                gen_conf_ids = gen_conf_ids_a
+                    if len(gen_conf_ids) == 0:
+                        raise ValueError("EmbedMolecules produced 0 conformers")
 
-                # --- Pool B: torsional sampling ---
-                if torsional_sampling and grids is not None:
-                    pool_b_ids = sample_constrained_confs(
+                    # CPU work: submit spyrmsd coverage to thread pool, overlapping
+                    # with the next GPU job.
+                    future = executor.submit(
+                        _compute_and_write,
+                        sequence,
+                        smiles,
+                        ref_mol,
+                        meta,
+                        n,
                         gen_mol,
-                        grids,
-                        n_samples=torsional_n_samples,
-                        strategy=torsional_strategy,
-                        seed=42,
+                        gen_conf_ids,
+                        time_gpu_s,
                     )
+                    coverage_futures.append(future)
 
-                    if pool_b_ids:
-                        # MACE-score Pool B and filter by Pool A energy envelope
-                        pe_b = _mace_score_conf_ids(gen_mol, pool_b_ids, mace_calc)
-                        e_mean = float(np.mean(pe_a))
-                        e_std = float(np.std(pe_a))
-                        threshold = e_mean + torsional_energy_sigma * e_std
-                        filtered_b_ids = [
-                            cid for cid, e in zip(pool_b_ids, pe_b) if e <= threshold
-                        ]
-                        logger.debug(
-                            "%s: Pool B %d embedded, %d pass energy filter (threshold %.3f eV)",
-                            sequence,
-                            len(pool_b_ids),
-                            len(filtered_b_ids),
-                            threshold,
+                except Exception as e:
+                    logger.warning(
+                        "Error processing %s at n_confs=%d: %s", sequence, n, e
+                    )
+                    with _write_lock:
+                        _append_row(
+                            errors_csv,
+                            {"sequence": sequence, "n_confs": n, "error": str(e)},
+                            ERROR_COLUMNS,
                         )
 
-                        if filtered_b_ids:
-                            # Single Butina pass on combined A+B to de-duplicate
-                            combined_ids = gen_conf_ids_a + filtered_b_ids
-                            gen_conf_ids = _butina_on_conf_ids(
-                                gen_mol, combined_ids, cutoff=butina_thresh
-                            )
-
-                coverage, min_rmsds = calc_coverage(
-                    ref_mol=ref_mol,
-                    gen_mol=gen_mol,
-                    gen_conf_ids=gen_conf_ids,
-                    rmsd_cutoff=rmsd_cutoff,
-                    filter_factor=filter_factor,
-                )
-
-                finite_rmsds = [r for r in min_rmsds if r != float("inf")]
-                mean_min_rmsd = (
-                    float(np.mean(finite_rmsds)) if finite_rmsds else float("nan")
-                )
-                median_min_rmsd = (
-                    float(np.median(finite_rmsds)) if finite_rmsds else float("nan")
-                )
-
-                row = {
-                    "sequence": sequence,
-                    "smiles": smiles,
-                    "topology": meta["topology"],
-                    "atom_bin": meta["atom_bin"],
-                    "num_monomers": meta["num_monomers"],
-                    "num_heavy_atoms": meta["num_heavy_atoms"],
-                    "n_confs": n,
-                    "sampling_mode": sampling_mode,
-                    "n_generated_confs": len(gen_conf_ids),
-                    "n_ref_confs": n_ref_confs,
-                    "coverage": round(coverage, 6),
-                    "mean_min_rmsd": round(mean_min_rmsd, 4),
-                    "median_min_rmsd": round(median_min_rmsd, 4),
-                }
-                _append_row(output_csv, row, OUTPUT_COLUMNS)
-                done.add((sequence, n, sampling_mode))
-
+        # Drain remaining coverage futures after the molecule loop finishes.
+        for future in tqdm(
+            as_completed(coverage_futures),
+            total=len(coverage_futures),
+            desc="coverage (draining)",
+        ):
+            try:
+                future.result()
             except Exception as e:
-                logger.warning(
-                    "Error processing %s at n_confs=%d mode=%s: %s",
-                    sequence,
-                    n,
-                    sampling_mode,
-                    e,
-                )
-                _append_row(
-                    errors_csv,
-                    {
-                        "sequence": sequence,
-                        "n_confs": n,
-                        "sampling_mode": sampling_mode,
-                        "error": str(e),
-                    },
-                    ERROR_COLUMNS,
-                )
+                logger.error("Unexpected error in coverage worker: %s", e)
 
 
 if __name__ == "__main__":
