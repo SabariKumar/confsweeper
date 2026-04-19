@@ -197,7 +197,13 @@ def calc_coverage(
         dtype=torch.float32,
     )
 
-    # Fast pre-filter: (n_ref, n_gen) RMSD matrix, no rotation
+    # Center each conformer to remove translational offset before pre-filtering.
+    # ETKDG and GFN2-xTB place molecules in arbitrary frames; without this,
+    # raw pairwise RMSDs are dominated by translation and every candidate fails.
+    ref_coords = ref_coords - ref_coords.mean(dim=1, keepdim=True)
+    gen_coords = gen_coords - gen_coords.mean(dim=1, keepdim=True)
+
+    # Fast pre-filter: (n_ref, n_gen) RMSD matrix, rotation not yet minimised
     fast_rmsds = pairwise_rmsd_tensor(ref_coords, gen_coords)
     filter_thresh = rmsd_cutoff * filter_factor
 

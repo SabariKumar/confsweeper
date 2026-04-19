@@ -137,9 +137,9 @@ def _butina_on_conf_ids(mol, conf_ids: list[int], cutoff: float) -> list[int]:
     coords = torch.tensor(
         np.array([mol.GetConformer(cid).GetPositions() for cid in conf_ids])
     )
-    n = len(conf_ids)
+    n_atoms = coords.shape[1]
     dists = torch.cdist(torch.flatten(coords, 1), torch.flatten(coords, 1), p=1.0) / (
-        3 * n
+        3 * n_atoms
     )
     _, centroids_result = clustering.butina(
         dists.to("cuda:0"), cutoff=cutoff, return_centroids=True

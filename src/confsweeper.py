@@ -146,7 +146,7 @@ def get_mace_calc(model: str = "medium"):
         ASE calculator compatible with ase_mol.get_potential_energy()
     """
     try:
-        from mace.calculators import mace_off
+        from mace.calculators import mace_off  # type: ignore
     except ImportError:
         raise ImportError(
             "mace-torch is not installed. "
@@ -187,9 +187,10 @@ def get_mol_PE(
     for conf in mol.GetConformers():
         coords.append(conf.GetPositions())
     coords = torch.tensor(np.array(coords))  # (N_CONFS, n_atoms, 3)
+    n_atoms = coords.shape[1]
     dists = torch.cdist(
         torch.flatten(coords, start_dim=1), torch.flatten(coords, start_dim=1), p=1.0
-    ) / (3 * n_confs)
+    ) / (3 * n_atoms)
     if gpu_clustering:
         # TODO: refactor to support dists on multiple gpus
         # butina returns a tuple of AsyncGpuResult objects when return_centroids=True
