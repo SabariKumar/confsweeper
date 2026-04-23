@@ -245,6 +245,86 @@ def get_mol_PE(
         return mol, conf_ids, pe
 
 
+_KCAL_TO_EV = 0.043364  # 1 kcal/mol in eV
+
+
+def get_mol_PE_mmff(
+    smi: str,
+    params,
+    hardware_opts,
+    n_confs: int = 1000,
+    cutoff_dist: float = 0.1,
+    gpu_clustering: bool = True,
+) -> Tuple:
+    """
+    Like get_mol_PE but scores conformers with RDKit MMFF94 instead of an ASE calculator.
+
+    Requires no GPU for energy scoring (MMFF94 runs on CPU). GPU is still used for
+    conformer embedding and Butina clustering via nvmolkit when gpu_clustering=True.
+    Energies are returned in eV (converted from MMFF94 kcal/mol) for compatibility
+    with downstream Boltzmann weighting code.
+
+    Params:
+        smi: str : input SMILES string
+        params : ETKDG params from get_embed_params or get_embed_params_macrocycle
+        hardware_opts : nvmolkit hardware options from get_hardware_opts
+        n_confs: int : conformers to embed before clustering
+        cutoff_dist: float : Butina RMSD clustering cutoff
+        gpu_clustering: bool : use nvmolkit GPU Butina (True) or RDKit CPU Butina (False)
+    Returns:
+        rdkit.Chem.Mol : mol with only Butina-representative conformers attached
+        List[int] : conformer IDs of cluster representatives
+        List[float] : MMFF94 potential energies in eV for each representative
+    """
+    from rdkit.Chem import AllChem
+
+    mol = Chem.AddHs(Chem.MolFromSmiles(smi))
+    embed.EmbedMolecules(
+        [mol], params, confsPerMolecule=n_confs, hardwareOptions=hardware_opts
+    )
+
+    n_embedded = mol.GetNumConformers()
+    if n_embedded == 0:
+        return mol, [], []
+
+    coords = torch.tensor(
+        np.array([mol.GetConformer(i).GetPositions() for i in range(n_embedded)])
+    )
+    n_atoms = coords.shape[1]
+    dists = torch.cdist(
+        torch.flatten(coords, start_dim=1), torch.flatten(coords, start_dim=1), p=1.0
+    ) / (3 * n_atoms)
+
+    if gpu_clustering:
+        _, centroids_result = clustering.butina(
+            dists.to("cuda:0"), cutoff=cutoff_dist, return_centroids=True
+        )
+        centroid_ids = centroids_result.numpy().tolist()
+    else:
+        clusters = ClusterData(
+            dists.numpy(),
+            n_embedded,
+            cutoff_dist,
+            isDistData=True,
+            distFunc=None,
+            reordering=True,
+        )
+        centroid_ids = [clusters[x][0] for x in range(len(clusters))]
+
+    mp = AllChem.MMFFGetMoleculeProperties(mol)
+    pe = []
+    for cid in centroid_ids:
+        ff = AllChem.MMFFGetMoleculeForceField(mol, mp, confId=cid)
+        energy_kcal = ff.CalcEnergy() if ff is not None else 1e6
+        pe.append(energy_kcal * _KCAL_TO_EV)
+
+    to_remove = [x for x in range(n_embedded) if x not in centroid_ids]
+    for id_ in to_remove:
+        mol.RemoveConformer(id_)
+
+    return mol, centroid_ids, pe
+
+
 def write_sdf(
     mol: rdkit.Chem.Mol,
     conf_ids: List,
