@@ -44,8 +44,6 @@ cclib = ">=1.8.1, <2"
 pickledb = { version = ">=0.9, <1", extras = ["sqlite"] }
 aiosqlite = ">=0.20, <1"
 
-[environments]
-default = {}
 
 [activation.env]
 CONDA_OVERRIDE_CUDA = "12.2"
