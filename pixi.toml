@@ -44,20 +44,11 @@ cclib = ">=1.8.1, <2"
 pickledb = { version = ">=0.9, <1", extras = ["sqlite"] }
 aiosqlite = ">=0.20, <1"
 
-# fairchem-core and mace-torch conflict on e3nn, so each backend lives in its
-# own feature with a separate solve-group.
-[feature.uma.dependencies]
-setuptools = "<81.0.0"
-
-[feature.uma.pypi-dependencies]
-fairchem-core = ">=2.19.0, <3"
-
 [feature.mace.pypi-dependencies]
 mace-torch = ">=0.3.14, <0.4"
 
-# default uses UMA; `pixi run -e mace ...` for the MACE backend
 [environments]
-default = {features = ["uma"], solve-group = "default"}
+default = {features = ["mace"], solve-group = "mace"}
 mace = {features = ["mace"], solve-group = "mace"}
 
 [activation.env]
