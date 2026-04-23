@@ -61,4 +61,4 @@ default = {features = ["uma"], solve-group = "default"}
 mace = {features = ["mace"], solve-group = "mace"}
 
 [activation.env]
-CONDA_OVERRIDE_CUDA = "12.2"
+CONDA_OVERRIDE_CUDA = "12.4"
