@@ -46,6 +46,9 @@ aiosqlite = ">=0.20, <1"
 
 # fairchem-core and mace-torch conflict on e3nn, so each backend lives in its
 # own feature with a separate solve-group.
+[feature.uma.dependencies]
+setuptools = "<81.0.0"
+
 [feature.uma.pypi-dependencies]
 fairchem-core = ">=2.19.0, <3"
 
