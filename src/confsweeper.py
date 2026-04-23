@@ -135,13 +135,15 @@ def get_uma_calc(model: str = "uma-s-1", task: str = "omol"):
     return FAIRChemCalculator(checkpoint_path=model, task_name=task)
 
 
-def get_mace_calc(model: str = "medium"):
+def get_mace_calc(model: str = "medium", device: str = "cuda"):
     """
     Return a MACE-OFF ASE calculator.  Requires the optional mace extra:
         pip install confsweeper[mace]   or   pixi install -e mace
 
     Params:
-        model : MACE-OFF model size — "small", "medium", or "large"
+        model  : MACE-OFF model size — "small", "medium", or "large"
+        device : torch device string (default "cuda"); use "cpu" on login nodes
+                 to pre-cache the model file without a GPU
     Returns:
         ASE calculator compatible with ase_mol.get_potential_energy()
     """
@@ -153,7 +155,7 @@ def get_mace_calc(model: str = "medium"):
             "Install the optional extra: pip install confsweeper[mace] "
             "or pixi install -e mace"
         ) from None
-    return mace_off(model=model, device="cuda", default_dtype="float32")
+    return mace_off(model=model, device=device, default_dtype="float32")
 
 
 def get_mol_PE(
