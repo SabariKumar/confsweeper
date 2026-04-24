@@ -51,7 +51,7 @@ def make_confs(
         batch_size=1000,
         batchesPerGpu=2,
     )
-    macemp = get_mace_calc()
+    macemp = get_uma_calc()
     timings = []
     for smi, uuid in tqdm(zip(peptide_df["SMILES"], peptide_df["uuid"])):
         start_time = time.perf_counter()
@@ -59,7 +59,7 @@ def make_confs(
             smi=smi,
             params=params,
             hardware_opts=hardware_opts,
-            mace_calc=macemp,
+            calc=macemp,
             n_confs=n_confs,
             cutoff_dist=butina_thresh,
             gpu_clustering=True,

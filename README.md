@@ -1,7 +1,205 @@
-GPU accelerated conformer clustering + energy prediction with nvmolkit and MACE
+# confsweeper
 
-This project is set up to use pixi for dependency management. To install, (after installing pixi):
-- `git clone` the repo
-- `cd` to the repo root
-- `pixi install`
-- If running on an HPC system's CPU nodes/systems without a graphics card, you may need to mock the CUDA drivers: `export CONDA_OVERRIDE_CUDA=12.2`
+GPU-accelerated conformer generation, clustering, and energy scoring for small molecules.
+
+The core pipeline — nvmolkit ETKDGv3 GPU embedding, GPU Butina clustering, MACE-OFF energy scoring — works for any molecule type. The optional `etkdg+torsional` sampling mode is **macrocycle-specific**: it adds a second conformer pool driven by a CREMP-derived Ramachandran prior over backbone (phi, psi) angles, targeting dihedral regions that ETKDGv3 misses for cyclic peptides. If you are not working with macrocyclic peptides, use `etkdg` mode only.
+
+The conformational landscape problem confsweeper addresses is exhaustive but tractable exploration: these molecules are large enough that naive enumeration is slow, but small enough that all relevant conformers fit within a single embedding + clustering loop. The pipeline generates a large pool of conformers, deduplicates with GPU-accelerated Butina clustering, and scores the surviving representatives with MACE-OFF.
+
+## Pipeline
+
+```
+SMILES
+  │
+  ▼
+nvmolkit ETKDGv3  ─────────────────────────────────────────── Pool A (force-field-biased)
+  │
+  ▼  [etkdg+torsional mode only]
+Constrained DG  ──  (phi, psi) sampled from CREMP Ramachandran prior  ─── Pool B (dihedral-targeted)
+  │
+  ▼
+Merge A + B
+  │
+  ▼
+GPU Butina (nvmolkit)  ──  deduplicate across all conformers, single pass
+  │
+  ▼
+MACE-OFF / UMA energy scoring  ──  one forward pass per representative
+  │
+  ▼
+SDF output  (coordinates + energy annotation per conformer)
+```
+
+The two-pool architecture (for macrocyclic peptides only) is designed so that torsional sampling adds coverage in backbone dihedral regions that ETKDGv3 rarely visits, without paying double the scoring cost: a single Butina pass deduplicates across both pools before any neural-network inference runs. For all other molecule types, Pool B is omitted and the pipeline runs as standard ETKDGv3 → Butina → MACE-OFF.
+
+## Installation
+
+This project uses [pixi](https://pixi.sh) for dependency management.
+
+```bash
+git clone <repo>
+cd confsweeper
+pixi install
+```
+
+On CPU-only HPC nodes (login nodes without CUDA drivers), mock the CUDA runtime before installing:
+
+```bash
+export CONDA_OVERRIDE_CUDA=12.2
+pixi install
+```
+
+There are two pixi environments:
+
+| Environment | Command | Use |
+|-------------|---------|-----|
+| `mace` | `pixi run -e mace python ...` | **Primary** — MACE-OFF energy scoring |
+| `default` | `pixi run python ...` | UMA (FairChem); see note below |
+
+Use the `mace` environment for all standard work. The `default` environment contains UMA (FairChem), which is present in the codebase but **not actively supported** — use MACE-OFF instead.
+
+Always run Python through pixi. Never use bare `python3` or set `PYTHONPATH` manually.
+
+## Quick start
+
+Run Python through the `mace` pixi environment:
+
+```bash
+pixi run -e mace python my_script.py
+```
+
+```python
+from confsweeper import (
+    get_embed_params, get_embed_params_macrocycle, get_hardware_opts, get_mace_calc,
+    get_mol_PE_batched, load_ramachandran_grids,
+)
+
+# For macrocyclic peptides use get_embed_params_macrocycle(); for other molecules use get_embed_params()
+params = get_embed_params_macrocycle()
+hw = get_hardware_opts()
+calc = get_mace_calc(model="medium", device="cuda")
+
+# ETKDG only
+mol, conf_ids, energies = get_mol_PE_batched(
+    smi="C[C@@H]1NC(=O)[C@@H](C)NC(=O)[C@@H](C)NC(=O)[C@@H](C)NC1=O",
+    params=params,
+    hardware_opts=hw,
+    calc=calc,
+    n_confs=1000,
+)
+
+# ETKDG + torsional sampling (Pool A + Pool B → merged Butina → MACE)
+grids = load_ramachandran_grids("data/processed/cremp/ramachandran_grids.npz")
+mol, conf_ids, energies = get_mol_PE_batched(
+    smi="C[C@@H]1NC(=O)[C@@H](C)NC(=O)[C@@H](C)NC(=O)[C@@H](C)NC1=O",
+    params=params,
+    hardware_opts=hw,
+    calc=calc,
+    n_confs=1000,
+    grids=grids,
+    n_constrained_samples=200,
+    torsion_strategy="inverse",
+)
+# mol carries only Butina-representative conformers from the merged pool
+# energies[i] is in eV for conf_ids[i]
+```
+
+## Sampling modes
+
+### `etkdg` (default)
+
+Standard nvmolkit ETKDGv3 embedding. **Works for any molecule type** — small molecules, peptides, macrocycles, non-peptide scaffolds. Torsion priors are derived from the Cambridge Structural Database. For macrocyclic peptides, pass `params = get_embed_params_macrocycle()` to enable the ring-closure-aware ETKDGv3 flags; for all other molecules, use `get_embed_params()`.
+
+### `etkdg+torsional` — **macrocyclic peptides only**
+
+> **This mode is macrocycle-specific.** Do not use it for acyclic molecules or non-peptide macrocycles.
+
+Adds a second conformer pool (Pool B) generated by backbone dihedral-constrained distance geometry. Target (phi, psi) angles are sampled from a CREMP-derived Ramachandran prior — specifically from the non-zero but low-probability cells of that prior, which are the regions that GFN2-xTB visits but ETKDGv3 misses. Pool A and Pool B are merged into the same mol object, deduplicated in a single Butina pass, then scored together.
+
+This mode is the right choice when benchmarking against CREMP reference conformers or when broad backbone dihedral coverage matters more than raw throughput. For non-macrocycle use cases, `etkdg` mode is sufficient.
+
+The CREMP Ramachandran grids must be built once before using this mode:
+
+```bash
+python data/scripts/build_ramachandran_grids.py \
+    --pickle_dir data/raw/cremp/pickle \
+    --output_npz data/processed/cremp/ramachandran_grids.npz
+```
+
+**CLI usage:**
+
+```bash
+python src/confsweeper.py \
+    --smi_csv         molecules.csv \
+    --output_dir      output/ \
+    --sampling_mode   etkdg+torsional \
+    --n_constrained_samples 200 \
+    --torsion_strategy inverse \
+    --ramachandran_grids data/processed/cremp/ramachandran_grids.npz
+```
+
+## Energy backends
+
+| Backend | Function | Status | Notes |
+|---------|----------|--------|-------|
+| MACE-OFF | `get_mace_calc()` | **Supported** | `mace` pixi env; batched scoring via `get_mol_PE_batched` |
+| MMFF94 | `get_mol_PE_mmff()` | Supported | CPU only; no GPU required; useful for fast prototyping |
+| UMA (FairChem) | `get_uma_calc()` | **Not supported** | Code present but not maintained; use MACE-OFF |
+
+## Repository structure
+
+```
+src/
+  confsweeper.py          — main pipeline: embedding, clustering, scoring, I/O
+  torsional_sampling.py   — backbone dihedral-constrained Phase 2 sampling
+  utils.py                — geometry comparison (RMSD + energy delta)
+  validation/             — benchmarking confsweeper against CREMP and GEOM-Drugs
+
+data/
+  raw/cremp/pickle/       — CREMP GFN2-xTB conformer pickles (not in repo)
+  processed/cremp/        — derived artefacts: validation subsets, Ramachandran grids
+  scripts/                — one-time data preparation scripts (see data/scripts/README.md)
+
+tests/                    — pytest test suite
+```
+
+## Tests
+
+### Unit tests
+
+```bash
+pixi run python -m pytest tests/ -q
+```
+
+The full unit suite takes **~15 minutes** on a modern CPU. Individual file runtimes:
+
+| File | Tests | Time |
+|------|-------|------|
+| `test_confsweeper.py` | ~30 | ~9 min |
+| `test_torsional_sampling.py` | 46 | ~4.5 min |
+| others | — | < 1 min |
+
+`test_confsweeper.py` is slow because the CLI test runs CPU ETKDGv3 across all six peptides in the test CSV. `test_torsional_sampling.py` is slow because constrained DG embedding is CPU-only by design (see `src/README.md`).
+
+All GPU-dependent code (nvmolkit embedding, nvmolkit Butina, MACE forward pass) is mocked in the unit suite so no GPU is required to run it.
+
+### GPU integration tests
+
+```bash
+pixi run python -m pytest tests/integration/ --gpu -v
+```
+
+These tests exercise the real GPU code paths without mocking — the core value proposition of confsweeper. They are skipped by default and require a CUDA device and a working nvmolkit installation.
+
+| Test | What it validates |
+|------|-------------------|
+| `test_nvmolkit_gpu_embedding_produces_conformers` | nvmolkit GPU embedding produces ≥1 conformer |
+| `test_nvmolkit_gpu_butina_returns_valid_centroids` | GPU Butina returns unique valid centroid indices |
+| `test_get_mol_PE_mmff_gpu_pipeline` | Full GPU embed → GPU Butina → CPU MMFF94 (no model needed) |
+| `test_get_mol_PE_batched_gpu_etkdg` | `get_mol_PE_batched` ETKDG path with GPU embed and Butina |
+| `test_get_mol_PE_batched_gpu_torsional` | Two-pool pipeline with GPU Butina and CREMP Ramachandran prior |
+| `test_get_mol_PE_batched_torsional_pool_b_increases_coverage` | Torsional pool does not reduce representative count |
+| `test_get_mol_PE_batched_gpu_mace` | Full pipeline with real MACE-OFF scoring (requires `mace` pixi env) |
+| `test_get_mol_PE_batched_gpu_uma` | Full pipeline with real UMA scoring (requires cached checkpoint) |
+
+The MACE and UMA tests are individually skipped if the respective backend is not installed or the model checkpoint is not cached.
