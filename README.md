@@ -154,4 +154,12 @@ tests/                    — pytest test suite
 pixi run python -m pytest tests/ -q
 ```
 
-The full test suite takes ~5 minutes; torsional sampling tests are the slowest (~4.5 min) because they embed conformers with CPU ETKDGv3.
+The full suite takes **~15 minutes** on a modern CPU. Individual file runtimes:
+
+| File | Tests | Time |
+|------|-------|------|
+| `test_confsweeper.py` | 16 | ~9 min |
+| `test_torsional_sampling.py` | 46 | ~4.5 min |
+| others | — | < 1 min |
+
+`test_confsweeper.py` is slow because the CLI test runs CPU ETKDGv3 across all six peptides in the test CSV. `test_torsional_sampling.py` is slow because constrained DG embedding is CPU-only by design (see `src/README.md`).
