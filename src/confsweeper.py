@@ -23,6 +23,8 @@ from rdkit.Chem.rdDistGeom import ETKDGv3
 from rdkit.ML.Cluster.Butina import ClusterData
 from tqdm import tqdm
 
+from torsional_sampling import load_ramachandran_grids, sample_constrained_confs
+
 warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
 
@@ -253,19 +255,30 @@ def get_mol_PE_batched(
     n_confs: int = 1000,
     cutoff_dist: float = 0.1,
     gpu_clustering: bool = True,
+    grids: dict | None = None,
+    n_constrained_samples: int = 0,
+    torsion_strategy: str = "uniform",
+    torsion_seed: int = 0,
 ) -> Tuple:
     """
-    Like get_mol_PE but scores all Butina-representative conformers in a single
-    MACE forward pass via _mace_batch_energies.
+    Embed conformers for a SMILES string, cluster with Butina, and score with a
+    batched MACE forward pass. Optionally augments the ETKDG pool (Pool A) with a
+    second pool of backbone dihedral-constrained conformers (Pool B) before
+    deduplication, so the merged pool covers dihedral regions that ETKDG misses.
 
     Params:
         smi: str : input SMILES string
         params : ETKDG params from get_embed_params or get_embed_params_macrocycle
         hardware_opts : nvmolkit hardware options from get_hardware_opts
         calc : MACECalculator from get_mace_calc() (UMA fallback supported)
-        n_confs: int : conformers to embed before clustering
-        cutoff_dist: float : Butina RMSD clustering cutoff
+        n_confs: int : Pool A conformers to embed via nvmolkit ETKDG
+        cutoff_dist: float : Butina clustering cutoff (normalised L1 units)
         gpu_clustering: bool : use nvmolkit GPU Butina (True) or RDKit CPU Butina (False)
+        grids: dict | None : Ramachandran grids from load_ramachandran_grids(); if None,
+                             torsional sampling (Pool B) is skipped
+        n_constrained_samples: int : Pool B (phi, psi) draws; ignored when grids is None
+        torsion_strategy: str : 'uniform' or 'inverse' (see torsional_sampling module)
+        torsion_seed: int : RNG seed for Pool B sampling
     Returns:
         rdkit.Chem.Mol : mol with only Butina-representative conformers attached
         List[int] : conformer IDs of cluster representatives
@@ -275,10 +288,27 @@ def get_mol_PE_batched(
     embed.EmbedMolecules(
         [mol], params, confsPerMolecule=n_confs, hardwareOptions=hardware_opts
     )
-    coords = []
-    for conf in mol.GetConformers():
-        coords.append(conf.GetPositions())
-    coords = torch.tensor(np.array(coords))
+
+    if grids is not None and n_constrained_samples > 0:
+        sample_constrained_confs(
+            mol,
+            grids,
+            n_constrained_samples,
+            strategy=torsion_strategy,
+            seed=torsion_seed,
+        )
+
+    # Collect all conformer IDs in iteration order before building the distance
+    # matrix.  Pool A IDs are 0-based sequential (nvmolkit); Pool B IDs start
+    # from n_pool_a (appended by embed_constrained).  Butina returns 0-based row
+    # indices, not IDs, so we need this mapping to recover the actual conf IDs.
+    all_conf_ids = [c.GetId() for c in mol.GetConformers()]
+    if not all_conf_ids:
+        return mol, [], []
+
+    coords = torch.tensor(
+        np.array([mol.GetConformer(cid).GetPositions() for cid in all_conf_ids])
+    )
     n_atoms = coords.shape[1]
     dists = torch.cdist(
         torch.flatten(coords, start_dim=1), torch.flatten(coords, start_dim=1), p=1.0
@@ -288,17 +318,19 @@ def get_mol_PE_batched(
         _, centroids_result = clustering.butina(
             dists.to("cuda:0"), cutoff=cutoff_dist, return_centroids=True
         )
-        centroid_ids = centroids_result.numpy().tolist()
+        centroid_row_ids = centroids_result.numpy().tolist()
     else:
         clusters = ClusterData(
             dists.numpy(),
-            n_confs,
+            len(all_conf_ids),
             cutoff_dist,
             isDistData=True,
             distFunc=None,
             reordering=True,
         )
-        centroid_ids = [clusters[x][0] for x in range(len(clusters))]
+        centroid_row_ids = [clusters[x][0] for x in range(len(clusters))]
+
+    centroid_ids = [all_conf_ids[i] for i in centroid_row_ids]
 
     atomic_nums = [atom.GetAtomicNum() for atom in mol.GetAtoms()]
     ase_mols = [
@@ -308,9 +340,10 @@ def get_mol_PE_batched(
 
     pe = _mace_batch_energies(calc, ase_mols)
 
-    to_remove = [x for x in range(n_confs) if x not in centroid_ids]
-    for id_ in to_remove:
-        mol.RemoveConformer(id_)
+    centroid_set = set(centroid_ids)
+    for cid in all_conf_ids:
+        if cid not in centroid_set:
+            mol.RemoveConformer(cid)
 
     return mol, centroid_ids, pe
 
@@ -475,20 +508,72 @@ def write_sdf(
 @click.option("--smi_csv")
 @click.option("--output_dir")
 @click.option("--save_lowest_energy", default=False)
+@click.option(
+    "--sampling_mode",
+    type=click.Choice(["etkdg", "etkdg+torsional"]),
+    default="etkdg",
+    show_default=True,
+    help="etkdg: standard nvmolkit ETKDGv3. etkdg+torsional: adds a second pool of "
+    "backbone dihedral-constrained conformers sampled from the CREMP Ramachandran prior.",
+)
+@click.option(
+    "--n_constrained_samples",
+    default=200,
+    show_default=True,
+    help="Number of (phi, psi) draws for Pool B (etkdg+torsional only).",
+)
+@click.option(
+    "--torsion_strategy",
+    type=click.Choice(["uniform", "inverse"]),
+    default="uniform",
+    show_default=True,
+    help="uniform: equal weight to all CREMP-accessible cells. "
+    "inverse: oversample rare cells to fill ETKDG gaps (etkdg+torsional only).",
+)
+@click.option(
+    "--ramachandran_grids",
+    default="data/processed/cremp/ramachandran_grids.npz",
+    show_default=True,
+    help="Path to CREMP Ramachandran grids .npz built by data/scripts/build_ramachandran_grids.py.",
+)
 def run_PE_calc(
-    smi_csv: pd.DataFrame, output_dir: os.PathLike | str, save_lowest_energy: bool
+    smi_csv: pd.DataFrame,
+    output_dir: os.PathLike | str,
+    save_lowest_energy: bool,
+    sampling_mode: str,
+    n_constrained_samples: int,
+    torsion_strategy: str,
+    ramachandran_grids: str,
 ):
-    params = get_embed_params()
     hardware_opts = get_hardware_opts()
     uma_calc = get_uma_calc()
     smi_df = read_csv(smi_csv)
+
+    if sampling_mode == "etkdg+torsional":
+        params = get_embed_params_macrocycle()
+        grids = load_ramachandran_grids(ramachandran_grids)
+    else:
+        params = get_embed_params()
+        grids = None
+
     for smi, uuid_ in tqdm(zip(smi_df["smiles"], smi_df["uuid"]), total=len(smi_df)):
-        mol, conf_ids, pe = get_mol_PE(
-            smi=smi,
-            params=params,
-            hardware_opts=hardware_opts,
-            calc=uma_calc,
-        )
+        if sampling_mode == "etkdg+torsional":
+            mol, conf_ids, pe = get_mol_PE_batched(
+                smi=smi,
+                params=params,
+                hardware_opts=hardware_opts,
+                calc=uma_calc,
+                grids=grids,
+                n_constrained_samples=n_constrained_samples,
+                torsion_strategy=torsion_strategy,
+            )
+        else:
+            mol, conf_ids, pe = get_mol_PE(
+                smi=smi,
+                params=params,
+                hardware_opts=hardware_opts,
+                calc=uma_calc,
+            )
         write_sdf(
             mol=mol,
             conf_ids=conf_ids,

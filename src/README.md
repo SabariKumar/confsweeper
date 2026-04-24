@@ -46,13 +46,17 @@ which backend scored the conformers.
 in a separate ASE calculator call. Works with both MACE and UMA but is slow for
 large representative sets because it iterates conformers sequentially.
 
-**`get_mol_PE_batched`** — preferred for MACE. Scores all Butina representatives in
-a single MACE forward pass via `_mace_batch_energies`. The batching is implemented
-by assembling a single PyG `Batch` from all conformers and calling the MACE model
-once with `compute_force=False`. This is the right function for production runs
-where GPU utilisation matters. If the MACE batching API is unavailable or raises
+**`get_mol_PE_batched`** — preferred for MACE, and the only function that supports
+torsional sampling. After Pool A embedding it optionally calls `sample_constrained_confs`
+to append Pool B conformers to the same mol object, then runs a single Butina pass over
+the merged pool before scoring. All Butina representatives are scored in one MACE forward
+pass via `_mace_batch_energies`. If the MACE batching API is unavailable or raises
 (e.g. when `calc` is a UMA calculator), `_mace_batch_energies` falls back silently
 to sequential scoring.
+
+Torsional sampling is activated by passing `grids` (loaded from the CREMP Ramachandran
+`.npz` via `load_ramachandran_grids`) and setting `n_constrained_samples > 0`. When
+`grids=None` (the default), behaviour is identical to before — no overhead is added.
 
 **`get_mol_PE_mmff`** — like `get_mol_PE_batched` but scores with MMFF94. No GPU
 required for the scoring step; GPU is still used for embedding and Butina.
@@ -61,9 +65,16 @@ required for the scoring step; GPU is still used for embedding and Butina.
 
 Butina clustering runs on the pairwise L1 distance matrix between flattened conformer
 coordinate tensors, normalised by `3 * n_atoms` so the cutoff is in Å-per-atom units
-rather than raw L1 distance. The GPU Butina path (`nvmolkit.clustering.butina`) returns
-centroid conformer IDs directly. The CPU fallback uses `rdkit.ML.Cluster.Butina.ClusterData`
-and takes the first member of each cluster as the representative.
+rather than raw L1 distance. The GPU Butina path (`nvmolkit.clustering.butina`) and the
+CPU fallback (`rdkit.ML.Cluster.Butina.ClusterData`) both return 0-based *row indices*
+into the distance matrix, not RDKit conformer IDs.
+
+In the single-pool (ETKDG-only) case these happen to be the same, because nvmolkit
+assigns conformer IDs starting at 0 sequentially. In the two-pool case, Pool B
+conformers receive IDs starting from the Pool A count, so row index ≠ conformer ID.
+`get_mol_PE_batched` handles this by collecting `all_conf_ids = [c.GetId() for c in
+mol.GetConformers()]` before building the distance matrix and mapping centroid row
+indices back through that list to recover actual conformer IDs.
 
 The normalisation `/ (3 * n_atoms)` means `cutoff_dist=0.1` corresponds to a mean
 coordinate deviation of 0.1 Å per atom, not a 0.1 Å RMSD. This is a coarser criterion
@@ -71,7 +82,7 @@ than symmetric RMSD but is much cheaper to compute across thousands of conformer
 
 ### Data contracts
 
-**`get_mol_PE` / `get_mol_PE_batched` / `get_mol_PE_mmff`**
+**`get_mol_PE` / `get_mol_PE_mmff`** (shared params)
 
 | Argument | Type | Notes |
 |----------|------|-------|
@@ -82,6 +93,15 @@ than symmetric RMSD but is much cheaper to compute across thousands of conformer
 | `n_confs` | `int` | conformers to embed before Butina (default 1000) |
 | `cutoff_dist` | `float` | Butina threshold in normalised L1 units (default 0.1) |
 | `gpu_clustering` | `bool` | `True` to use nvmolkit GPU Butina (default) |
+
+**`get_mol_PE_batched`** — all of the above, plus:
+
+| Argument | Type | Notes |
+|----------|------|-------|
+| `grids` | `dict \| None` | from `load_ramachandran_grids()`; `None` disables Pool B |
+| `n_constrained_samples` | `int` | Pool B (phi, psi) draws (default 0) |
+| `torsion_strategy` | `str` | `'uniform'` or `'inverse'` (default `'uniform'`) |
+| `torsion_seed` | `int` | RNG seed for Pool B reproducibility (default 0) |
 
 Returns `(mol, conf_ids, pe)`:
 - `mol`: `Chem.Mol` with only Butina-representative conformers attached
