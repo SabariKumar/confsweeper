@@ -123,8 +123,7 @@ def get_uma_calc(model: str = "uma-s-1", task: str = "omol"):
     """
     Return a FairChem UMA ASE calculator (default: UMA-S, omol task).
 
-    The omol task head is trained on the OMol25 dataset (organic molecules,
-    DFT-level) and is the appropriate choice for peptide conformer scoring.
+    Deprecated: UMA is not actively supported. Use get_mace_calc() instead.
 
     Params:
         model : FairChem checkpoint name or path (default "uma-s-1")
@@ -132,6 +131,13 @@ def get_uma_calc(model: str = "uma-s-1", task: str = "omol"):
     Returns:
         ASE calculator compatible with ase_mol.get_potential_energy()
     """
+    import warnings
+
+    warnings.warn(
+        "get_uma_calc() is not actively supported. Use get_mace_calc() instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     from fairchem.core import FAIRChemCalculator
 
     return FAIRChemCalculator(checkpoint_path=model, task_name=task)
@@ -275,7 +281,8 @@ def get_mol_PE_batched(
         cutoff_dist: float : Butina clustering cutoff (normalised L1 units)
         gpu_clustering: bool : use nvmolkit GPU Butina (True) or RDKit CPU Butina (False)
         grids: dict | None : Ramachandran grids from load_ramachandran_grids(); if None,
-                             torsional sampling (Pool B) is skipped
+                             torsional sampling (Pool B) is skipped. MACROCYCLIC
+                             PEPTIDES ONLY — see torsional_sampling.py module docstring.
         n_constrained_samples: int : Pool B (phi, psi) draws; ignored when grids is None
         torsion_strategy: str : 'uniform' or 'inverse' (see torsional_sampling module)
         torsion_seed: int : RNG seed for Pool B sampling
@@ -513,8 +520,10 @@ def write_sdf(
     type=click.Choice(["etkdg", "etkdg+torsional"]),
     default="etkdg",
     show_default=True,
-    help="etkdg: standard nvmolkit ETKDGv3. etkdg+torsional: adds a second pool of "
-    "backbone dihedral-constrained conformers sampled from the CREMP Ramachandran prior.",
+    help="etkdg: standard nvmolkit ETKDGv3, suitable for any molecule type. "
+    "etkdg+torsional: adds a second pool of backbone dihedral-constrained conformers "
+    "sampled from the CREMP Ramachandran prior — MACROCYCLIC PEPTIDES ONLY. "
+    "Automatically switches to macrocycle-specific ETKDG parameters.",
 )
 @click.option(
     "--n_constrained_samples",
@@ -546,7 +555,7 @@ def run_PE_calc(
     ramachandran_grids: str,
 ):
     hardware_opts = get_hardware_opts()
-    uma_calc = get_uma_calc()
+    mace_calc = get_mace_calc()
     smi_df = read_csv(smi_csv)
 
     if sampling_mode == "etkdg+torsional":
@@ -562,7 +571,7 @@ def run_PE_calc(
                 smi=smi,
                 params=params,
                 hardware_opts=hardware_opts,
-                calc=uma_calc,
+                calc=mace_calc,
                 grids=grids,
                 n_constrained_samples=n_constrained_samples,
                 torsion_strategy=torsion_strategy,
@@ -572,7 +581,7 @@ def run_PE_calc(
                 smi=smi,
                 params=params,
                 hardware_opts=hardware_opts,
-                calc=uma_calc,
+                calc=mace_calc,
             )
         write_sdf(
             mol=mol,

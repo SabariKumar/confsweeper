@@ -1,9 +1,13 @@
 """
 Backbone dihedral-constrained conformer generation for macrocyclic peptides.
 
-Provides tools to inject target (phi, psi) backbone dihedral angles as 1,4-distance
-constraints into an RDKit bounds matrix, then embed conformers satisfying those
-constraints via ETKDGv3.  Intended as Phase 2 of the confsweeper pipeline:
+**This module is macrocycle-specific.** It targets the backbone (phi, psi) dihedral
+space of head-to-tail cyclic peptides and assumes ring-closure constraints are present.
+It is not intended for acyclic molecules or non-peptide macrocycles.
+
+For general-purpose conformer generation (any molecule type), use the ETKDG functions
+in confsweeper.py directly. This module acts as Phase 2 of the pipeline, augmenting the
+ETKDG pool with conformers from backbone dihedral regions that ETKDGv3 tends to miss:
 
     Phase 1 (nvmolkit ETKDG) → pool A   (force-field-favored conformers)
     Phase 2 (constrained DG) → pool B   (dihedral-targeted conformers)
@@ -11,8 +15,18 @@ constraints via ETKDGv3.  Intended as Phase 2 of the confsweeper pipeline:
 
 The key idea is that ETKDGv3's distance geometry can be guided to embed conformers
 in specific (phi, psi) regions by tightening the 1,4-distance bounds for the
-relevant backbone atoms.  Ring-closure failures are free: ETKDGv3 returns no
-conformer for geometrically impossible combinations.
+relevant backbone atoms. Ring-closure failures are free: ETKDGv3 returns no
+conformer for geometrically impossible combinations, so inaccessible dihedral
+targets are discarded at zero cost.
+
+Why this is macrocycle-specific
+--------------------------------
+In acyclic molecules, systematic stepped rotations around each dihedral bond are
+a viable sampling strategy (the approach used by tools such as OMEGA). For macrocycles,
+ring-closure constraints couple all backbone dihedrals: rotating one bond changes
+the ring geometry, making independent stepped rotations produce mostly ring-open
+(invalid) structures. Distance geometry solves this correctly by enforcing ring
+closure as a constraint throughout embedding rather than as a post-hoc filter.
 """
 
 import logging

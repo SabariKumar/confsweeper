@@ -11,5 +11,8 @@ mace = ["mace-torch>=0.3.14,<0.4"]
 where = ["src"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["tests", "tests/integration"]
 pythonpath = ["src"]
+markers = [
+    "gpu: requires a CUDA GPU and nvmolkit — run with --gpu",
+]

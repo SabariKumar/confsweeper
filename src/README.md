@@ -1,9 +1,12 @@
 # src/
 
 Core confsweeper library. Three modules handle distinct responsibilities:
-`confsweeper.py` owns the full generation-to-scoring pipeline, `torsional_sampling.py`
-provides the backbone dihedral-constrained Phase 2 conformer pool, and `utils.py`
-provides geometry comparison utilities used by the validation layer.
+`confsweeper.py` owns the full generation-to-scoring pipeline and is general-purpose —
+it works for any molecule type. `torsional_sampling.py` provides the backbone
+dihedral-constrained Phase 2 conformer pool and is **macrocycle-specific**: it
+assumes a head-to-tail cyclic peptide backbone and should not be used for acyclic
+molecules. `utils.py` provides geometry comparison utilities used by the validation
+layer.
 
 ---
 
@@ -30,11 +33,13 @@ Two helper functions build RDKit `EmbedParameters` objects for nvmolkit:
 Three calculators are available, all returning energies in eV for compatibility with
 downstream Boltzmann-weighting code:
 
-| Function | Backend | Environment |
-|----------|---------|-------------|
-| `get_mace_calc()` | MACE-OFF (small/medium/large) | `mace` pixi env |
-| `get_uma_calc()` | FairChem UMA-S, omol task | `default` pixi env |
-| `get_mol_PE_mmff` (no separate getter) | RDKit MMFF94 | any |
+| Function | Backend | Environment | Status |
+|----------|---------|-------------|--------|
+| `get_mace_calc()` | MACE-OFF (small/medium/large) | `mace` pixi env | **Supported** |
+| `get_mol_PE_mmff` | RDKit MMFF94 | any | Supported |
+| `get_uma_calc()` | FairChem UMA-S, omol task | `default` pixi env | **Not supported** |
+
+UMA (`get_uma_calc`) is present in the codebase but not actively maintained. Use MACE-OFF.
 
 MMFF94 energies are converted from kcal/mol via the constant `_KCAL_TO_EV = 0.043364`.
 The conversion is applied in `get_mol_PE_mmff` so callers always see eV regardless of
@@ -126,6 +131,11 @@ carries a `MACE_ENERGY` property (eV) regardless of which backend was used. When
 ---
 
 ## torsional_sampling.py
+
+> **Macrocyclic peptides only.** This module targets the backbone (phi, psi) dihedral
+> space of head-to-tail cyclic peptides. It is not suitable for acyclic molecules or
+> non-peptide macrocycles. For general-purpose conformer generation, use the ETKDG
+> functions in `confsweeper.py` directly.
 
 Implements backbone dihedral-constrained conformer generation (Phase 2 of the two-pool
 pipeline). The key idea is that RDKit's distance geometry algorithm (ETKDGv3) is guided

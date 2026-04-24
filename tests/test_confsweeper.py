@@ -442,12 +442,22 @@ def test_get_mol_PE_batched_pool_b_centroid_id_correct():
     Pool B conformer IDs start at n_pool_a, so the Butina row index (n_pool_a + k)
     must be mapped back through all_conf_ids to the actual conformer ID.
     """
+    pool_b_ids: list[int] = []
 
     def _add_pool_b(mol, grids, n_samples, **kwargs):
-        AllChem.EmbedMultipleConfs(mol, numConfs=2, randomSeed=99)
-        return [c.GetId() for c in mol.GetConformers()][-2:]
+        # Add a conformer directly rather than via ETKDG — ethane is too simple for
+        # EmbedMultipleConfs to reliably produce a new conformer when one already exists.
+        from rdkit.Chem import Conformer
 
-    # _mock_butina_last selects the last row — a Pool B conformer.
+        n_atoms = mol.GetNumAtoms()
+        conf = Conformer(n_atoms)
+        for i in range(n_atoms):
+            conf.SetAtomPosition(i, (float(i), 0.0, 0.0))
+        new_id = mol.AddConformer(conf, assignId=True)
+        pool_b_ids.append(new_id)
+        return [new_id]
+
+    # _mock_butina_last selects the last row — which must be the Pool B conformer.
     with (
         patch("confsweeper.embed.EmbedMolecules", side_effect=_mock_embed),
         patch("confsweeper.clustering.butina", side_effect=_mock_butina_last),
@@ -461,14 +471,15 @@ def test_get_mol_PE_batched_pool_b_centroid_id_correct():
             calc=MagicMock(),
             n_confs=3,
             grids=_MOCK_GRIDS,
-            n_constrained_samples=2,
+            n_constrained_samples=1,
         )
 
     assert len(conf_ids) == 1
     valid_ids = {c.GetId() for c in mol.GetConformers()}
     assert conf_ids[0] in valid_ids
-    # The selected centroid is a Pool B conformer (ID >= n_pool_a = 3).
-    assert conf_ids[0] >= 3
+    # The selected centroid must be one of the Pool B conformers we tracked.
+    assert pool_b_ids, "Pool B must have produced at least one conformer"
+    assert conf_ids[0] in pool_b_ids
 
 
 # ---------------------------------------------------------------------------

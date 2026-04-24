@@ -828,7 +828,7 @@ packages:
 - pypi: ./
   name: confsweeper
   version: 0.0.1
-  sha256: 6e09270e69bffcd98063699ccc33924211b17408fd9ffd4ec7fb8a0d5c36d9a7
+  sha256: b31b04b6b8056c95b1fe9541f68fef5373ac0ec0ef5ce62d92e679bece817dcc
   requires_dist:
   - mace-torch>=0.3.14,<0.4 ; extra == 'mace'
   requires_python: '>=3.11'
