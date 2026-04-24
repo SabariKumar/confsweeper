@@ -245,7 +245,116 @@ def get_mol_PE(
         return mol, conf_ids, pe
 
 
+def get_mol_PE_batched(
+    smi: str,
+    params,
+    hardware_opts,
+    calc,
+    n_confs: int = 1000,
+    cutoff_dist: float = 0.1,
+    gpu_clustering: bool = True,
+) -> Tuple:
+    """
+    Like get_mol_PE but scores all Butina-representative conformers in a single
+    MACE forward pass via _mace_batch_energies.
+
+    Params:
+        smi: str : input SMILES string
+        params : ETKDG params from get_embed_params or get_embed_params_macrocycle
+        hardware_opts : nvmolkit hardware options from get_hardware_opts
+        calc : MACECalculator from get_mace_calc() (UMA fallback supported)
+        n_confs: int : conformers to embed before clustering
+        cutoff_dist: float : Butina RMSD clustering cutoff
+        gpu_clustering: bool : use nvmolkit GPU Butina (True) or RDKit CPU Butina (False)
+    Returns:
+        rdkit.Chem.Mol : mol with only Butina-representative conformers attached
+        List[int] : conformer IDs of cluster representatives
+        List[float] : potential energies in eV for each representative
+    """
+    mol = Chem.AddHs(Chem.MolFromSmiles(smi))
+    embed.EmbedMolecules(
+        [mol], params, confsPerMolecule=n_confs, hardwareOptions=hardware_opts
+    )
+    coords = []
+    for conf in mol.GetConformers():
+        coords.append(conf.GetPositions())
+    coords = torch.tensor(np.array(coords))
+    n_atoms = coords.shape[1]
+    dists = torch.cdist(
+        torch.flatten(coords, start_dim=1), torch.flatten(coords, start_dim=1), p=1.0
+    ) / (3 * n_atoms)
+
+    if gpu_clustering:
+        _, centroids_result = clustering.butina(
+            dists.to("cuda:0"), cutoff=cutoff_dist, return_centroids=True
+        )
+        centroid_ids = centroids_result.numpy().tolist()
+    else:
+        clusters = ClusterData(
+            dists.numpy(),
+            n_confs,
+            cutoff_dist,
+            isDistData=True,
+            distFunc=None,
+            reordering=True,
+        )
+        centroid_ids = [clusters[x][0] for x in range(len(clusters))]
+
+    atomic_nums = [atom.GetAtomicNum() for atom in mol.GetAtoms()]
+    ase_mols = [
+        ase.Atoms(positions=mol.GetConformer(cid).GetPositions(), numbers=atomic_nums)
+        for cid in centroid_ids
+    ]
+
+    pe = _mace_batch_energies(calc, ase_mols)
+
+    to_remove = [x for x in range(n_confs) if x not in centroid_ids]
+    for id_ in to_remove:
+        mol.RemoveConformer(id_)
+
+    return mol, centroid_ids, pe
+
+
 _KCAL_TO_EV = 0.043364  # 1 kcal/mol in eV
+
+
+def _mace_batch_energies(calc, ase_mols: list) -> list:
+    """
+    Score multiple ASE Atoms in a single MACE forward pass.
+
+    Builds one PyG Batch from all conformers, runs the model once, and returns
+    per-conformer energies in eV. Falls back to sequential scoring on any error
+    (e.g. if calc is not a MACECalculator or the private API has changed).
+
+    Params:
+        calc : MACECalculator returned by get_mace_calc()
+        ase_mols : list[ase.Atoms] conformers to score
+    Returns:
+        list[float] potential energies in eV, one per conformer
+    """
+    try:
+        from mace.tools.torch_geometric.batch import Batch
+
+        data_list = [calc._atoms_to_batch(m) for m in ase_mols]
+        batch = Batch.from_data_list(data_list).to(calc.device)
+
+        with torch.no_grad():
+            out = calc.models[0](
+                batch,
+                training=False,
+                compute_force=False,
+                compute_virials=False,
+                compute_stress=False,
+            )
+
+        scale = getattr(calc, "energy_units_to_eV", 1.0)
+        return (out["energy"].detach().cpu().float().numpy() * scale).tolist()
+    except Exception:
+        pe = []
+        for mol in ase_mols:
+            mol.calc = calc
+            pe.append(float(mol.get_potential_energy()))
+        return pe
 
 
 def get_mol_PE_mmff(
