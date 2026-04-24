@@ -13,7 +13,7 @@ cuda = "12"
 [dependencies]
 python = ">=3.11, <3.13"
 rdkit = "*"
-pytorch-gpu = ">=2.8.0,<2.9"
+pytorch-gpu = "==2.5.1"
 dgl = {version = ">2.0.0", channel="dglteam/label/th24_cu124"}
 jupyterlab = ">=4.5.1,<5"
 openbabel = ">=3.1.1,<4"
@@ -43,6 +43,7 @@ networkx = "*"
 cclib = ">=1.8.1, <2"
 pickledb = { version = ">=0.9, <1", extras = ["sqlite"] }
 aiosqlite = ">=0.20, <1"
+mace-torch = ">=0.3.14, <0.4"
 
 
 [activation.env]
