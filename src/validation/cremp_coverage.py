@@ -67,8 +67,8 @@ from nvmolkit import clustering
 from confsweeper import (
     get_embed_params_macrocycle,
     get_hardware_opts,
+    get_mace_calc,
     get_mol_PE,
-    get_uma_calc,
 )
 from torsional_sampling import load_ramachandran_grids, sample_constrained_confs
 from validation.cremp import calc_coverage, iter_validation_mols
@@ -286,7 +286,7 @@ def run_coverage_benchmark(
     hardware_opts = get_hardware_opts(
         preprocessingThreads=8, batch_size=1000, batchesPerGpu=2
     )
-    mace_calc = get_uma_calc()
+    mace_calc = get_mace_calc()
 
     # _gpu_lock: nvmolkit and MACE are not thread-safe — serialise all GPU work.
     # _write_lock: serialise CSV writes and done-set updates.
@@ -294,7 +294,15 @@ def run_coverage_benchmark(
     _write_lock = threading.Lock()
 
     def _compute_and_write(
-        sequence, smiles, ref_mol, meta, n, gen_mol, gen_conf_ids, time_gpu_s
+        sequence,
+        smiles,
+        ref_mol,
+        meta,
+        n,
+        sampling_mode,
+        gen_mol,
+        gen_conf_ids,
+        time_gpu_s,
     ):
         """CPU-bound half: spyrmsd coverage then write result. Runs in parallel."""
         t0 = time.perf_counter()
@@ -320,6 +328,7 @@ def run_coverage_benchmark(
             "num_monomers": meta["num_monomers"],
             "num_heavy_atoms": meta["num_heavy_atoms"],
             "n_confs": n,
+            "sampling_mode": sampling_mode,
             "n_generated_confs": len(gen_conf_ids),
             "n_ref_confs": ref_mol.GetNumConformers(),
             "coverage": round(coverage, 6),
@@ -330,7 +339,7 @@ def run_coverage_benchmark(
         }
         with _write_lock:
             _append_row(output_csv, row, OUTPUT_COLUMNS)
-            done.add((sequence, n))
+            done.add((sequence, n, sampling_mode))
 
     coverage_futures = []
 
@@ -338,13 +347,14 @@ def run_coverage_benchmark(
         mol_iter = iter_validation_mols(subset_csv, pickle_dir)
         for sequence, smiles, ref_mol, meta in tqdm(mol_iter, desc="molecules"):
             for n in n_confs_values:
-                if (sequence, n) in done:
+                if (sequence, n, sampling_mode) in done:
                     continue
                 try:
                     # GPU work: serialised so nvmolkit/MACE are never called concurrently.
                     t0 = time.perf_counter()
                     with _gpu_lock:
-                        gen_mol, gen_conf_ids, _ = get_mol_PE(
+                        # --- Pool A: standard ETKDG → Butina → MACE ---
+                        gen_mol, gen_conf_ids_a, pe_a = get_mol_PE(
                             smi=smiles,
                             params=params,
                             hardware_opts=hardware_opts,
@@ -353,11 +363,52 @@ def run_coverage_benchmark(
                             cutoff_dist=butina_thresh,
                             gpu_clustering=True,
                         )
-                    time_gpu_s = time.perf_counter() - t0
-                    gen_conf_ids = list(gen_conf_ids)
+                        gen_conf_ids_a = list(gen_conf_ids_a)
 
-                    if len(gen_conf_ids) == 0:
-                        raise ValueError("EmbedMolecules produced 0 conformers")
+                        if len(gen_conf_ids_a) == 0:
+                            raise ValueError("EmbedMolecules produced 0 conformers")
+
+                        gen_conf_ids = gen_conf_ids_a
+
+                        # --- Pool B: torsional sampling ---
+                        if torsional_sampling and grids is not None:
+                            pool_b_ids = sample_constrained_confs(
+                                gen_mol,
+                                grids,
+                                n_samples=torsional_n_samples,
+                                strategy=torsional_strategy,
+                                seed=42,
+                            )
+
+                            if pool_b_ids:
+                                # MACE-score Pool B and filter by Pool A energy envelope
+                                pe_b = _mace_score_conf_ids(
+                                    gen_mol, pool_b_ids, mace_calc
+                                )
+                                e_mean = float(np.mean(pe_a))
+                                e_std = float(np.std(pe_a))
+                                threshold = e_mean + torsional_energy_sigma * e_std
+                                filtered_b_ids = [
+                                    cid
+                                    for cid, e in zip(pool_b_ids, pe_b)
+                                    if e <= threshold
+                                ]
+                                logger.debug(
+                                    "%s: Pool B %d embedded, %d pass energy filter (threshold %.3f eV)",
+                                    sequence,
+                                    len(pool_b_ids),
+                                    len(filtered_b_ids),
+                                    threshold,
+                                )
+
+                                if filtered_b_ids:
+                                    # Single Butina pass on combined A+B to de-duplicate
+                                    combined_ids = gen_conf_ids_a + filtered_b_ids
+                                    gen_conf_ids = _butina_on_conf_ids(
+                                        gen_mol, combined_ids, cutoff=butina_thresh
+                                    )
+
+                    time_gpu_s = time.perf_counter() - t0
 
                     # CPU work: submit spyrmsd coverage to thread pool, overlapping
                     # with the next GPU job.
@@ -368,6 +419,7 @@ def run_coverage_benchmark(
                         ref_mol,
                         meta,
                         n,
+                        sampling_mode,
                         gen_mol,
                         gen_conf_ids,
                         time_gpu_s,
@@ -376,12 +428,21 @@ def run_coverage_benchmark(
 
                 except Exception as e:
                     logger.warning(
-                        "Error processing %s at n_confs=%d: %s", sequence, n, e
+                        "Error processing %s at n_confs=%d mode=%s: %s",
+                        sequence,
+                        n,
+                        sampling_mode,
+                        e,
                     )
                     with _write_lock:
                         _append_row(
                             errors_csv,
-                            {"sequence": sequence, "n_confs": n, "error": str(e)},
+                            {
+                                "sequence": sequence,
+                                "n_confs": n,
+                                "sampling_mode": sampling_mode,
+                                "error": str(e),
+                            },
                             ERROR_COLUMNS,
                         )
 
