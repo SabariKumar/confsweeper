@@ -23,10 +23,11 @@ Two helper functions build RDKit `EmbedParameters` objects for nvmolkit:
 
 - **`get_embed_params()`** — baseline ETKDGv3 with `useRandomCoords=True`. Suitable
   for small molecules.
-- **`get_embed_params_macrocycle()`** — adds `useMacrocycleTorsions`, `useMacrocycle14config`,
-  and `useSmallRingTorsions`. The macrocycle flags enable a special sampling regime in
-  ETKDGv3 that handles the ring-closure constraints of cyclic backbones. Use this for
-  any cyclic peptide input.
+- **`get_embed_params_macrocycle()`** — adds `useMacrocycleTorsions` and
+  `useMacrocycle14config`, the ETKDGv3 flags that enable a special sampling regime for
+  ring-closure constraints on cyclic backbones. Use this for any cyclic peptide input.
+  `useSmallRingTorsions` is intentionally left disabled — nvmolkit does not support
+  the flag and hangs indefinitely in CPU preprocessing when it is set.
 
 ### Energy backends
 

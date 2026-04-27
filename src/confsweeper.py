@@ -75,9 +75,12 @@ def get_embed_params() -> rdkit.Chem.rdDistGeom.EmbedParameters:
 def get_embed_params_macrocycle() -> rdkit.Chem.rdDistGeom.EmbedParameters:
     """
     ETKDG setup for macrocyclic molecules. ETKDGv3 already enables
-    useMacrocycleTorsions and useMacrocycle14config by default; this function
-    additionally enables useSmallRingTorsions (off by default) which improves
-    embedding for ring systems within the macrocycle scaffold.
+    useMacrocycleTorsions and useMacrocycle14config by default; the
+    useSmallRingTorsions flag (which would improve embedding for small ring
+    systems within the macrocycle scaffold) is intentionally left disabled
+    because nvmolkit does not support it and hangs indefinitely in CPU
+    preprocessing when it is set.
+
     Params:
         None
     Returns:
@@ -87,9 +90,6 @@ def get_embed_params_macrocycle() -> rdkit.Chem.rdDistGeom.EmbedParameters:
     params.useRandomCoords = True
     params.useMacrocycleTorsions = True
     params.useMacrocycle14config = True
-    # useSmallRingTorsions is disabled: nvmolkit does not support this ETKDGv3 flag
-    # and hangs indefinitely in CPU preprocessing when it is set.
-    # params.useSmallRingTorsions = True
     return params
 
 
