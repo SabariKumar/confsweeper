@@ -396,6 +396,51 @@ def _mace_batch_energies(calc, ase_mols: list) -> list:
         return pe
 
 
+def _energy_ranked_dedup(
+    coords: torch.Tensor,
+    energies: np.ndarray,
+    rmsd_threshold: float,
+) -> list[int]:
+    """
+    Pick basin representatives by energy rank with a geometric exclusion radius.
+
+    Differs from Butina: Butina picks dense cluster centres first, which can
+    discard the lowest-energy member of a dense cluster. Energy-ranked dedup
+    iterates lowest energy first, so each basin's representative is its
+    energy minimum.
+
+    Distances use the same normalised L1 metric as get_mol_PE_batched so the
+    rmsd_threshold parameter is comparable to its cutoff_dist (default 0.1).
+
+    Params:
+        coords: torch.Tensor : conformer coordinates [N, A, 3]
+        energies: ndarray [N] : potential energies in eV (any shift; only differences matter)
+        rmsd_threshold: float : exclusion radius in normalised L1 units (sum |Δ| / 3·A)
+    Returns:
+        list[int] : indices into the input arrays of the chosen centroids,
+                    ordered by ascending energy
+    """
+    n = coords.shape[0]
+    if n == 0:
+        return []
+    if n == 1:
+        return [0]
+
+    n_atoms = coords.shape[1]
+    flat = coords.reshape(n, -1)
+    order = np.argsort(np.asarray(energies), kind="stable")
+
+    excluded = torch.zeros(n, dtype=torch.bool, device=flat.device)
+    centroids: list[int] = []
+    for idx in order.tolist():
+        if bool(excluded[idx]):
+            continue
+        centroids.append(idx)
+        d = (flat - flat[idx].unsqueeze(0)).abs().sum(dim=1) / (3 * n_atoms)
+        excluded |= d < rmsd_threshold
+    return centroids
+
+
 def get_mol_PE_mmff(
     smi: str,
     params,
