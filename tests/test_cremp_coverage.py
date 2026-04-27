@@ -138,7 +138,7 @@ class TestAppendRow:
 
 
 def _mock_get_mol_PE(
-    smi, params, hardware_opts, calc, n_confs, cutoff_dist, gpu_clustering
+    smi, params, hardware_opts, mace_calc, n_confs, cutoff_dist, gpu_clustering
 ):
     """Returns a mol with n_confs conformers and dummy PE values."""
     mol = _make_mol(smi, min(n_confs, 3))
@@ -178,7 +178,7 @@ class TestRunCoverageBenchmark:
 
         with patch("validation.cremp_coverage.get_embed_params_macrocycle"), patch(
             "validation.cremp_coverage.get_hardware_opts"
-        ), patch("validation.cremp_coverage.get_uma_calc"), patch(
+        ), patch("validation.cremp_coverage.get_mace_calc"), patch(
             "validation.cremp_coverage.get_mol_PE", side_effect=_mock_get_mol_PE
         ):
             result = runner.invoke(run_coverage_benchmark, args)
@@ -217,7 +217,14 @@ class TestRunCoverageBenchmark:
         # Pre-populate output CSV with one (sequence, n_confs) pair
         output_csv = str(tmp_path / "coverage.csv")
         pre_row = {c: "" for c in OUTPUT_COLUMNS}
-        pre_row.update({"sequence": "A.V.G.L", "n_confs": "1000", "coverage": "0.99"})
+        pre_row.update(
+            {
+                "sequence": "A.V.G.L",
+                "n_confs": "1000",
+                "sampling_mode": "etkdg",
+                "coverage": "0.99",
+            }
+        )
         _append_row(output_csv, pre_row, OUTPUT_COLUMNS)
 
         pkl_dir = tmp_path / "pickle"
@@ -235,7 +242,7 @@ class TestRunCoverageBenchmark:
         runner = CliRunner()
         with patch("validation.cremp_coverage.get_embed_params_macrocycle"), patch(
             "validation.cremp_coverage.get_hardware_opts"
-        ), patch("validation.cremp_coverage.get_uma_calc"), patch(
+        ), patch("validation.cremp_coverage.get_mace_calc"), patch(
             "validation.cremp_coverage.get_mol_PE", side_effect=counting_mock
         ):
             runner.invoke(
@@ -268,7 +275,7 @@ class TestRunCoverageBenchmark:
         runner = CliRunner()
         with patch("validation.cremp_coverage.get_embed_params_macrocycle"), patch(
             "validation.cremp_coverage.get_hardware_opts"
-        ), patch("validation.cremp_coverage.get_uma_calc"), patch(
+        ), patch("validation.cremp_coverage.get_mace_calc"), patch(
             "validation.cremp_coverage.get_mol_PE", side_effect=RuntimeError("GPU OOM")
         ):
             runner.invoke(
@@ -313,7 +320,7 @@ class TestRunCoverageBenchmark:
         runner = CliRunner()
         with patch("validation.cremp_coverage.get_embed_params_macrocycle"), patch(
             "validation.cremp_coverage.get_hardware_opts"
-        ), patch("validation.cremp_coverage.get_uma_calc"), patch(
+        ), patch("validation.cremp_coverage.get_mace_calc"), patch(
             "validation.cremp_coverage.get_mol_PE", side_effect=fail_first
         ):
             result = runner.invoke(
@@ -329,6 +336,8 @@ class TestRunCoverageBenchmark:
                     errors_csv,
                     "--n_confs",
                     "1000",
+                    "--max_workers",
+                    "1",
                 ],
             )
 
@@ -337,3 +346,47 @@ class TestRunCoverageBenchmark:
         df = pd.read_csv(output_csv)
         assert len(df) == 1
         assert df.iloc[0]["sequence"] == "a.V.G.L"
+
+    def test_torsional_sampling_mode_written_to_output(self, tmp_path):
+        pkl_dir = tmp_path / "pickle"
+        pkl_dir.mkdir()
+        _write_pickle(pkl_dir / "A.V.G.L.pickle")
+        subset_csv = _make_subset_csv(tmp_path, ["A.V.G.L"])
+        output_csv = str(tmp_path / "coverage.csv")
+        errors_csv = str(tmp_path / "errors.csv")
+
+        # sample_constrained_confs returns no Pool B ids — we just want to confirm
+        # the sampling_mode label reaches the output CSV.
+        runner = CliRunner()
+        with patch("validation.cremp_coverage.get_embed_params_macrocycle"), patch(
+            "validation.cremp_coverage.get_hardware_opts"
+        ), patch("validation.cremp_coverage.get_mace_calc"), patch(
+            "validation.cremp_coverage.get_mol_PE", side_effect=_mock_get_mol_PE
+        ), patch(
+            "validation.cremp_coverage.load_ramachandran_grids", return_value={}
+        ), patch(
+            "validation.cremp_coverage.sample_constrained_confs", return_value=[]
+        ):
+            result = runner.invoke(
+                run_coverage_benchmark,
+                [
+                    "--subset_csv",
+                    str(subset_csv),
+                    "--pickle_dir",
+                    str(pkl_dir),
+                    "--output_csv",
+                    output_csv,
+                    "--errors_csv",
+                    errors_csv,
+                    "--n_confs",
+                    "1000",
+                    "--torsional_sampling",
+                    "--max_workers",
+                    "1",
+                ],
+            )
+
+        assert result.exit_code == 0, result.output
+        df = pd.read_csv(output_csv)
+        assert len(df) == 1
+        assert df.iloc[0]["sampling_mode"] == "etkdg+torsional"

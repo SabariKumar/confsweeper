@@ -87,10 +87,9 @@ def get_embed_params_macrocycle() -> rdkit.Chem.rdDistGeom.EmbedParameters:
     params.useRandomCoords = True
     params.useMacrocycleTorsions = True
     params.useMacrocycle14config = True
-    # TODO: verify useSmallRingTorsions compatibility with nvmolkit before use in
-    # production. nvmolkit may not support all ETKDGv3 torsion flags — if embedding
-    # silently produces 0 conformers or crashes, disable this first.
-    params.useSmallRingTorsions = True
+    # useSmallRingTorsions is disabled: nvmolkit does not support this ETKDGv3 flag
+    # and hangs indefinitely in CPU preprocessing when it is set.
+    # params.useSmallRingTorsions = True
     return params
 
 

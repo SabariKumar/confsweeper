@@ -197,6 +197,11 @@ def calc_coverage(
         dtype=torch.float32,
     )
 
+    # Center each conformer to its centroid so the pre-filter RMSD reflects
+    # shape difference, not translational offset between independent coordinate frames.
+    ref_coords = ref_coords - ref_coords.mean(dim=1, keepdim=True)
+    gen_coords = gen_coords - gen_coords.mean(dim=1, keepdim=True)
+
     # Center each conformer to remove translational offset before pre-filtering.
     # ETKDG and GFN2-xTB place molecules in arbitrary frames; without this,
     # raw pairwise RMSDs are dominated by translation and every candidate fails.
