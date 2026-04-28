@@ -176,11 +176,25 @@ def _make_seq_mock_mace():
 
 @pytest.fixture
 def exhaustive_mocks():
-    """Patch nvmolkit embed and MACE scoring with deterministic CPU mocks."""
+    """
+    Patch nvmolkit embed, MACE scoring, and GPU MMFF with deterministic CPU
+    mocks so integration tests run without a GPU and without depending on
+    nvmolkit's real CUDA paths.
+
+    GPU MMFF is patched as a no-op (it would otherwise be called from
+    `get_mol_PE_exhaustive` whenever minimize=True, which is now the default).
+    Tests that specifically exercise the MMFF dispatch path patch
+    `nvmolkit.mmffOptimization.MMFFOptimizeMoleculesConfs` themselves.
+    """
     mock_mace = _make_seq_mock_mace()
-    with patch(
-        "confsweeper.embed.EmbedMolecules", side_effect=_mock_embed_seed_aware
-    ), patch("confsweeper._mace_batch_energies", side_effect=mock_mace):
+    with (
+        patch("confsweeper.embed.EmbedMolecules", side_effect=_mock_embed_seed_aware),
+        patch("confsweeper._mace_batch_energies", side_effect=mock_mace),
+        patch(
+            "nvmolkit.mmffOptimization.MMFFOptimizeMoleculesConfs",
+            return_value=[[]],
+        ),
+    ):
         yield
 
 
@@ -360,6 +374,95 @@ def test_exhaustive_minimize_unknown_backend_raises(exhaustive_mocks):
             minimize=True,
             mmff_backend="something_else",
         )
+
+
+def test_exhaustive_minimize_false_skips_both_backends(exhaustive_mocks):
+    """minimize=False must not call MMFF on either backend, regardless of what
+    mmff_backend is set to. The mmff_backend value is only consulted when
+    minimize is True."""
+    n_seeds = 6
+    with (
+        patch("rdkit.Chem.AllChem.MMFFOptimizeMolecule", return_value=0) as mock_cpu,
+        patch(
+            "nvmolkit.mmffOptimization.MMFFOptimizeMoleculesConfs",
+            return_value=[[]],
+        ) as mock_gpu,
+    ):
+        get_mol_PE_exhaustive(
+            TEST_SMILES,
+            get_embed_params(),
+            hardware_opts=None,
+            calc=MagicMock(),
+            n_seeds=n_seeds,
+            embed_chunk_size=n_seeds,
+            score_chunk_size=n_seeds,
+            minimize=False,
+            mmff_backend="gpu",  # ignored when minimize=False
+            rmsd_threshold=0.0,
+            e_window_kT=1e9,
+        )
+    mock_cpu.assert_not_called()
+    mock_gpu.assert_not_called()
+
+
+def test_exhaustive_energy_filter_force_keeps_minimum(exhaustive_mocks):
+    """If every conformer's energy comparison evaluates to False (e.g. NaN
+    energies), the energy-filter guard force-retains a single conformer at
+    `argmin(energies)` so the contract "at least one centroid" holds.
+
+    This exercises the `if not keep_mask.any()` fallback in get_mol_PE_exhaustive.
+    """
+    n_seeds = 5
+
+    def _all_nan_mace(_calc, ase_mols):
+        # Every conformer scored as NaN. (energies - e_min) <= window then
+        # evaluates to all-False, triggering the forced-keep-minimum guard.
+        return [float("nan")] * len(ase_mols)
+
+    with patch("confsweeper._mace_batch_energies", side_effect=_all_nan_mace):
+        mol, centroid_ids, energies = get_mol_PE_exhaustive(
+            TEST_SMILES,
+            get_embed_params(),
+            hardware_opts=None,
+            calc=MagicMock(),
+            n_seeds=n_seeds,
+            embed_chunk_size=n_seeds,
+            score_chunk_size=n_seeds,
+            minimize=False,
+            rmsd_threshold=0.0,
+            e_window_kT=5.0,
+        )
+    # Forced-keep-minimum guarantees exactly one centroid even though no
+    # conformer passes the energy filter. The returned mol holds exactly that
+    # conformer and energies has length one.
+    assert len(centroid_ids) == 1
+    assert len(energies) == 1
+    assert mol.GetNumConformers() == 1
+
+
+def test_exhaustive_returned_mol_matches_centroid_ids(exhaustive_mocks):
+    """The returned mol contains exactly the conformers identified by
+    centroid_ids — no leftover non-centroid conformers and no centroid
+    pruned out. This is the cleanup contract for the final stage of the
+    pipeline."""
+    n_seeds = 12
+    mol, centroid_ids, _ = get_mol_PE_exhaustive(
+        TEST_SMILES,
+        get_embed_params(),
+        hardware_opts=None,
+        calc=MagicMock(),
+        n_seeds=n_seeds,
+        embed_chunk_size=n_seeds,
+        score_chunk_size=n_seeds,
+        minimize=False,
+        rmsd_threshold=0.0,
+        e_window_kT=1e9,
+    )
+    mol_conf_ids = sorted(c.GetId() for c in mol.GetConformers())
+    assert mol_conf_ids == sorted(centroid_ids)
+    # Every centroid_id must resolve to a real conformer on the mol.
+    for cid in centroid_ids:
+        mol.GetConformer(cid)  # raises if missing
 
 
 # ---------------------------------------------------------------------------
