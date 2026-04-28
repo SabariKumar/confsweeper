@@ -10,6 +10,7 @@ from rdkit.Chem import AllChem
 from confsweeper import (
     _KT_EV_298K,
     _energy_ranked_dedup,
+    _jitter_rotatable_dihedrals,
     get_embed_params,
     get_mol_PE_exhaustive,
 )
@@ -295,9 +296,9 @@ def test_exhaustive_single_conformer_skips_dedup(exhaustive_mocks):
     assert mol.GetNumConformers() == 1
 
 
-def test_exhaustive_minimize_invokes_mmff(exhaustive_mocks):
-    """minimize=True triggers AllChem.MMFFOptimizeMolecule once per conformer
-    in the pool (called before energy scoring)."""
+def test_exhaustive_minimize_cpu_invokes_per_conformer_mmff(exhaustive_mocks):
+    """mmff_backend='cpu' triggers AllChem.MMFFOptimizeMolecule once per
+    conformer in the pool (called before energy scoring)."""
     n_seeds = 6
     with patch("rdkit.Chem.AllChem.MMFFOptimizeMolecule", return_value=0) as mock_mmff:
         get_mol_PE_exhaustive(
@@ -309,8 +310,184 @@ def test_exhaustive_minimize_invokes_mmff(exhaustive_mocks):
             embed_chunk_size=n_seeds,
             score_chunk_size=n_seeds,
             minimize=True,
+            mmff_backend="cpu",
             rmsd_threshold=0.0,
             e_window_kT=1e9,
         )
     # One MMFF call per embedded conformer. Mock embed always succeeds.
     assert mock_mmff.call_count == n_seeds
+
+
+def test_exhaustive_minimize_gpu_invokes_batched_mmff(exhaustive_mocks):
+    """mmff_backend='gpu' calls nvmolkit.mmffOptimization.MMFFOptimizeMoleculesConfs
+    exactly once with the full conformer set."""
+    n_seeds = 6
+    with patch(
+        "nvmolkit.mmffOptimization.MMFFOptimizeMoleculesConfs", return_value=[[]]
+    ) as mock_mmff:
+        get_mol_PE_exhaustive(
+            TEST_SMILES,
+            get_embed_params(),
+            hardware_opts=None,
+            calc=MagicMock(),
+            n_seeds=n_seeds,
+            embed_chunk_size=n_seeds,
+            score_chunk_size=n_seeds,
+            minimize=True,
+            mmff_backend="gpu",
+            rmsd_threshold=0.0,
+            e_window_kT=1e9,
+        )
+    # Single batched call regardless of n_seeds.
+    mock_mmff.assert_called_once()
+    args, kwargs = mock_mmff.call_args
+    # First positional arg is the list of mols (length 1, our test mol).
+    assert len(args[0]) == 1
+    assert args[0][0].GetNumConformers() == n_seeds
+
+
+def test_exhaustive_minimize_unknown_backend_raises(exhaustive_mocks):
+    """An unrecognised mmff_backend value raises ValueError."""
+    with pytest.raises(ValueError, match="unknown mmff_backend"):
+        get_mol_PE_exhaustive(
+            TEST_SMILES,
+            get_embed_params(),
+            hardware_opts=None,
+            calc=MagicMock(),
+            n_seeds=2,
+            embed_chunk_size=2,
+            score_chunk_size=2,
+            minimize=True,
+            mmff_backend="something_else",
+        )
+
+
+# ---------------------------------------------------------------------------
+# _jitter_rotatable_dihedrals
+# ---------------------------------------------------------------------------
+
+
+def _embed_butane(n_confs: int = 3, seed: int = 0):
+    """
+    Build n-butane (CCCC) with explicit Hs and CPU-embed `n_confs` conformers.
+    n-butane has exactly one rotatable dihedral (the central C-C bond), so the
+    output of `_jitter_rotatable_dihedrals` is unambiguous.
+
+    Params:
+        n_confs: int : number of conformers to embed
+        seed: int : RNG seed for ETKDG
+    Returns:
+        rdkit.Chem.Mol : n-butane mol with explicit Hs and `n_confs` conformers
+    """
+    from rdkit import Chem
+
+    mol = Chem.AddHs(Chem.MolFromSmiles("CCCC"))
+    AllChem.EmbedMultipleConfs(mol, numConfs=n_confs, randomSeed=seed)
+    return mol
+
+
+def test_jitter_rotatable_dihedrals_returns_dihedral_count():
+    """n-butane has exactly one rotatable backbone dihedral."""
+    mol = _embed_butane(n_confs=2)
+    n = _jitter_rotatable_dihedrals(mol, jitter_deg=10.0, seed=0)
+    assert n == 1
+
+
+def test_jitter_rotatable_dihedrals_changes_geometry():
+    """A non-zero jitter actually moves the dihedral; magnitude is bounded by
+    jitter_deg and direction is random per (conformer, dihedral)."""
+    from rdkit.Chem import rdMolTransforms
+
+    mol = _embed_butane(n_confs=4, seed=1)
+    # Capture original dihedrals (atom indices for n-butane: 0-1-2-3 are the carbons).
+    before = [
+        rdMolTransforms.GetDihedralDeg(mol.GetConformer(c), 0, 1, 2, 3)
+        for c in range(mol.GetNumConformers())
+    ]
+    _jitter_rotatable_dihedrals(mol, jitter_deg=15.0, seed=42)
+    after = [
+        rdMolTransforms.GetDihedralDeg(mol.GetConformer(c), 0, 1, 2, 3)
+        for c in range(mol.GetNumConformers())
+    ]
+    deltas = [(a - b + 180) % 360 - 180 for a, b in zip(after, before)]
+    # Every conformer moved (uniform sampling at jitter=15° draws zero with
+    # probability ≪ 1e-9 across 4 conformers).
+    assert all(abs(d) > 1e-3 for d in deltas)
+    # Every move stays inside the [-jitter, +jitter] envelope (with tiny tolerance
+    # for floating-point in the trig conversions).
+    assert all(abs(d) <= 15.0 + 1e-6 for d in deltas)
+
+
+def test_jitter_rotatable_dihedrals_seed_is_deterministic():
+    """Two jitter calls on identical inputs with the same seed produce
+    identical dihedrals; with different seeds they differ."""
+    from rdkit.Chem import rdMolTransforms
+
+    def _jitter_and_read(seed: int) -> list[float]:
+        mol = _embed_butane(n_confs=3, seed=7)
+        _jitter_rotatable_dihedrals(mol, jitter_deg=20.0, seed=seed)
+        return [
+            rdMolTransforms.GetDihedralDeg(mol.GetConformer(c), 0, 1, 2, 3)
+            for c in range(mol.GetNumConformers())
+        ]
+
+    a1 = _jitter_and_read(seed=99)
+    a2 = _jitter_and_read(seed=99)
+    b = _jitter_and_read(seed=100)
+    assert a1 == a2
+    assert a1 != b
+
+
+def test_jitter_rotatable_dihedrals_skips_ring_bonds():
+    """The rotatable-bond SMARTS uses '!@' to exclude ring bonds. Cyclohexane
+    therefore has zero rotatable bonds and the helper is a no-op."""
+    from rdkit import Chem
+
+    mol = Chem.AddHs(Chem.MolFromSmiles("C1CCCCC1"))
+    AllChem.EmbedMultipleConfs(mol, numConfs=2, randomSeed=0)
+    n = _jitter_rotatable_dihedrals(mol, jitter_deg=30.0, seed=0)
+    assert n == 0
+
+
+def test_get_mol_PE_exhaustive_jitter_zero_is_noop(exhaustive_mocks):
+    """dihedral_jitter_deg=0 must not invoke the jitter helper. The default
+    pipeline behaviour stays unchanged."""
+    with patch(
+        "confsweeper._jitter_rotatable_dihedrals", return_value=0
+    ) as mock_jitter:
+        get_mol_PE_exhaustive(
+            TEST_SMILES,
+            get_embed_params(),
+            hardware_opts=None,
+            calc=MagicMock(),
+            n_seeds=6,
+            embed_chunk_size=6,
+            score_chunk_size=6,
+            dihedral_jitter_deg=0.0,
+            rmsd_threshold=0.0,
+            e_window_kT=1e9,
+        )
+    mock_jitter.assert_not_called()
+
+
+def test_get_mol_PE_exhaustive_jitter_invokes_helper(exhaustive_mocks):
+    """dihedral_jitter_deg>0 invokes the jitter helper exactly once with the
+    matching jitter angle."""
+    with patch(
+        "confsweeper._jitter_rotatable_dihedrals", return_value=1
+    ) as mock_jitter:
+        get_mol_PE_exhaustive(
+            TEST_SMILES,
+            get_embed_params(),
+            hardware_opts=None,
+            calc=MagicMock(),
+            n_seeds=6,
+            embed_chunk_size=6,
+            score_chunk_size=6,
+            dihedral_jitter_deg=12.5,
+            rmsd_threshold=0.0,
+            e_window_kT=1e9,
+        )
+    mock_jitter.assert_called_once()
+    _, kwargs = mock_jitter.call_args
+    assert kwargs["jitter_deg"] == 12.5

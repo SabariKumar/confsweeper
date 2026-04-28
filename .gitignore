@@ -2,6 +2,9 @@
 .pixi/*
 !.pixi/config.toml
 
+# Diagnostic script logs (kept locally for monitoring; not tracked)
+scripts/*.log
+
 # Docs
 .cache/
 docs/reference/*
