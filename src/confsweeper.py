@@ -1,3 +1,44 @@
+"""
+confsweeper.py — generation-to-scoring conformer pipeline.
+
+The public surface is a family of `get_mol_PE*` functions that each take a
+SMILES string and return `(mol, conf_ids, energies)`: an RDKit mol with the
+representative conformers attached, the integer IDs of those representatives,
+and their potential energies in eV.
+
+Three pipelines, each suited to a different sampling regime:
+
+    get_mol_PE             baseline reference. Embeds n_confs conformers via
+                           nvmolkit ETKDG, Butina-clusters, scores each
+                           representative in a separate ASE calculator call.
+                           Slow for large representative sets; use mainly to
+                           validate the other pipelines.
+
+    get_mol_PE_batched     production small-N pipeline. Same embed + Butina,
+                           but scores all representatives in a single batched
+                           MACE forward pass. Optionally adds backbone
+                           dihedral-constrained Pool B conformers via
+                           torsional_sampling.sample_constrained_confs (this
+                           is the only pipeline that supports torsional
+                           sampling). Use for general-purpose conformer
+                           generation when n_confs ≤ ~1000 is sufficient.
+
+    get_mol_PE_exhaustive  randomized-saturation pipeline for cyclic peptides
+                           and other molecules with rich multi-basin Boltzmann
+                           ensembles. Embeds thousands of conformers,
+                           optionally MMFF-minimises them on GPU
+                           (nvmolkit.mmffOptimization), MACE-scores in chunks,
+                           applies a 5 kT energy filter, and dedup via the
+                           private _energy_ranked_dedup helper (a basin-energy
+                           variant of Butina that picks the lowest-energy
+                           member of each geometric basin). Saturation-
+                           validated defaults are baked in; see the function
+                           docstring and docs/exhaustive_etkdg_plan.md.
+
+The three pipelines share the same return contract, so downstream consumers
+(SDF writers, fine-tuning conformer caches) swap one function call to upgrade.
+"""
+
 import contextlib
 import os
 import random
@@ -75,9 +116,12 @@ def get_embed_params() -> rdkit.Chem.rdDistGeom.EmbedParameters:
 def get_embed_params_macrocycle() -> rdkit.Chem.rdDistGeom.EmbedParameters:
     """
     ETKDG setup for macrocyclic molecules. ETKDGv3 already enables
-    useMacrocycleTorsions and useMacrocycle14config by default; this function
-    additionally enables useSmallRingTorsions (off by default) which improves
-    embedding for ring systems within the macrocycle scaffold.
+    useMacrocycleTorsions and useMacrocycle14config by default; the
+    useSmallRingTorsions flag (which would improve embedding for small ring
+    systems within the macrocycle scaffold) is intentionally left disabled
+    because nvmolkit does not support it and hangs indefinitely in CPU
+    preprocessing when it is set.
+
     Params:
         None
     Returns:
@@ -87,9 +131,6 @@ def get_embed_params_macrocycle() -> rdkit.Chem.rdDistGeom.EmbedParameters:
     params.useRandomCoords = True
     params.useMacrocycleTorsions = True
     params.useMacrocycle14config = True
-    # useSmallRingTorsions is disabled: nvmolkit does not support this ETKDGv3 flag
-    # and hangs indefinitely in CPU preprocessing when it is set.
-    # params.useSmallRingTorsions = True
     return params
 
 
@@ -355,6 +396,7 @@ def get_mol_PE_batched(
 
 
 _KCAL_TO_EV = 0.043364  # 1 kcal/mol in eV
+_KT_EV_298K = 8.617333e-5 * 298.0  # k_B T at 298 K in eV (≈ 0.02568)
 
 
 def _mace_batch_energies(calc, ase_mols: list) -> list:
@@ -394,6 +436,368 @@ def _mace_batch_energies(calc, ase_mols: list) -> list:
             mol.calc = calc
             pe.append(float(mol.get_potential_energy()))
         return pe
+
+
+def _energy_ranked_dedup(
+    coords: torch.Tensor,
+    energies: np.ndarray,
+    rmsd_threshold: float,
+) -> list[int]:
+    """
+    Pick basin representatives by energy rank with a geometric exclusion radius.
+
+    Differs from Butina: Butina picks dense cluster centres first, which can
+    discard the lowest-energy member of a dense cluster. Energy-ranked dedup
+    iterates lowest energy first, so each basin's representative is its
+    energy minimum.
+
+    Distances use the same normalised L1 metric as get_mol_PE_batched so the
+    rmsd_threshold parameter is comparable to its cutoff_dist (default 0.1).
+
+    Params:
+        coords: torch.Tensor : conformer coordinates [N, A, 3]
+        energies: ndarray [N] : potential energies in eV (any shift; only differences matter)
+        rmsd_threshold: float : exclusion radius in normalised L1 units (sum |Δ| / 3·A)
+    Returns:
+        list[int] : indices into the input arrays of the chosen centroids,
+                    ordered by ascending energy
+    """
+    n = coords.shape[0]
+    if n == 0:
+        return []
+    if n == 1:
+        return [0]
+
+    n_atoms = coords.shape[1]
+    flat = coords.reshape(n, -1)
+    order = np.argsort(np.asarray(energies), kind="stable")
+
+    excluded = torch.zeros(n, dtype=torch.bool, device=flat.device)
+    centroids: list[int] = []
+    for idx in order.tolist():
+        if bool(excluded[idx]):
+            continue
+        centroids.append(idx)
+        d = (flat - flat[idx].unsqueeze(0)).abs().sum(dim=1) / (3 * n_atoms)
+        excluded |= d < rmsd_threshold
+    return centroids
+
+
+# RDKit's standard rotatable-bond SMARTS — single bonds, not in any ring,
+# between heavy atoms that are themselves not terminal (D=1) and not in
+# triple bonds. For cyclic peptides this matches side-chain rotations only;
+# the macrocycle backbone is in-ring and therefore excluded.
+_ROTATABLE_BOND_SMARTS = Chem.MolFromSmarts("[!$(*#*)&!D1]-&!@[!$(*#*)&!D1]")
+
+
+def _jitter_rotatable_dihedrals(
+    mol: Chem.Mol,
+    jitter_deg: float,
+    seed: int,
+) -> int:
+    """
+    Add uniform random rotation in [-jitter_deg, +jitter_deg] to each
+    rotatable-bond dihedral on every conformer attached to mol (in place).
+
+    Intended as a post-embedding diversifier: ETKDG's torsion-knowledge prior
+    biases initial coordinates toward known-favourable dihedrals, which can
+    leave it stuck in one basin even with thousands of seeds. A small random
+    perturbation per rotatable bond pushes some conformers across nearby
+    basin boundaries before MACE rescoring; combined with the energy filter
+    and energy-ranked dedup, this can recover basins that pure ETKDG misses.
+
+    Macrocycle backbone bonds are in-ring and not matched by the rotatable-
+    bond SMARTS, so this only perturbs side-chain rotamers on cyclic
+    peptides. To explore backbone dihedrals on macrocycles, use
+    `torsional_sampling.sample_constrained_confs` instead.
+
+    Params:
+        mol: rdkit.Chem.Mol : mol with conformers attached (modified in place)
+        jitter_deg: float : maximum absolute perturbation per dihedral in degrees;
+            sampled uniformly on [-jitter_deg, +jitter_deg] independently per
+            (conformer, dihedral) pair
+        seed: int : RNG seed; fully determines the perturbation given
+            identical input geometry
+    Returns:
+        int : number of rotatable dihedrals jittered per conformer (constant
+            across conformers for the same mol)
+    """
+    from rdkit.Chem import rdMolTransforms
+
+    matches = mol.GetSubstructMatches(_ROTATABLE_BOND_SMARTS)
+
+    # Build (i, j, k, l) atom-index quadruples once: j-k is the rotatable bond;
+    # i and l are the first heavy-atom neighbours other than the bond partner.
+    # Heavy-atom-only matters because the SMARTS still matches when Hs are
+    # explicit (methyl-CH3 carbons have degree 4, not D1), but rotating around a
+    # bond whose only off-partner neighbour is an H is geometrically degenerate
+    # — it just spins the H(s). Skipping such bonds keeps `n` aligned with the
+    # standard implicit-H rotatable-bond count.
+    dihedrals: list[tuple[int, int, int, int]] = []
+    for j, k in matches:
+        atom_j = mol.GetAtomWithIdx(j)
+        atom_k = mol.GetAtomWithIdx(k)
+        i = next(
+            (
+                n.GetIdx()
+                for n in atom_j.GetNeighbors()
+                if n.GetIdx() != k and n.GetAtomicNum() != 1
+            ),
+            None,
+        )
+        l = next(  # noqa: E741 — l is the standard fourth-atom name for dihedrals
+            (
+                n.GetIdx()
+                for n in atom_k.GetNeighbors()
+                if n.GetIdx() != j and n.GetAtomicNum() != 1
+            ),
+            None,
+        )
+        if i is None or l is None:
+            continue
+        dihedrals.append((i, j, k, l))
+
+    rng = np.random.default_rng(seed)
+    for cid in [c.GetId() for c in mol.GetConformers()]:
+        conf = mol.GetConformer(cid)
+        for i, j, k, l in dihedrals:
+            current = rdMolTransforms.GetDihedralDeg(conf, i, j, k, l)
+            delta = float(rng.uniform(-jitter_deg, jitter_deg))
+            rdMolTransforms.SetDihedralDeg(conf, i, j, k, l, current + delta)
+
+    return len(dihedrals)
+
+
+def get_mol_PE_exhaustive(
+    smi: str,
+    params,
+    hardware_opts,
+    calc,
+    n_seeds: int = 10000,
+    embed_chunk_size: int = 1000,
+    score_chunk_size: int = 500,
+    e_window_kT: float = 5.0,
+    rmsd_threshold: float = 0.1,
+    minimize: bool = True,
+    mmff_backend: str = "gpu",
+    dihedral_jitter_deg: float = 0.0,
+    seed: int = 0,
+) -> Tuple[Chem.Mol, List[int], List[float]]:
+    """
+    Embed many randomized ETKDG conformers, MACE-score them all, energy-filter,
+    and dedup geometrically by basin energy minimum.
+
+    The premise is to replace CREST metadynamics with brute-force randomization:
+    nvmolkit's GPU embed is two orders of magnitude cheaper than CREST per
+    conformer, so we can afford thousands of seeds. The energy filter keeps
+    geometric dedup tractable on the massive pre-pool by dropping conformers
+    that cannot contribute to a 298 K Boltzmann ensemble regardless of their
+    geometric uniqueness.
+
+    When to use vs. get_mol_PE_batched:
+      * get_mol_PE_batched — small N, optionally torsional sampling, fast.
+      * get_mol_PE_exhaustive — cyclic peptides / molecules with rich
+        Boltzmann ensembles where get_mol_PE_batched produces near-one-hot
+        weight distributions because ETKDG-100 misses low-energy basins.
+
+    Default values for n_seeds, minimize, and mmff_backend are the
+    saturation-validated production settings from
+    docs/exhaustive_etkdg_plan.md: across the five representative cyclic
+    peptides tested (CREMP + PAMPA, n_heavy 27-103), this configuration
+    reproduces CREST-quality Boltzmann distributions on most peptides at
+    a fraction of CREST's compute cost. Larger n_seeds keeps helping
+    stochastically but with diminishing returns; minimize=True is the
+    decisive lever and should rarely be turned off.
+
+    Pipeline:
+      1. Embed n_seeds conformers via nvmolkit ETKDG. A single
+         EmbedMolecules call is used when n_seeds <= embed_chunk_size; for
+         larger n_seeds the call is repeated in chunks with seed offsets so
+         the GPU memory footprint stays bounded.
+      2. Optional rotatable-bond dihedral jitter (off by default;
+         dihedral_jitter_deg > 0 enables). Adds uniform random rotation in
+         [-jitter, +jitter] to every rotatable-bond dihedral on every
+         conformer to push some conformers across nearby basin boundaries
+         before scoring. Excludes ring bonds, so on cyclic peptides this
+         only perturbs side-chain rotamers.
+      3. Optional MMFF94 minimization in place (off by default). Two backends:
+         'gpu' (default) calls nvmolkit.mmffOptimization.MMFFOptimizeMoleculesConfs
+         in a single batched CUDA pass — ~25-50× faster than 'cpu' on cyclic
+         peptides. 'cpu' calls RDKit's serial AllChem.MMFFOptimizeMolecule per
+         conformer; pick this only if you need bit-exact agreement with RDKit
+         reference behaviour or if nvmolkit is unavailable.
+
+         The two backends can disagree on the final geometry of any given
+         conformer — different BFGS gradient details push the optimizer into
+         neighbouring basins on a few percent of cases. Final-energy Pearson r
+         between backends is ~0.95 with ~3-5 kcal/mol per-conformer std on
+         cyclic peptides; the basin distribution after dedup is comparable
+         but not identical. For exhaustive ETKDG saturation runs the GPU
+         backend's stochasticity is acceptable because we care about basin
+         coverage in aggregate, not per-conformer reproducibility.
+
+         When both jitter and minimize are on, MMFF runs after jitter and
+         will tend to relax perturbed geometries back toward the original
+         basin.
+      4. MACE-score the full pool in chunks of score_chunk_size.
+      5. Drop conformers with (E - E_min) > e_window_kT * kT (kT = 26 meV at
+         298 K). At least one conformer (the minimum) is always retained.
+      6. Energy-ranked geometric dedup via _energy_ranked_dedup, keeping the
+         lowest-energy member of each geometric basin defined by
+         rmsd_threshold (normalised L1 units, matching get_mol_PE_batched).
+
+    The randomSeed attribute on `params` is mutated during chunked embedding
+    (each chunk uses seed + chunk_index * embed_chunk_size). Bit-exact
+    reproducibility across runs is not guaranteed because nvmolkit advances
+    internal random state independently of params.randomSeed, but
+    distributional reproducibility (sorted-energy and basin-count statistics)
+    is preserved.
+
+    Params:
+        smi: str : input SMILES string
+        params : ETKDG params from get_embed_params or get_embed_params_macrocycle
+        hardware_opts : nvmolkit hardware options from get_hardware_opts
+        calc : MACECalculator from get_mace_calc()
+        n_seeds: int : total ETKDG seeds to embed
+        embed_chunk_size: int : per-call cap before chunking; tune to GPU memory
+        score_chunk_size: int : per-batch MACE forward pass cap
+        e_window_kT: float : energy filter window in units of kT_298K
+        rmsd_threshold: float : geometric dedup exclusion radius (normalised L1)
+        minimize: bool : MMFF94-minimize each conformer before scoring
+        mmff_backend: str : 'gpu' (default; nvmolkit batched CUDA) or 'cpu'
+            (RDKit serial). Only consulted when minimize=True. See pipeline
+            step 3 above for behaviour notes.
+        dihedral_jitter_deg: float : maximum absolute rotation in degrees applied
+            uniformly at random to each rotatable-bond dihedral on every
+            conformer; 0.0 disables jitter (default)
+        seed: int : base ETKDG random seed; chunk i uses seed + i*embed_chunk_size.
+            The dihedral jitter RNG is also seeded from this value (with a
+            fixed offset) so two runs with identical params and seed produce
+            identical jitter patterns.
+    Returns:
+        rdkit.Chem.Mol : mol with only basin-representative conformers attached
+        List[int] : conformer IDs of basin representatives, ordered by ascending energy
+        List[float] : potential energies in eV for each representative
+    """
+    mol = Chem.AddHs(Chem.MolFromSmiles(smi))
+
+    # 1. Massive embed (Path A single call, or Path B chunked when n_seeds is large)
+    if n_seeds <= embed_chunk_size:
+        params.randomSeed = seed
+        embed.EmbedMolecules(
+            [mol], params, confsPerMolecule=n_seeds, hardwareOptions=hardware_opts
+        )
+    else:
+        n_remaining = n_seeds
+        chunk_idx = 0
+        while n_remaining > 0:
+            this_chunk = min(embed_chunk_size, n_remaining)
+            params.randomSeed = seed + chunk_idx * embed_chunk_size
+            n_before = mol.GetNumConformers()
+            embed.EmbedMolecules(
+                [mol],
+                params,
+                confsPerMolecule=this_chunk,
+                hardwareOptions=hardware_opts,
+            )
+            # Stop early if a chunk produced nothing — likely an
+            # embedding-incompatible molecule rather than a transient failure.
+            if mol.GetNumConformers() == n_before:
+                break
+            n_remaining -= this_chunk
+            chunk_idx += 1
+
+    all_conf_ids = [c.GetId() for c in mol.GetConformers()]
+    if not all_conf_ids:
+        return mol, [], []
+
+    # 2. Optional rotatable-bond dihedral jitter. Mutates conformer geometry
+    # in place; uses a deterministic seed offset so the perturbation is
+    # reproducible from the function-level seed.
+    if dihedral_jitter_deg > 0.0:
+        _jitter_rotatable_dihedrals(
+            mol,
+            jitter_deg=dihedral_jitter_deg,
+            seed=seed
+            + 1_000_003,  # large prime offset to avoid clashing with chunked embed seeds
+        )
+
+    # 3. Optional MMFF94 minimization. Errors leave the conformer at its
+    # pre-minimize geometry; we don't track per-conformer success/failure
+    # because MACE scoring afterwards naturally surfaces any pathological
+    # geometries through extreme energies.
+    if minimize:
+        if mmff_backend == "gpu":
+            # nvmolkit batched CUDA implementation — single call optimises
+            # every conformer of `mol` in place. Order-dependent import:
+            # nvmolkit.embedMolecules must be loaded first to register some
+            # global C++ state, which the embed call above already did.
+            from nvmolkit.mmffOptimization import MMFFOptimizeMoleculesConfs
+
+            MMFFOptimizeMoleculesConfs([mol], hardwareOptions=hardware_opts)
+        elif mmff_backend == "cpu":
+            from rdkit.Chem import AllChem
+
+            for cid in all_conf_ids:
+                AllChem.MMFFOptimizeMolecule(mol, confId=cid)
+        else:
+            raise ValueError(
+                f"unknown mmff_backend {mmff_backend!r}; expected 'gpu' or 'cpu'"
+            )
+
+    # 4. Batched MACE scoring, chunked to bound the GPU forward-pass batch size.
+    atomic_nums = [a.GetAtomicNum() for a in mol.GetAtoms()]
+    energies: List[float] = []
+    for start in range(0, len(all_conf_ids), score_chunk_size):
+        chunk_ids = all_conf_ids[start : start + score_chunk_size]
+        ase_mols = [
+            ase.Atoms(
+                positions=mol.GetConformer(cid).GetPositions(),
+                numbers=atomic_nums,
+            )
+            for cid in chunk_ids
+        ]
+        energies.extend(_mace_batch_energies(calc, ase_mols))
+
+    energies_arr = np.asarray(energies, dtype=np.float64)
+
+    # 5. Energy filter: keep conformers within e_window_kT * kT of the minimum.
+    e_min = energies_arr.min()
+    keep_mask = (energies_arr - e_min) <= e_window_kT * _KT_EV_298K
+    if not keep_mask.any():
+        # Only reachable on degenerate inputs (e.g. NaN energies). Force the
+        # caller's contract: at least one centroid is always returned.
+        keep_mask = np.zeros_like(keep_mask)
+        keep_mask[int(np.argmin(energies_arr))] = True
+
+    kept_pool_idx = np.where(keep_mask)[0].tolist()
+    kept_conf_ids = [all_conf_ids[i] for i in kept_pool_idx]
+    kept_energies = energies_arr[kept_pool_idx]
+
+    # 6. Energy-ranked geometric dedup. With a single survivor there is
+    # nothing to cluster; otherwise use the basin-energy primitive.
+    if len(kept_conf_ids) == 1:
+        centroid_ids = list(kept_conf_ids)
+        centroid_energies = [float(kept_energies[0])]
+    else:
+        coords = torch.tensor(
+            np.array([mol.GetConformer(cid).GetPositions() for cid in kept_conf_ids])
+        )
+        centroid_pool_idx = _energy_ranked_dedup(
+            coords, kept_energies, rmsd_threshold=rmsd_threshold
+        )
+        centroid_ids = [kept_conf_ids[i] for i in centroid_pool_idx]
+        centroid_energies = [float(kept_energies[i]) for i in centroid_pool_idx]
+
+    # 7. Output: drop non-centroid conformers from the mol so the returned
+    # object matches the (mol, ids, energies) contract used by callers of
+    # get_mol_PE / get_mol_PE_batched.
+    centroid_set = set(centroid_ids)
+    for cid in all_conf_ids:
+        if cid not in centroid_set:
+            mol.RemoveConformer(cid)
+
+    return mol, centroid_ids, centroid_energies
 
 
 def get_mol_PE_mmff(

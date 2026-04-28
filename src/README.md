@@ -23,10 +23,11 @@ Two helper functions build RDKit `EmbedParameters` objects for nvmolkit:
 
 - **`get_embed_params()`** — baseline ETKDGv3 with `useRandomCoords=True`. Suitable
   for small molecules.
-- **`get_embed_params_macrocycle()`** — adds `useMacrocycleTorsions`, `useMacrocycle14config`,
-  and `useSmallRingTorsions`. The macrocycle flags enable a special sampling regime in
-  ETKDGv3 that handles the ring-closure constraints of cyclic backbones. Use this for
-  any cyclic peptide input.
+- **`get_embed_params_macrocycle()`** — adds `useMacrocycleTorsions` and
+  `useMacrocycle14config`, the ETKDGv3 flags that enable a special sampling regime for
+  ring-closure constraints on cyclic backbones. Use this for any cyclic peptide input.
+  `useSmallRingTorsions` is intentionally left disabled — nvmolkit does not support
+  the flag and hangs indefinitely in CPU preprocessing when it is set.
 
 ### Energy backends
 
@@ -62,6 +63,31 @@ to sequential scoring.
 Torsional sampling is activated by passing `grids` (loaded from the CREMP Ramachandran
 `.npz` via `load_ramachandran_grids`) and setting `n_constrained_samples > 0`. When
 `grids=None` (the default), behaviour is identical to before — no overhead is added.
+
+**`get_mol_PE_exhaustive`** — randomized-saturation pipeline for cyclic peptides
+and other molecules where `get_mol_PE_batched` produces near-one-hot Boltzmann
+distributions because ETKDG-100 misses low-energy basins. Embeds an order of
+magnitude more conformers (`n_seeds=10000` by default), optionally
+MMFF-minimises them on the GPU via `nvmolkit.mmffOptimization`, MACE-scores
+in chunks, applies a 5 kT energy filter, and dedups by basin energy minimum
+rather than cluster density. Returns the same `(mol, conf_ids, energies)`
+contract as the other pipelines, so downstream consumers swap one function
+call. See `docs/exhaustive_etkdg_plan.md` for the saturation experiments
+behind the chosen defaults; the headline result is that exhaustive ETKDG +
+MMFF reproduces CREST-quality Boltzmann distributions on most cyclic
+peptides we tested (e.g. `cremp_typical`: 27 heavy atoms, max_bw 0.318 vs
+CREST ground truth 0.246) at a fraction of CREST's compute cost.
+
+The seven-stage pipeline:
+1. Massive ETKDG embed (chunked when `n_seeds > embed_chunk_size`).
+2. Optional rotatable-bond dihedral jitter (off by default; experimental).
+3. Optional MMFF94 minimisation (on by default), `gpu` or `cpu` backend.
+4. Batched MACE scoring in chunks of `score_chunk_size`.
+5. Energy filter: drop conformers with `(E - E_min) > 5 kT`.
+6. Energy-ranked geometric dedup via `_energy_ranked_dedup` — picks the
+   lowest-energy conformer of each geometric basin, in contrast to Butina
+   which picks dense cluster centres.
+7. Returns one centroid per basin, ordered by ascending energy.
 
 **`get_mol_PE_mmff`** — like `get_mol_PE_batched` but scores with MMFF94. No GPU
 required for the scoring step; GPU is still used for embedding and Butina.
@@ -108,9 +134,25 @@ than symmetric RMSD but is much cheaper to compute across thousands of conformer
 | `torsion_strategy` | `str` | `'uniform'` or `'inverse'` (default `'uniform'`) |
 | `torsion_seed` | `int` | RNG seed for Pool B reproducibility (default 0) |
 
+**`get_mol_PE_exhaustive`** — different parameter space (no Butina cutoff, no
+torsional sampling, no `gpu_clustering` toggle):
+
+| Argument | Type | Notes |
+|----------|------|-------|
+| `smi`, `params`, `hardware_opts`, `calc` | — | as above |
+| `n_seeds` | `int` | total ETKDG seeds (default 10000, saturation-validated) |
+| `embed_chunk_size` | `int` | nvmolkit per-call cap before chunking (default 1000) |
+| `score_chunk_size` | `int` | MACE per-batch forward-pass cap (default 500) |
+| `e_window_kT` | `float` | energy filter window in `kT_298K` units (default 5.0) |
+| `rmsd_threshold` | `float` | basin-dedup exclusion radius in normalised L1 units (default 0.1) |
+| `minimize` | `bool` | MMFF94 minimise post-embed (default `True`, the lever) |
+| `mmff_backend` | `str` | `'gpu'` (default; nvmolkit batched CUDA) or `'cpu'` (RDKit serial) |
+| `dihedral_jitter_deg` | `float` | rotatable-bond jitter ±deg (default 0; experimental) |
+| `seed` | `int` | base ETKDG seed; chunk i uses `seed + i*embed_chunk_size` (default 0) |
+
 Returns `(mol, conf_ids, pe)`:
-- `mol`: `Chem.Mol` with only Butina-representative conformers attached
-- `conf_ids`: `List[int]` of conformer IDs on `mol`
+- `mol`: `Chem.Mol` with only basin-representative conformers attached
+- `conf_ids`: `List[int]` of conformer IDs on `mol`, ordered by ascending energy
 - `pe`: `List[float]` of energies in eV, same order as `conf_ids`
 
 **`write_sdf`**
@@ -127,6 +169,22 @@ carries a `MACE_ENERGY` property (eV) regardless of which backend was used. When
   after embedding before assuming `n_confs` conformers are available.
 - **GPU ID**: `get_hardware_opts` defaults to `gpuIds=[0]`. On multi-GPU nodes, set
   `gpuIds` explicitly; nvmolkit does not auto-select a free GPU.
+- **`get_mol_PE_exhaustive` is bursty, not monotone**: `max_bw` does not smoothly
+  decrease with `n_seeds`. It oscillates because each newly-discovered low-energy
+  conformer resets `E_min`, sometimes pushing previously-contributing basins outside
+  the 5 kT filter. The right summary metric across a sweep is `min(max_bw)`, not the
+  value at any specific `n_seeds`. A single large run is more reliable than a
+  fine-grained scan.
+- **`get_mol_PE_exhaustive` requires `minimize=True` for cyclic peptides**: turning
+  off MMFF post-minimisation reverts to one-hot Boltzmann distributions on most
+  peptides above ~50 heavy atoms, defeating the purpose of the pipeline. Only set
+  `minimize=False` if you specifically want pre-minimisation energies (e.g. ablation
+  studies).
+- **`get_mol_PE_exhaustive` GPU MMFF stochasticity**: the `mmff_backend='gpu'` path
+  produces final geometries that are not bit-exact identical to `'cpu'`. Pearson r
+  between final energies is ~0.95; basin distributions after dedup are similar but
+  not identical. For batch saturation runs this is fine. Switch to `'cpu'` only for
+  bit-exact RDKit reference behaviour, accepting a 25-50× slowdown.
 
 ---
 

@@ -76,16 +76,27 @@ def test_get_embed_params_macrocycle_14config_enabled():
     assert params.useMacrocycle14config is True
 
 
-def test_get_embed_params_macrocycle_small_ring_torsions_enabled():
+def test_get_embed_params_macrocycle_small_ring_torsions_disabled():
+    """useSmallRingTorsions is intentionally NOT enabled even though it
+    would help small rings inside the macrocycle scaffold: nvmolkit hangs
+    indefinitely in CPU preprocessing when the flag is set. See the
+    docstring of get_embed_params_macrocycle for the rationale."""
     params = get_embed_params_macrocycle()
-    assert params.useSmallRingTorsions is True
+    assert params.useSmallRingTorsions is False
 
 
-def test_get_embed_params_macrocycle_differs_from_default():
-    # useSmallRingTorsions is the key addition — off by default in ETKDGv3
+def test_get_embed_params_macrocycle_enables_macrocycle_torsion_flags():
+    """The macrocycle helper differs from the default in turning on the two
+    macrocycle-specific torsion flags. useSmallRingTorsions is left off in
+    both (see test_get_embed_params_macrocycle_small_ring_torsions_disabled)."""
     default = get_embed_params()
     macro = get_embed_params_macrocycle()
-    assert macro.useSmallRingTorsions != default.useSmallRingTorsions
+    assert macro.useMacrocycleTorsions is True
+    assert macro.useMacrocycle14config is True
+    # useMacrocycleTorsions defaults to True in ETKDGv3 too, so the helper's
+    # only behavioural difference vs get_embed_params is the explicit setting
+    # of these two flags (and the explicit useRandomCoords=True).
+    assert macro.useRandomCoords == default.useRandomCoords
 
 
 # ---------------------------------------------------------------------------
