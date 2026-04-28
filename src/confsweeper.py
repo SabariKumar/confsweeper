@@ -1,3 +1,44 @@
+"""
+confsweeper.py — generation-to-scoring conformer pipeline.
+
+The public surface is a family of `get_mol_PE*` functions that each take a
+SMILES string and return `(mol, conf_ids, energies)`: an RDKit mol with the
+representative conformers attached, the integer IDs of those representatives,
+and their potential energies in eV.
+
+Three pipelines, each suited to a different sampling regime:
+
+    get_mol_PE             baseline reference. Embeds n_confs conformers via
+                           nvmolkit ETKDG, Butina-clusters, scores each
+                           representative in a separate ASE calculator call.
+                           Slow for large representative sets; use mainly to
+                           validate the other pipelines.
+
+    get_mol_PE_batched     production small-N pipeline. Same embed + Butina,
+                           but scores all representatives in a single batched
+                           MACE forward pass. Optionally adds backbone
+                           dihedral-constrained Pool B conformers via
+                           torsional_sampling.sample_constrained_confs (this
+                           is the only pipeline that supports torsional
+                           sampling). Use for general-purpose conformer
+                           generation when n_confs ≤ ~1000 is sufficient.
+
+    get_mol_PE_exhaustive  randomized-saturation pipeline for cyclic peptides
+                           and other molecules with rich multi-basin Boltzmann
+                           ensembles. Embeds thousands of conformers,
+                           optionally MMFF-minimises them on GPU
+                           (nvmolkit.mmffOptimization), MACE-scores in chunks,
+                           applies a 5 kT energy filter, and dedup via the
+                           private _energy_ranked_dedup helper (a basin-energy
+                           variant of Butina that picks the lowest-energy
+                           member of each geometric basin). Saturation-
+                           validated defaults are baked in; see the function
+                           docstring and docs/exhaustive_etkdg_plan.md.
+
+The three pipelines share the same return contract, so downstream consumers
+(SDF writers, fine-tuning conformer caches) swap one function call to upgrade.
+"""
+
 import contextlib
 import os
 import random
@@ -532,12 +573,12 @@ def get_mol_PE_exhaustive(
     params,
     hardware_opts,
     calc,
-    n_seeds: int = 5000,
+    n_seeds: int = 10000,
     embed_chunk_size: int = 1000,
     score_chunk_size: int = 500,
     e_window_kT: float = 5.0,
     rmsd_threshold: float = 0.1,
-    minimize: bool = False,
+    minimize: bool = True,
     mmff_backend: str = "gpu",
     dihedral_jitter_deg: float = 0.0,
     seed: int = 0,
@@ -558,6 +599,15 @@ def get_mol_PE_exhaustive(
       * get_mol_PE_exhaustive — cyclic peptides / molecules with rich
         Boltzmann ensembles where get_mol_PE_batched produces near-one-hot
         weight distributions because ETKDG-100 misses low-energy basins.
+
+    Default values for n_seeds, minimize, and mmff_backend are the
+    saturation-validated production settings from
+    docs/exhaustive_etkdg_plan.md: across the five representative cyclic
+    peptides tested (CREMP + PAMPA, n_heavy 27-103), this configuration
+    reproduces CREST-quality Boltzmann distributions on most peptides at
+    a fraction of CREST's compute cost. Larger n_seeds keeps helping
+    stochastically but with diminishing returns; minimize=True is the
+    decisive lever and should rarely be turned off.
 
     Pipeline:
       1. Embed n_seeds conformers via nvmolkit ETKDG. A single
