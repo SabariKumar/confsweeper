@@ -14,7 +14,7 @@ This document is the working design for the third sampler in the issue-#10 bench
 | 4 | Basin memory (`src/mcmm.py`) | ✓ complete |
 | 5 | Single-walker MCMM driver (`src/mcmm.py`) | ✓ complete |
 | 6 | Parallel walkers (batched) (`src/mcmm.py`) | ✓ complete |
-| 7 | Replica exchange | pending |
+| 7 | Replica exchange (`src/mcmm.py`) | ✓ complete |
 | 8 | `get_mol_PE_mcmm` entry point | pending |
 | 9 | Sampler benchmark wiring | pending |
 | 10 | Documentation | pending |
@@ -128,17 +128,21 @@ Verification: small-N batched results match the single-walker reference run sequ
 
 **Outcome.** `ParallelMCMMDriver` class added to `src/mcmm.py`. Architectural refactor: `MCMMWalker.step` was split into `step` (single-walker convenience that calls a `propose_fn`) and `apply_proposal` (lower-level primitive that takes a precomputed proposal). The parallel driver builds on `apply_proposal` so it can batch the proposal-generation stage across walkers (one GPU call per step) and dispatch accept/reject decisions in a sequential walker loop. Sequential dispatch is intentional: walker `i` sees memory updates from walkers `j < i` made earlier in the same step. This avoids duplicate-basin creation when two walkers propose into the same novel conformation and matches the standard MCMM-with-shared-memory convention. The `batch_propose_fn(coords_list) → list[(coords, energy, det_j, success)]` abstraction is the integration target for Step 8 — at that point a closure over the shared RDKit mol will stage all N walker conformers as distinct conformer IDs and run nvmolkit MMFF + MACE in single batched calls. Eight driver tests in `tests/test_mcmm.py` covering construction validation, N=1 equivalence with single walker, per-walker accept-list ordering, disjoint-basin independence, shared-basin serialisation (the load-bearing test that two walkers proposing into the same novel basin produce one basin with usage=2), proposal-count mismatch error, run-loop accept aggregation, and `n_accepted` property aggregation across walkers.
 
-### Step 7: Replica exchange — pending (next)
+### Step 7: Replica exchange — ✓ complete
 
 8 temperatures geometric 300 K → 600 K. N walkers per temperature (default 8 → 64 walkers total). Swap attempts between adjacent temperatures every 20 steps via standard Metropolis on ΔE × Δβ. Replica indices are tracked so the basin memory's per-temperature provenance can be inspected if needed (though the memory itself is shared across temperatures).
 
 Tests: swap acceptance probability matches the analytical Metropolis value across many independent trials; replica ordering is preserved after swaps (no state mixing bugs).
 
+**Outcome.** `ReplicaExchangeMCMMDriver` class added to `src/mcmm.py`, plus a private `_swap_walker_configs(a, b)` helper that exchanges `(coords, energy, current_basin_idx)` between two walkers while leaving `kt`, RNG, and counters with the slot. Architectural decision: swap configurations rather than temperatures, so per-temperature provenance is preserved (the walker at slot `(t, i)` always tracks the trajectory at `kts[t]`, even though individual configurations have hopped across temperatures). Per `step()`: batch propose across all walkers (one GPU call), then if `n_steps % swap_interval == 0` attempt swaps between every adjacent (t, t+1) temperature pair, paired by within-temp walker index. Constructor enforces uniform group size, uniform kt within each group, and strictly-increasing kt across groups so the ladder is well-defined. Swap acceptance: `p = min(1, exp((β_high − β_low)(E_high − E_low)))` with the `arg ≥ 0` (favorable) branch shortcircuited to 1. 18 tests in `tests/test_mcmm.py` covering `_swap_walker_configs` semantics (configs swap, counters and kt stay), constructor validation (empty, uneven group sizes, mixed kt within group, non-monotonic temperatures, invalid swap_interval), the swap probability formula in three regimes (conditional, favorable-always-1, equal-energy-1), swap mechanics (always-accept and always-reject paths), all-pairs scan order, `step()` flat-order results, swap-interval timing, and run-loop accept aggregation.
+
+One test-fixture lesson: `_make_remd_walkers` initially placed within-temp walkers at offsets that fell within the basin-distinguishing threshold of each other, so multiple walkers latched onto the same initial basin and the Saunders bias kicked in faster than expected during the run-loop accept-counting test. Fixed by spacing offsets to gap = 10 (≈ 3.3 normalised-L1 units, well above the 0.5 threshold).
+
 ---
 
 ## Phase 3 — Integration
 
-### Step 8: `get_mol_PE_mcmm` entry point
+### Step 8: `get_mol_PE_mcmm` entry point — pending (next)
 
 New function in `src/confsweeper.py`. Pipeline: enumerate backbone windows → initialize walkers from a seed conformer (e.g., one ETKDG conformer minimized with MMFF) → run replica-exchange MC for the configured step budget → MACE-rescore the basin set → call refactored `_minimize_score_filter_dedup` for the final filter/dedup/prune. Returns `(mol, conf_ids, energies)`.
 
@@ -170,4 +174,4 @@ Update `src/README.md` and `scripts/README.md`: new module(s), function, sampler
 2. DBT geometry as a standalone `src/concerted_rotation.py` (potentially reusable for any macrocycle MC code) vs. inlined into `src/mcmm.py`. Standalone is preferred — clean separation, the geometry has no MCMM-specific state.
 3. Implement DBT from scratch. No published reference exists in the pixi `mace` environment. v0 uses numerical closure (Option B above); the analytical polynomial (Option A) is deferred to a future PR if benchmark data shows multi-branch enumeration is necessary.
 
-All three locked. Steps 1–6 complete (see Progress table at top); Step 7 (replica exchange) is next.
+All three locked. Steps 1–7 complete (see Progress table at top); Step 8 (`get_mol_PE_mcmm` entry point) is next.

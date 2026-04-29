@@ -713,3 +713,247 @@ class ParallelMCMMDriver:
         for _ in range(n_steps):
             self.step()
         return self.n_accepted - n_accepted_before
+
+
+# ---------------------------------------------------------------------------
+# Replica exchange — temperature ladder over the parallel driver
+# ---------------------------------------------------------------------------
+
+
+def _swap_walker_configs(walker_a: MCMMWalker, walker_b: MCMMWalker) -> None:
+    """
+    Exchange `(coords, energy, current_basin_idx)` between two walkers.
+
+    Per-walker counters (`n_steps`, `n_accepted`) and temperature (`kt`)
+    stay with the walker — only the configuration moves. This preserves
+    "per-temperature provenance": after many swaps, walker at slot
+    (temp_idx, walker_idx) still represents the trajectory at
+    `kts[temp_idx]`, even though individual configurations have hopped
+    across temperatures.
+
+    Memory is unaffected: the swapped basin indices reference the same
+    shared `BasinMemory`, so the `current_basin_idx` field stays valid
+    after the swap. No usage counters are incremented (a swap is not a
+    re-discovery).
+    """
+    walker_a.coords, walker_b.coords = walker_b.coords, walker_a.coords
+    walker_a.energy, walker_b.energy = walker_b.energy, walker_a.energy
+    walker_a.current_basin_idx, walker_b.current_basin_idx = (
+        walker_b.current_basin_idx,
+        walker_a.current_basin_idx,
+    )
+
+
+class ReplicaExchangeMCMMDriver:
+    """
+    Replica-exchange MCMM driver. Wraps a fixed temperature ladder with
+    one or more walkers per temperature, all sharing one BasinMemory,
+    and periodically attempts configuration swaps between adjacent
+    temperatures via the standard REMD Metropolis criterion.
+
+    Architecture:
+      * `walkers_by_temp[t][i]` is the i-th walker at temperature index
+        t. Temperatures must be strictly increasing (kt[0] < kt[1] < …),
+        and every walker at temperature t must have `kt == kts[t]`.
+      * Per `step()`: every walker proposes via `batch_propose_fn` (one
+        GPU call across all walkers, same as `ParallelMCMMDriver`), then
+        if `n_steps % swap_interval == 0` the driver attempts a swap
+        between every adjacent (t, t+1) temperature pair, paired by
+        within-temperature walker index. With M walkers per temperature
+        and T temperatures, this is (T - 1) × M swap attempts per swap
+        event.
+      * Swap criterion: `p_swap = min(1, exp((β_{t+1} - β_t) × (E_{t+1}
+        - E_t)))`. When the high-T configuration has higher energy than
+        the low-T one (the typical regime), the argument is negative and
+        the swap accepts conditionally; when reversed (favorable swap),
+        always accept.
+      * Swap formulation: configurations exchange between slots while
+        slot temperatures and per-walker counters stay put — see
+        `_swap_walker_configs`.
+
+    Step 8 will configure this driver with 8 temperatures geometric
+    300 K → 600 K and N=8 walkers per temperature (64 total walkers,
+    matched compute budget against `get_mol_PE_exhaustive`'s 10 000
+    seeds at 200 steps per walker).
+
+    Params:
+        walkers_by_temp: list[list[MCMMWalker]] : walkers grouped by
+            temperature, low-to-high. All groups must have the same
+            length M (same number of walkers per temperature). All
+            walkers in group t must share the same `kt` value, and
+            `kt` must be strictly increasing across groups.
+        batch_propose_fn: callable : same contract as
+            `ParallelMCMMDriver.batch_propose_fn` — takes the flat list
+            of all walkers' coords (low-to-high temp, then by
+            within-temp index) and returns one proposal per walker.
+        swap_interval: int : number of `step()` calls between swap
+            attempts. Default 20 matches the literature convention.
+        swap_random_fn: callable | None : zero-argument callable
+            returning a uniform random float in [0, 1) for swap
+            accept/reject. Defaults to a fresh
+            `np.random.default_rng().random`. Tests inject a fixed
+            value to make swap decisions deterministic.
+    """
+
+    def __init__(
+        self,
+        walkers_by_temp: list,
+        batch_propose_fn,
+        swap_interval: int = 20,
+        swap_random_fn=None,
+    ):
+        if not walkers_by_temp:
+            raise ValueError("walkers_by_temp must be non-empty")
+        n_per_temp = len(walkers_by_temp[0])
+        if n_per_temp == 0:
+            raise ValueError("each temperature group must have at least one walker")
+        for t, group in enumerate(walkers_by_temp):
+            if len(group) != n_per_temp:
+                raise ValueError(
+                    "every temperature group must have the same number of "
+                    f"walkers; group {t} has {len(group)}, expected {n_per_temp}"
+                )
+        self.kts = [group[0].kt for group in walkers_by_temp]
+        for t, group in enumerate(walkers_by_temp):
+            for w in group:
+                if w.kt != self.kts[t]:
+                    raise ValueError(
+                        f"walkers in temperature group {t} have inconsistent kt: "
+                        f"expected {self.kts[t]}, found {w.kt}"
+                    )
+        for t in range(len(self.kts) - 1):
+            if not (self.kts[t] < self.kts[t + 1]):
+                raise ValueError(
+                    "kts must be strictly increasing across temperature groups; "
+                    f"kts[{t}]={self.kts[t]} ≥ kts[{t+1}]={self.kts[t+1]}"
+                )
+        if swap_interval < 1:
+            raise ValueError(f"swap_interval must be >= 1, got {swap_interval}")
+
+        self.walkers_by_temp = [list(group) for group in walkers_by_temp]
+        self.batch_propose_fn = batch_propose_fn
+        self.swap_interval = swap_interval
+        self._swap_random = (
+            swap_random_fn
+            if swap_random_fn is not None
+            else np.random.default_rng().random
+        )
+        self.n_steps = 0
+        self.n_swap_attempts = 0
+        self.n_swap_accepted = 0
+        self._flat_walkers = [w for group in self.walkers_by_temp for w in group]
+
+    @property
+    def n_temperatures(self) -> int:
+        return len(self.walkers_by_temp)
+
+    @property
+    def n_walkers_per_temp(self) -> int:
+        return len(self.walkers_by_temp[0])
+
+    @property
+    def n_walkers(self) -> int:
+        return len(self._flat_walkers)
+
+    @property
+    def n_accepted(self) -> int:
+        """Cumulative accepts across all walkers at all temperatures."""
+        return sum(w.n_accepted for w in self._flat_walkers)
+
+    @property
+    def swap_acceptance_rate(self) -> float:
+        """Fraction of attempted swaps that succeeded."""
+        return self.n_swap_accepted / max(self.n_swap_attempts, 1)
+
+    def step(self) -> list:
+        """
+        Run one MC step across every walker, attempting swaps if the
+        step count is a multiple of `swap_interval`.
+
+        Returns:
+            list[bool] : per-walker accept/reject result, in flat order
+                (low-temp first, then by within-temp walker index).
+        Raises:
+            ValueError: if the batch proposer returns the wrong number
+                of proposals.
+        """
+        coords_list = [w.coords for w in self._flat_walkers]
+        proposals = self.batch_propose_fn(coords_list)
+        if len(proposals) != self.n_walkers:
+            raise ValueError(
+                f"batch_propose_fn returned {len(proposals)} proposals; "
+                f"expected {self.n_walkers}"
+            )
+        results = [
+            walker.apply_proposal(*proposal)
+            for walker, proposal in zip(self._flat_walkers, proposals)
+        ]
+        self.n_steps += 1
+        if self.n_steps % self.swap_interval == 0:
+            self.attempt_swaps()
+        return results
+
+    def attempt_swaps(self) -> list:
+        """
+        Attempt one swap between every adjacent (t, t+1) temperature
+        pair, paired by within-temperature walker index.
+
+        Returns:
+            list[bool] : per-attempt swap result, in scan order
+                (t = 0..T-2, then i = 0..M-1). Length is (T-1) × M.
+        """
+        results: list = []
+        for t in range(self.n_temperatures - 1):
+            kt_low, kt_high = self.kts[t], self.kts[t + 1]
+            for i in range(self.n_walkers_per_temp):
+                w_low = self.walkers_by_temp[t][i]
+                w_high = self.walkers_by_temp[t + 1][i]
+                p_swap = self._swap_acceptance_prob(w_low, w_high, kt_low, kt_high)
+                self.n_swap_attempts += 1
+                if self._swap_random() < p_swap:
+                    _swap_walker_configs(w_low, w_high)
+                    self.n_swap_accepted += 1
+                    results.append(True)
+                else:
+                    results.append(False)
+        return results
+
+    def run(self, n_steps: int) -> int:
+        """
+        Run `n_steps` MC steps across the ladder.
+
+        Params:
+            n_steps: int : number of step() calls (each may trigger
+                swap attempts based on `swap_interval`).
+        Returns:
+            int : total accepts across all walkers during this call
+                (not cumulative — for cumulative use `self.n_accepted`).
+        """
+        n_accepted_before = self.n_accepted
+        for _ in range(n_steps):
+            self.step()
+        return self.n_accepted - n_accepted_before
+
+    def _swap_acceptance_prob(
+        self,
+        w_low: MCMMWalker,
+        w_high: MCMMWalker,
+        kt_low: float,
+        kt_high: float,
+    ) -> float:
+        """
+        Standard REMD swap acceptance probability:
+        `p = min(1, exp((β_high − β_low)(E_high − E_low)))`.
+
+        kt_low and kt_high must both be strictly positive and finite;
+        the constructor enforces this via the strictly-increasing check
+        on the temperature ladder.
+        """
+        beta_low = 1.0 / kt_low
+        beta_high = 1.0 / kt_high
+        delta_beta = beta_high - beta_low
+        delta_e = w_high.energy - w_low.energy
+        arg = delta_beta * delta_e
+        if arg >= 0.0:
+            return 1.0
+        return float(np.exp(arg))

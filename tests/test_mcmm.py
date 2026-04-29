@@ -18,7 +18,9 @@ from mcmm import (
     BasinMemory,
     MCMMWalker,
     ParallelMCMMDriver,
+    ReplicaExchangeMCMMDriver,
     _ordered_backbone_residues,
+    _swap_walker_configs,
     enumerate_backbone_windows,
 )
 
@@ -847,3 +849,336 @@ def test_parallel_driver_n_accepted_property_aggregates_walkers():
     # Stepping a walker outside the driver also reflects in n_accepted.
     w0.step(_fixed_proposer(target_x=100.0, target_e=0.0))
     assert driver.n_accepted == 3
+
+
+# ---------------------------------------------------------------------------
+# _swap_walker_configs
+# ---------------------------------------------------------------------------
+
+
+def test_swap_walker_configs_exchanges_state_in_place():
+    """`_swap_walker_configs` swaps coords + energy + current_basin_idx
+    while leaving kt and per-walker counters with the walker."""
+    memory = BasinMemory(n_atoms=_TEST_N_ATOMS, rmsd_threshold=0.5)
+    w_low = MCMMWalker(_line_conformer(0.0), -1.0, kt=1.0, memory=memory)
+    w_high = MCMMWalker(_line_conformer(50.0), 5.0, kt=2.0, memory=memory)
+    # Step them so n_steps differ and we can verify counters don't swap.
+    w_low.step(_fixed_proposer(target_x=0.0, target_e=-1.0, success=False))
+    w_low.step(_fixed_proposer(target_x=0.0, target_e=-1.0, success=False))
+    assert w_low.n_steps == 2 and w_high.n_steps == 0
+
+    coords_low_before = w_low.coords.clone()
+    coords_high_before = w_high.coords.clone()
+    idx_low_before = w_low.current_basin_idx
+    idx_high_before = w_high.current_basin_idx
+
+    _swap_walker_configs(w_low, w_high)
+
+    # Configs swapped:
+    assert w_low.coords.equal(coords_high_before)
+    assert w_high.coords.equal(coords_low_before)
+    assert w_low.energy == 5.0
+    assert w_high.energy == -1.0
+    assert w_low.current_basin_idx == idx_high_before
+    assert w_high.current_basin_idx == idx_low_before
+    # kt and counters did NOT swap:
+    assert w_low.kt == 1.0
+    assert w_high.kt == 2.0
+    assert w_low.n_steps == 2
+    assert w_high.n_steps == 0
+
+
+# ---------------------------------------------------------------------------
+# ReplicaExchangeMCMMDriver — construction validation
+# ---------------------------------------------------------------------------
+
+
+def _make_remd_walkers(
+    kts: list, n_per_temp: int = 1, threshold: float = 0.5, memory=None
+):
+    """Build a `walkers_by_temp` list with one walker per (temp, slot)
+    pair. Each walker starts at a distant offset so initial basins are
+    pairwise distinct (gap of 10 along the line, distance 10/3 ≈ 3.3
+    well above the default threshold of 0.5)."""
+    if memory is None:
+        memory = BasinMemory(n_atoms=_TEST_N_ATOMS, rmsd_threshold=threshold)
+    groups = []
+    for t, kt in enumerate(kts):
+        group = []
+        for i in range(n_per_temp):
+            offset = 100 * t + 10 * i
+            group.append(
+                MCMMWalker(
+                    _line_conformer(float(offset)),
+                    energy=0.0,
+                    kt=kt,
+                    memory=memory,
+                    random_fn=lambda: 0.5,
+                )
+            )
+        groups.append(group)
+    return groups, memory
+
+
+def test_remd_constructor_rejects_empty_walkers():
+    with pytest.raises(ValueError, match="must be non-empty"):
+        ReplicaExchangeMCMMDriver([], lambda c: [])
+
+
+def test_remd_constructor_rejects_empty_temperature_group():
+    with pytest.raises(ValueError, match="at least one walker"):
+        ReplicaExchangeMCMMDriver([[]], lambda c: [])
+
+
+def test_remd_constructor_rejects_uneven_group_sizes():
+    """All temperature groups must have the same number of walkers
+    (paired-swap convention)."""
+    memory = BasinMemory(n_atoms=_TEST_N_ATOMS, rmsd_threshold=0.5)
+    groups = [
+        [MCMMWalker(_line_conformer(0.0), 0.0, kt=1.0, memory=memory)],
+        [
+            MCMMWalker(_line_conformer(50.0), 0.0, kt=2.0, memory=memory),
+            MCMMWalker(_line_conformer(60.0), 0.0, kt=2.0, memory=memory),
+        ],
+    ]
+    with pytest.raises(ValueError, match="same number of"):
+        ReplicaExchangeMCMMDriver(groups, lambda c: [])
+
+
+def test_remd_constructor_rejects_mixed_kt_within_group():
+    memory = BasinMemory(n_atoms=_TEST_N_ATOMS, rmsd_threshold=0.5)
+    groups = [
+        [
+            MCMMWalker(_line_conformer(0.0), 0.0, kt=1.0, memory=memory),
+            MCMMWalker(_line_conformer(10.0), 0.0, kt=1.5, memory=memory),  # mismatch
+        ],
+        [
+            MCMMWalker(_line_conformer(50.0), 0.0, kt=2.0, memory=memory),
+            MCMMWalker(_line_conformer(60.0), 0.0, kt=2.0, memory=memory),
+        ],
+    ]
+    with pytest.raises(ValueError, match="inconsistent kt"):
+        ReplicaExchangeMCMMDriver(groups, lambda c: [])
+
+
+def test_remd_constructor_rejects_non_monotonic_temperatures():
+    memory = BasinMemory(n_atoms=_TEST_N_ATOMS, rmsd_threshold=0.5)
+    groups = [
+        [MCMMWalker(_line_conformer(0.0), 0.0, kt=2.0, memory=memory)],
+        [MCMMWalker(_line_conformer(50.0), 0.0, kt=1.0, memory=memory)],  # decreasing
+    ]
+    with pytest.raises(ValueError, match="strictly increasing"):
+        ReplicaExchangeMCMMDriver(groups, lambda c: [])
+
+
+def test_remd_constructor_rejects_invalid_swap_interval():
+    groups, _ = _make_remd_walkers([1.0, 2.0])
+    with pytest.raises(ValueError, match="swap_interval must be >= 1"):
+        ReplicaExchangeMCMMDriver(groups, lambda c: [], swap_interval=0)
+
+
+# ---------------------------------------------------------------------------
+# ReplicaExchangeMCMMDriver — swap acceptance formula
+# ---------------------------------------------------------------------------
+
+
+def test_remd_swap_probability_matches_exp_delta_beta_delta_e():
+    """`_swap_acceptance_prob` returns `exp((β_high − β_low)(E_high − E_low))`
+    when the argument is negative (the conditional regime)."""
+    groups, _ = _make_remd_walkers([1.0, 2.0])
+    driver = ReplicaExchangeMCMMDriver(groups, lambda c: [])
+    w_low, w_high = groups[0][0], groups[1][0]
+
+    w_low.energy = 0.0
+    w_high.energy = 5.0
+    # delta_beta = 1/2 - 1/1 = -0.5; delta_e = 5; arg = -2.5
+    p = driver._swap_acceptance_prob(w_low, w_high, kt_low=1.0, kt_high=2.0)
+    assert p == pytest.approx(math.exp(-2.5), rel=1e-9)
+
+
+def test_remd_swap_probability_one_when_high_temp_lower_energy():
+    """When the high-T configuration has lower energy than the low-T one,
+    the swap is always favorable (the low-energy state belongs at low T)."""
+    groups, _ = _make_remd_walkers([1.0, 2.0])
+    driver = ReplicaExchangeMCMMDriver(groups, lambda c: [])
+    w_low, w_high = groups[0][0], groups[1][0]
+
+    w_low.energy = 5.0
+    w_high.energy = 0.0  # high-T has lower energy
+    p = driver._swap_acceptance_prob(w_low, w_high, kt_low=1.0, kt_high=2.0)
+    assert p == 1.0
+
+
+def test_remd_swap_probability_one_when_energies_equal():
+    """ΔE = 0 → arg = 0 → exp(0) = 1, and the `arg >= 0` branch returns 1."""
+    groups, _ = _make_remd_walkers([1.0, 2.0])
+    driver = ReplicaExchangeMCMMDriver(groups, lambda c: [])
+    w_low, w_high = groups[0][0], groups[1][0]
+    w_low.energy = 3.0
+    w_high.energy = 3.0
+    p = driver._swap_acceptance_prob(w_low, w_high, kt_low=1.0, kt_high=2.0)
+    assert p == 1.0
+
+
+# ---------------------------------------------------------------------------
+# ReplicaExchangeMCMMDriver — swap mechanics
+# ---------------------------------------------------------------------------
+
+
+def test_remd_attempt_swaps_exchanges_configs_at_p_one():
+    """When p_swap = 1 (favorable swap, e.g. high-T has lower energy),
+    `attempt_swaps` always exchanges configurations between the paired
+    slots."""
+    groups, _ = _make_remd_walkers([1.0, 2.0])
+    driver = ReplicaExchangeMCMMDriver(
+        groups, lambda c: [], swap_random_fn=lambda: 0.999
+    )
+    w_low, w_high = groups[0][0], groups[1][0]
+    # Force favorable swap: high-T energy < low-T energy.
+    w_low.energy = 5.0
+    w_high.energy = 0.0
+    coords_low_before = w_low.coords.clone()
+    coords_high_before = w_high.coords.clone()
+
+    results = driver.attempt_swaps()
+    assert results == [True]
+    assert w_low.coords.equal(coords_high_before)
+    assert w_high.coords.equal(coords_low_before)
+    assert driver.n_swap_attempts == 1
+    assert driver.n_swap_accepted == 1
+
+
+def test_remd_attempt_swaps_skips_when_random_above_threshold():
+    """When the swap probability is < 1 (typical regime) and random_fn ≥ p,
+    no swap occurs."""
+    groups, _ = _make_remd_walkers([1.0, 2.0])
+    driver = ReplicaExchangeMCMMDriver(
+        groups, lambda c: [], swap_random_fn=lambda: 0.999
+    )
+    w_low, w_high = groups[0][0], groups[1][0]
+    # Unfavorable swap: high-T has higher energy. p_swap = exp(-2.5) ≈ 0.082.
+    w_low.energy = 0.0
+    w_high.energy = 5.0
+    coords_low_before = w_low.coords.clone()
+    coords_high_before = w_high.coords.clone()
+
+    results = driver.attempt_swaps()
+    assert results == [False]
+    assert w_low.coords.equal(coords_low_before)
+    assert w_high.coords.equal(coords_high_before)
+    assert driver.n_swap_attempts == 1
+    assert driver.n_swap_accepted == 0
+
+
+def test_remd_attempt_swaps_iterates_all_adjacent_pairs():
+    """With T temperatures and M walkers per temp, attempt_swaps performs
+    (T - 1) × M swap attempts, in scan order (low-temp first, then by
+    within-temp index)."""
+    groups, _ = _make_remd_walkers([1.0, 2.0, 3.0], n_per_temp=2)
+    driver = ReplicaExchangeMCMMDriver(
+        groups, lambda c: [], swap_random_fn=lambda: 0.999
+    )
+    results = driver.attempt_swaps()
+    assert len(results) == (3 - 1) * 2
+    assert driver.n_swap_attempts == 4
+
+
+# ---------------------------------------------------------------------------
+# ReplicaExchangeMCMMDriver — step() and swap_interval semantics
+# ---------------------------------------------------------------------------
+
+
+def _identity_batch(coords_list):
+    """Mock batch_propose_fn that proposes each walker's current coords
+    (no movement) with a small downhill bump so the move is always
+    accepted under finite kt. Useful for testing swap timing without
+    having walkers diverge to new basins."""
+    return [(c.clone(), 0.0, 1.0, True) for c in coords_list]
+
+
+def test_remd_step_returns_per_walker_results_in_flat_order():
+    """`step()` returns a list of accept/reject results in the order
+    [temp_0_walker_0, temp_0_walker_1, ..., temp_T-1_walker_M-1]."""
+    groups, _ = _make_remd_walkers([1.0, 2.0], n_per_temp=2)
+    driver = ReplicaExchangeMCMMDriver(
+        groups, _identity_batch, swap_interval=100, swap_random_fn=lambda: 0.999
+    )
+    results = driver.step()
+    assert len(results) == 4  # 2 temps × 2 walkers
+
+
+def test_remd_step_does_not_swap_below_interval():
+    """`step()` only triggers swap attempts every `swap_interval` steps."""
+    groups, _ = _make_remd_walkers([1.0, 2.0])
+    driver = ReplicaExchangeMCMMDriver(
+        groups,
+        _identity_batch,
+        swap_interval=5,
+        swap_random_fn=lambda: 0.999,
+    )
+    # 4 steps: no swap attempts
+    for _ in range(4):
+        driver.step()
+    assert driver.n_swap_attempts == 0
+    # 5th step: triggers exactly one swap attempt (one adjacent pair × 1 walker per temp)
+    driver.step()
+    assert driver.n_swap_attempts == 1
+
+
+def test_remd_step_swaps_at_each_interval_multiple():
+    """Swap attempts trigger at each multiple of `swap_interval`."""
+    groups, _ = _make_remd_walkers([1.0, 2.0])
+    driver = ReplicaExchangeMCMMDriver(
+        groups, _identity_batch, swap_interval=2, swap_random_fn=lambda: 0.999
+    )
+    for _ in range(6):
+        driver.step()
+    # Steps 2, 4, 6 each trigger one attempt → 3 total
+    assert driver.n_swap_attempts == 3
+
+
+# ---------------------------------------------------------------------------
+# ReplicaExchangeMCMMDriver — properties and statistics
+# ---------------------------------------------------------------------------
+
+
+def test_remd_walker_count_properties():
+    groups, _ = _make_remd_walkers([0.5, 1.0, 2.0, 4.0], n_per_temp=3)
+    driver = ReplicaExchangeMCMMDriver(groups, lambda c: [])
+    assert driver.n_temperatures == 4
+    assert driver.n_walkers_per_temp == 3
+    assert driver.n_walkers == 12
+
+
+def test_remd_swap_acceptance_rate_property():
+    """`swap_acceptance_rate` = n_swap_accepted / n_swap_attempts."""
+    groups, _ = _make_remd_walkers([1.0, 2.0])
+    driver = ReplicaExchangeMCMMDriver(
+        groups, lambda c: [], swap_random_fn=lambda: 0.999
+    )
+    assert driver.swap_acceptance_rate == 0.0
+    # Force one favorable swap
+    groups[0][0].energy = 5.0
+    groups[1][0].energy = 0.0
+    driver.attempt_swaps()
+    assert driver.swap_acceptance_rate == 1.0
+    # Now an unfavorable one — rejected with random=0.999
+    groups[0][0].energy = 0.0
+    groups[1][0].energy = 5.0
+    driver.attempt_swaps()
+    assert driver.swap_acceptance_rate == 0.5  # 1 / 2
+
+
+def test_remd_run_accumulates_accepts_across_walkers_and_steps():
+    """`run(N)` returns the total accepts across walkers and steps for
+    this call."""
+    groups, _ = _make_remd_walkers([1.0, 2.0], n_per_temp=2)
+    driver = ReplicaExchangeMCMMDriver(
+        groups, _identity_batch, swap_interval=100, swap_random_fn=lambda: 0.999
+    )
+    # _identity_batch always proposes the walker's current coords (no move),
+    # so apply_proposal sees ΔE = 0 - current_e. With initial e=0, ΔE=0.
+    # bias = 1/√1 = 1 (each walker is at its own initial basin), det_j = 1,
+    # so p_accept = min(1, 1*1*1) = 1. random_fn = lambda: 0.5 < 1.
+    n_accepted = driver.run(3)
+    assert n_accepted == 4 * 3  # 4 walkers × 3 steps
