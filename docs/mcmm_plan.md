@@ -39,21 +39,25 @@ Behavior must be byte-equivalent. Verification: re-run `tests/test_exhaustive_et
 
 New self-contained `src/concerted_rotation.py`. No MC, no MACE, no torch — pure numpy. Standalone module so any other macrocycle MC code in this project (or downstream) can pick it up without depending on the MCMM driver.
 
-Implements:
+**v0 closure solver: numerical (Option B).** The original plan called for the analytical degree-16 polynomial of Coutsias 2004 (Option A), but on review the algebraic re-derivation is high-risk for subtle bugs that would silently violate detailed balance, and pure-Python performance of the closure step is irrelevant given MMFF dominates the per-move cost. v0 uses `scipy.optimize.least_squares` to solve the closure constraint numerically, with the current geometry as the initial guess. This finds a single closure branch (the one in the same homotopy class as the current state) rather than enumerating all up to 16 branches.
 
-- 7-atom-window parameterization. Inputs: positions of 7 consecutive backbone atoms, choice of drive dihedral, drive perturbation Δθ. Outputs: new positions of the 5 inner atoms (outer two preserved exactly).
-- Polynomial closure solver. Coutsias 2004 reformulation rather than DBT 1993 original — same algorithm, better-conditioned numerics. Up to 16 real solutions; we select the branch closest to the current geometry.
-- Wu-Deem 1999 Jacobian. |det J| of the closure-constraint Jacobian with respect to the drive angle, used to weight the proposal probability for detailed balance.
+**Implementation:**
 
-Test invariants:
+- 7-atom-window parameterization. Inputs: positions of 7 consecutive backbone atoms, choice of drive dihedral, drive perturbation Δθ. Outputs: new positions of the inner atoms (outer atoms r₀, r₁, r₅, r₆ preserved approximately by the closure solver, exactly to within `tol`).
+- Numerical closure via `scipy.optimize.least_squares`. The system is generically over-determined when 1 of 4 dihedrals is the drive (6 raw position constraints on the outer atoms r₅, r₆ minus a few automatic from chain rigidity, vs. 3 free dihedrals). Least-squares handles the over-constraint gracefully: when an exact solution exists, it converges to zero residual; when no exact solution exists, residual stays non-zero and the move is rejected as geometrically infeasible. Tunable Δθ amplitude trades acceptance rate against move size.
+- Wu-Deem 1999 Jacobian via finite differences. |det J| of the 3 free dihedrals with respect to the drive angle, evaluated at the solution; used to weight the proposal probability for detailed balance. Finite differences are noisier than the analytical form but have correct qualitative behavior.
+
+**Test invariants:**
 
 - Zero perturbation maps to identity (positions unchanged to machine precision).
-- Outer atom positions preserved to 1e-9 after non-zero perturbation.
-- Analytical Jacobian matches finite-difference numerical Jacobian to 1e-6 across a sweep of geometries.
-- Polynomial degree check on hand-constructed cases (known number of real solutions).
-- Coutsias 2004 published test cases reproduced.
+- Outer atom positions preserved to within `tol` after a successful closure.
+- Bond lengths and bond angles in the 7-atom chain preserved by the chain-rebuild primitive (independent of the closure solver).
+- The drive dihedral changes by exactly Δθ relative to its original value.
+- Numerical Jacobian smoke test: |det J| is finite and well-conditioned across a sweep of geometries.
 
-This is the longest and trickiest piece of the implementation. Land it as its own commit so review focuses on the geometry. Pure-Python performance is fine for v0 — the bottleneck of the full pipeline is MMFF, not move proposal. Profile-driven port to torch or C only if profiling later shows DBT itself is hot.
+**Option A as deferred upgrade.** The analytical degree-16 polynomial (Coutsias 2004 / DBT 1993) gives multi-branch enumeration: a single move can jump to a topologically distant ring conformation rather than being trapped in the current homotopy class. This is the entire reason DBT/Coutsias is special vs. naive loop closure. For cyclic peptides with realistic constrained geometry, real basins probably all live in one homotopy class, so multi-branch enumeration mostly buys noise — but if benchmark data shows MCMM stuck in one branch on real peptides, Option A becomes worth the ~400-500 lines of algebraic implementation. Trigger: per-replica branch-jump rate near zero in `pampa_large` runs, or basin coverage saturating below `get_mol_PE_exhaustive`'s.
+
+Pure-Python performance is fine for v0 — the bottleneck of the full pipeline is MMFF, not move proposal. Profile-driven port to torch or C only if profiling later shows the closure step itself is hot.
 
 ---
 
@@ -126,6 +130,7 @@ Update `src/README.md` and `scripts/README.md`: new module(s), function, sampler
 ## Risks to instrument from day one
 
 - **DBT acceptance rate on macrocycles is unknown.** Literature reports 5–20 % on linear proteins; cyclic peptides may be lower. Instrument per-replica acceptance rate during runs and surface it in benchmark logs alongside `n_basins` and `max_bw`. If <1 % on `pampa_large`, the fallback is adaptive Δθ amplitude tuning (standard MC adaptation, ~10 lines of code).
+- **Closure tolerance as a coverage lever.** `concerted_rotation.DEFAULT_CLOSURE_TOL` (currently 0.01 Å) controls the maximum r5 + r6 displacement norm tolerated as "ring-closed." Relaxing it monotonically improves geometry-acceptance and basin coverage — but only up to a sweet spot near 0.1 Å (the MMFF bond-stretch tolerance). Beyond that, MMFF drift can carry the structure into a different basin than the concerted-rotation move targeted, degrading toward "random perturbation + MMFF basin search" and erasing the algorithmic advantage. Instrument both the closure-pass rate and the post-MMFF RMSD-from-target during benchmark runs so we can detect when the lever is being used productively vs. defeating its own purpose. Couples to Δθ amplitude (relax both together for bigger directed moves).
 - **MMFF/MACE basin tier mismatch.** Basin memory dedups at the MMFF level (where minimization happens); final scoring is MACE. Two distinct MMFF basins can collapse to one MACE basin (and vice versa). Instrument `n_basins_mmff` and `n_basins_mace` separately so we see whether tier mismatch is real before deciding whether to add MACE-as-minimizer in v1.
 - **Polynomial root-finding numerical stability.** Coutsias 2004's reformulation is meaningfully better-conditioned than DBT 1993's original recipe. Validate against Coutsias's published test cases and watch for branch-selection ambiguity near the closure manifold's boundary.
 - **Walker-budget shape vs. exhaustive ETKDG.** 64 × 200 = 12 800 minimizations is the headline matched budget, but two factors complicate the comparison: DBT-rejected moves still incur the MMFF cost, and MACE rescoring runs only on the deduped basin set (not every walker's accepted state). Report effective MACE-equivalent budget alongside raw step count.
@@ -136,6 +141,6 @@ Update `src/README.md` and `scripts/README.md`: new module(s), function, sampler
 
 1. Land Step 1 (shared-tail refactor) as a standalone commit before any MCMM work, so its behavior-preservation can be verified in isolation against the existing `tests/test_exhaustive_etkdg.py` and `tests/test_pool_b.py` suites.
 2. DBT geometry as a standalone `src/concerted_rotation.py` (potentially reusable for any macrocycle MC code) vs. inlined into `src/mcmm.py`. Standalone is preferred — clean separation, the geometry has no MCMM-specific state.
-3. Implement DBT from scratch following Coutsias 2004. No published reference exists in the pixi `mace` environment that wraps the algorithm cleanly, and writing it from scratch is the only path. Estimated scope: ~300–500 lines of geometry code plus tests.
+3. Implement DBT from scratch. No published reference exists in the pixi `mace` environment. v0 uses numerical closure (Option B above); the analytical polynomial (Option A) is deferred to a future PR if benchmark data shows multi-branch enumeration is necessary.
 
-Once those three are locked, work begins at Step 1.
+All three locked; work began at Step 1 (shared-tail refactor, complete) and continues at Step 2 (`src/concerted_rotation.py`).
