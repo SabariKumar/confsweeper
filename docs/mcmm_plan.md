@@ -4,6 +4,21 @@ Branch: `10-benchmark-non-etkdg-samplers-against-exhaustive-etkdg-on-cyclic-pept
 
 This document is the working design for the third sampler in the issue-#10 benchmark: Multiple Minimum Monte Carlo (Saunders 1990) with replica exchange and Dodd-Boone-Theodorou concerted-rotation backbone moves. It captures the implementation order, the testable invariants at each layer, and the open decisions that block coding. Folded into `src/README.md` (or deleted) before the PR ships.
 
+## Progress
+
+| Step | Description | Status |
+|------|-------------|--------|
+| 1 | Refactor shared post-sampling tail | ✓ complete |
+| 2 | DBT concerted rotation geometry (`src/concerted_rotation.py`) | ✓ complete |
+| 3 | Backbone window enumeration (`src/mcmm.py`) | ✓ complete |
+| 4 | Basin memory | pending |
+| 5 | Single-walker MCMM driver | pending |
+| 6 | Parallel walkers (batched) | pending |
+| 7 | Replica exchange | pending |
+| 8 | `get_mol_PE_mcmm` entry point | pending |
+| 9 | Sampler benchmark wiring | pending |
+| 10 | Documentation | pending |
+
 ---
 
 ## Goals and constraints
@@ -27,7 +42,7 @@ Constraints inherited from issue #11:
 
 ## Phase 1 — Foundation (unblocks everything else)
 
-### Step 1: Refactor shared post-sampling tail
+### Step 1: Refactor shared post-sampling tail — ✓ complete
 
 Extract the MMFF → batched MACE score → 5 kT energy filter → `_energy_ranked_dedup` → non-centroid prune block from `get_mol_PE_exhaustive` and `get_mol_PE_pool_b` into a private `_minimize_score_filter_dedup(mol, calc, hardware_opts, ...)` helper in `src/confsweeper.py`. Both existing functions become thin wrappers around their respective Phase 1 sampler plus the shared tail.
 
@@ -35,7 +50,9 @@ The refactor flag was deliberately deferred from the Pool B PR because two calle
 
 Behavior must be byte-equivalent. Verification: re-run `tests/test_exhaustive_etkdg.py` and `tests/test_pool_b.py` unmodified; all tests pass. Remove the refactor flag from `src/README.md` and from `get_mol_PE_pool_b`'s docstring.
 
-### Step 2: DBT concerted rotation geometry
+**Outcome.** Helper landed in `src/confsweeper.py`. Both callers became thin wrappers. All 33 existing exhaustive + pool_b tests pass unchanged. Refactor flag removed from `src/README.md`.
+
+### Step 2: DBT concerted rotation geometry — ✓ complete
 
 New self-contained `src/concerted_rotation.py`. No MC, no MACE, no torch — pure numpy. Standalone module so any other macrocycle MC code in this project (or downstream) can pick it up without depending on the MCMM driver.
 
@@ -59,19 +76,23 @@ New self-contained `src/concerted_rotation.py`. No MC, no MACE, no torch — pur
 
 Pure-Python performance is fine for v0 — the bottleneck of the full pipeline is MMFF, not move proposal. Profile-driven port to torch or C only if profiling later shows the closure step itself is hot.
 
+**Outcome.** `src/concerted_rotation.py` (~280 lines) with `rotation_matrix`, `dihedral_angle`, `apply_dihedral_changes`, `closure_residual`, `propose_move`. 20 tests in `tests/test_concerted_rotation.py` covering rotation primitives, chain-rebuild geometry preservation, sign-convention self-consistency, closure contract, and edge cases. `DEFAULT_CLOSURE_TOL` set to 0.01 Å (relaxed from initial 1e-6 because the system is over-determined: 6 residuals on r5/r6 vs. 3 free dihedrals when one is the drive); coverage-lever guidance documented in the module docstring.
+
 ---
 
 ## Phase 2 — MCMM algorithm core
 
 All in a new `src/mcmm.py`. Builds on Step 2 (`concerted_rotation.py`) and Step 1 (refactored shared tail).
 
-### Step 3: Backbone window enumeration
+### Step 3: Backbone window enumeration — ✓ complete
 
 Given a cyclic peptide mol, return all valid 7-atom windows entirely inside the macrocycle. Reuses `torsional_sampling._BACKBONE_SMARTS` and `get_backbone_dihedrals` for the residue-level structure.
 
 Tests on cyclo(Ala)4 and cyclo(Ala)6: verify expected window count and that every returned window's outer atoms are inside the ring.
 
-### Step 4: Basin memory
+**Outcome.** `src/mcmm.py` created with `enumerate_backbone_windows(mol)` and the private `_ordered_backbone_residues(mol)` helper. Walks the macrocycle ring via C → N peptide bonds, emits 3K cyclic windows for a K-residue cyclic peptide. Reuses `get_backbone_dihedrals` from `torsional_sampling.py` (rather than the private `_BACKBONE_SMARTS` constant). 13 tests in `tests/test_mcmm.py` covering window count, sequential bonding, cyclic shifts, full backbone coverage, plus error cases (linear peptides raise `ValueError`, non-peptide cyclic mols return `[]`). The initial `len(ordered) != len(residues)` closure check was too weak for linear peptides where only the fully-internal residues match the SMARTS; replaced with an explicit `ring_closed` flag set only when the walk's `next_n` equals `start_n`.
+
+### Step 4: Basin memory — pending (next)
 
 `class BasinMemory` backed by torch tensors `[K, n_atoms, 3]` for stored basin coordinates and `[K]` for usage counts.
 
@@ -143,4 +164,4 @@ Update `src/README.md` and `scripts/README.md`: new module(s), function, sampler
 2. DBT geometry as a standalone `src/concerted_rotation.py` (potentially reusable for any macrocycle MC code) vs. inlined into `src/mcmm.py`. Standalone is preferred — clean separation, the geometry has no MCMM-specific state.
 3. Implement DBT from scratch. No published reference exists in the pixi `mace` environment. v0 uses numerical closure (Option B above); the analytical polynomial (Option A) is deferred to a future PR if benchmark data shows multi-branch enumeration is necessary.
 
-All three locked; work began at Step 1 (shared-tail refactor, complete) and continues at Step 2 (`src/concerted_rotation.py`).
+All three locked. Steps 1–3 complete (see Progress table at top); Step 4 (Basin memory) is next.
