@@ -22,8 +22,12 @@ Sampler dispatch table — currently:
     pool_b            backbone-dihedral-constrained DG (get_mol_PE_pool_b),
                       strategy='inverse', n_attempts=1, otherwise matched
                       defaults to exhaustive_etkdg
-Future entries (CREST-fast, MCMM, REMD) plug in as new functions plus a
-single new dispatch-table key; the benchmark protocol stays unchanged.
+    mcmm              Multiple Minimum Monte Carlo with replica exchange
+                      (get_mol_PE_mcmm). 8 temps × 8 walkers (300 K → 600 K)
+                      with n_steps derived from n_seeds so total MMFF work
+                      matches exhaustive_etkdg's at the same --n_seeds.
+Future entries (CREST-fast, REMD) plug in as new functions plus a single
+new dispatch-table key; the benchmark protocol stays unchanged.
 
 Per (peptide, sampler) row, the script reports the same Boltzmann-weight
 metrics as saturation_etkdg.py (n_basins, max_bw, eff_n, n_within_3kT,
@@ -37,7 +41,7 @@ Usage (in the confsweeper pixi mace environment):
         --cremp_csv data/processed/cremp/validation_subset.csv \\
         --pampa_csv /home/sabari/peptide_electrostatics/data/fine_tune/CycPeptMPDB_PAMPA_deduped.csv \\
         --out_csv  results/sampler_benchmark.csv \\
-        --samplers exhaustive_etkdg,pool_b \\
+        --samplers exhaustive_etkdg,pool_b,mcmm \\
         --n_seeds  10000
 
 The output CSV is resume-aware on (peptide_id, sampler, n_seeds): re-running
@@ -75,6 +79,7 @@ from confsweeper import (  # noqa: E402
     get_hardware_opts,
     get_mace_calc,
     get_mol_PE_exhaustive,
+    get_mol_PE_mcmm,
     get_mol_PE_pool_b,
 )
 from torsional_sampling import load_ramachandran_grids  # noqa: E402
@@ -171,9 +176,56 @@ def _run_pool_b(
     return energies_eV
 
 
+def _run_mcmm(
+    peptide: dict, n_seeds: int, hardware_opts, calc, grids: dict | None
+) -> list[float]:
+    """
+    Adapter: run get_mol_PE_mcmm with the issue-#11 default temperature
+    ladder (8 temps × 8 walkers = 64 walkers, 300 K → 600 K geometric)
+    and `n_steps` derived from `n_seeds` so the total MMFF minimisation
+    budget matches `exhaustive_etkdg`'s for the same `--n_seeds`.
+
+    Mapping: MCMM costs roughly one MMFF call per walker per step. At
+    the default 64 walkers, `n_steps = n_seeds // 64` keeps total MMFF
+    work proportional to `n_seeds`. For the saturation-validated
+    `n_seeds=10000` this gives 156 steps per walker (12 480 total
+    minimisations, within ~25 % of exhaustive ETKDG's headline budget).
+
+    The `grids` argument is unused — MCMM does not consume the
+    Ramachandran prior.
+
+    Params:
+        peptide: dict : peptide row from select_*_peptides
+        n_seeds: int : matched-budget MMFF call budget; converted to
+            n_steps = max(1, n_seeds // 64) per walker
+        hardware_opts : nvmolkit hardware options
+        calc : MACE calculator
+        grids: dict | None : ignored
+    Returns:
+        list[float] : MACE energies in eV for the basin-representative conformers
+    """
+    del grids  # unused by this adapter
+    params = get_embed_params_macrocycle()
+    n_walkers_per_temp = 8
+    n_temperatures = 8
+    n_walkers = n_walkers_per_temp * n_temperatures
+    n_steps = max(1, n_seeds // n_walkers)
+    _, _, energies_eV = get_mol_PE_mcmm(
+        peptide["smiles"],
+        params,
+        hardware_opts,
+        calc,
+        n_walkers_per_temp=n_walkers_per_temp,
+        n_temperatures=n_temperatures,
+        n_steps=n_steps,
+    )
+    return energies_eV
+
+
 SAMPLERS: dict[str, callable] = {
     "exhaustive_etkdg": _run_exhaustive_etkdg,
     "pool_b": _run_pool_b,
+    "mcmm": _run_mcmm,
 }
 
 

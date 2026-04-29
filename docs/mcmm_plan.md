@@ -17,7 +17,7 @@ This document is the working design for the third sampler in the issue-#10 bench
 | 7 | Replica exchange (`src/mcmm.py`) | ✓ complete |
 | 8 | `get_mol_PE_mcmm` entry point + proposer stub (`src/confsweeper.py`, `src/mcmm.py`) | ✓ complete (orchestration) |
 | 8b | Real `make_mcmm_proposer` (DBT + side-chain coupling + MMFF + MACE) | ✓ complete |
-| 9 | Sampler benchmark wiring | pending |
+| 9 | Sampler benchmark wiring (`scripts/sampler_benchmark.py`) | ✓ complete |
 | 10 | Documentation | pending |
 
 ---
@@ -198,11 +198,13 @@ Once 8b lands, Step 9 (sampler benchmark wiring) plugs `mcmm` into `scripts/samp
 
 **Test count delta**: +4 in `test_concerted_rotation.py` (24 total), +5 in `test_mcmm.py` (90 total), no changes in `test_get_mol_PE_mcmm.py` since it patches `confsweeper.make_mcmm_proposer` and is unaffected by the body swap. All 158 tests pass across the 5 directly-affected suites.
 
-### Step 9: Sampler benchmark wiring
+### Step 9: Sampler benchmark wiring — ✓ complete
 
 Add `"mcmm"` row to `SAMPLERS` dispatch in `scripts/sampler_benchmark.py`. Adapter forwards default args; signature matches the existing `_run_*` adapters. End-to-end smoke run on cyclo(Ala)4 with `--samplers mcmm --n_seeds 100`. CLI default becomes `--samplers exhaustive_etkdg,pool_b,mcmm`.
 
-### Step 10: Documentation
+**Outcome.** `_run_mcmm` adapter added to `scripts/sampler_benchmark.py` with the matched-budget mapping `n_steps = max(1, n_seeds // 64)` — at the issue-#11 default 8 × 8 = 64 walkers, this keeps total MMFF work proportional to `n_seeds` so MCMM and exhaustive ETKDG can be run at the same `--n_seeds` value for a fair comparison. Module docstring updated, CLI default `--samplers` is now `exhaustive_etkdg,pool_b,mcmm`. The `grids` argument is ignored by `_run_mcmm` (MCMM doesn't consume the Ramachandran prior). Verified: script imports cleanly, `SAMPLERS = ['exhaustive_etkdg', 'pool_b', 'mcmm']`, CLI help shows the updated default.
+
+### Step 10: Documentation — pending (next)
 
 Update `src/README.md` and `scripts/README.md`: new module(s), function, sampler entry, plus a section explaining the move set, replica-exchange architecture, and basin-memory bookkeeping. Remove the shared-tail refactor flag.
 
@@ -224,4 +226,4 @@ Update `src/README.md` and `scripts/README.md`: new module(s), function, sampler
 2. DBT geometry as a standalone `src/concerted_rotation.py` (potentially reusable for any macrocycle MC code) vs. inlined into `src/mcmm.py`. Standalone is preferred — clean separation, the geometry has no MCMM-specific state.
 3. Implement DBT from scratch. No published reference exists in the pixi `mace` environment. v0 uses numerical closure (Option B above); the analytical polynomial (Option A) is deferred to a future PR if benchmark data shows multi-branch enumeration is necessary.
 
-All three locked. Steps 1–8b complete (see Progress table at top). Step 9 (sampler benchmark wiring) is next, then Step 10 (final docs).
+All three locked. Steps 1–9 complete (see Progress table at top). Step 10 (final docs in `src/README.md` and `scripts/README.md`) is the last item; after that the branch is ready for the issue-#10 benchmark run.
