@@ -17,6 +17,7 @@ from mcmm import (
     WINDOW_SIZE,
     BasinMemory,
     MCMMWalker,
+    ParallelMCMMDriver,
     _ordered_backbone_residues,
     enumerate_backbone_windows,
 )
@@ -434,7 +435,7 @@ def _fixed_proposer(
         (current_coords) -> (new_coords, new_energy, det_j, success).
     """
 
-    def fn(_current_coords):
+    def fn(_):
         return _line_conformer(target_x), target_e, det_j, success
 
     return fn
@@ -642,3 +643,207 @@ def test_walker_run_returns_accept_count_for_this_call():
     assert n2 == 2
     assert walker.n_accepted == 5
     assert walker.n_steps == 5
+
+
+# ---------------------------------------------------------------------------
+# ParallelMCMMDriver
+# ---------------------------------------------------------------------------
+
+
+def _scripted_batch_propose_fn(per_walker_proposals: list):
+    """
+    Deterministic batch proposer that emits one fixed proposal per call,
+    cycling through `per_walker_proposals` for each step. Each entry is
+    a list of (target_x, target_e, det_j, success) — one tuple per walker.
+
+    Returns a callable matching `batch_propose_fn(coords_list) → list[...]`
+    that ignores the input coords and returns the next scripted batch.
+    """
+    state = {"step": 0}
+
+    def fn(coords_list):
+        proposals_for_this_step = per_walker_proposals[state["step"]]
+        state["step"] += 1
+        out = []
+        for target_x, target_e, det_j, success in proposals_for_this_step:
+            out.append((_line_conformer(target_x), target_e, det_j, success))
+        del coords_list  # ignored — fully scripted
+        return out
+
+    return fn
+
+
+def test_parallel_driver_constructor_rejects_empty_walkers():
+    with pytest.raises(ValueError, match="walkers list must be non-empty"):
+        ParallelMCMMDriver(walkers=[], batch_propose_fn=lambda _: [])
+
+
+def test_parallel_driver_n1_matches_single_walker_step():
+    """N=1 ParallelMCMMDriver should produce identical state to a single
+    MCMMWalker.step run with the equivalent propose_fn — same proposal,
+    same RNG, same memory updates."""
+    # Reference: single walker
+    memory_ref = BasinMemory(n_atoms=_TEST_N_ATOMS, rmsd_threshold=0.5)
+    walker_ref = MCMMWalker(
+        _line_conformer(0.0), 0.0, kt=1.0, memory=memory_ref, random_fn=lambda: 0.1
+    )
+    walker_ref.step(_fixed_proposer(target_x=5.0, target_e=-1.0))
+
+    # Parallel: N=1 driver with the same proposal
+    memory_par = BasinMemory(n_atoms=_TEST_N_ATOMS, rmsd_threshold=0.5)
+    walker_par = MCMMWalker(
+        _line_conformer(0.0), 0.0, kt=1.0, memory=memory_par, random_fn=lambda: 0.1
+    )
+    batch_fn = _scripted_batch_propose_fn([[(5.0, -1.0, 1.0, True)]])
+    driver = ParallelMCMMDriver([walker_par], batch_fn)
+    driver.step()
+
+    assert walker_par.coords.equal(walker_ref.coords)
+    assert walker_par.energy == walker_ref.energy
+    assert walker_par.n_accepted == walker_ref.n_accepted
+    assert memory_par.n_basins == memory_ref.n_basins
+    assert memory_par.usages.tolist() == memory_ref.usages.tolist()
+
+
+def test_parallel_driver_step_returns_per_walker_results():
+    """`step()` returns a list of accept/reject booleans, one per walker,
+    in the walker-list order."""
+    memory = BasinMemory(n_atoms=_TEST_N_ATOMS, rmsd_threshold=0.5)
+    w0 = MCMMWalker(
+        _line_conformer(0.0), 0.0, kt=0.0, memory=memory, random_fn=lambda: 0.5
+    )
+    w1 = MCMMWalker(
+        _line_conformer(20.0), 0.0, kt=0.0, memory=memory, random_fn=lambda: 0.5
+    )
+    # w0 proposes uphill (rejected at T=0); w1 proposes downhill (accepted).
+    batch_fn = _scripted_batch_propose_fn(
+        [
+            [
+                (10.0, 5.0, 1.0, True),  # uphill for w0 → reject
+                (25.0, -5.0, 1.0, True),  # downhill for w1 → accept
+            ]
+        ]
+    )
+    driver = ParallelMCMMDriver([w0, w1], batch_fn)
+    results = driver.step()
+    assert results == [False, True]
+
+
+def test_parallel_driver_disjoint_basins_independent_acceptance():
+    """Two walkers proposing into completely disjoint novel basins each
+    update memory once — no interference, both basins added."""
+    memory = BasinMemory(n_atoms=_TEST_N_ATOMS, rmsd_threshold=0.5)
+    w0 = MCMMWalker(
+        _line_conformer(0.0), 0.0, kt=math.inf, memory=memory, random_fn=lambda: 0.0
+    )
+    w1 = MCMMWalker(
+        _line_conformer(50.0), 0.0, kt=math.inf, memory=memory, random_fn=lambda: 0.0
+    )
+    # Initial state: 2 basins.
+    assert memory.n_basins == 2
+
+    # w0 → x=10 (novel), w1 → x=60 (novel).
+    batch_fn = _scripted_batch_propose_fn(
+        [
+            [(10.0, 0.0, 1.0, True), (60.0, 0.0, 1.0, True)],
+        ]
+    )
+    driver = ParallelMCMMDriver([w0, w1], batch_fn)
+    results = driver.step()
+    assert results == [True, True]
+    assert memory.n_basins == 4  # 2 initial + 2 new
+    assert memory.usages.tolist() == [1, 1, 1, 1]
+
+
+def test_parallel_driver_shared_basin_serializes_through_memory():
+    """When two walkers in the SAME step propose into the same novel basin,
+    the first to dispatch creates it (usage=1) and the second sees it as a
+    known basin and increments instead of duplicating. This is the
+    sequential-dispatch semantic."""
+    memory = BasinMemory(n_atoms=_TEST_N_ATOMS, rmsd_threshold=0.5)
+    w0 = MCMMWalker(
+        _line_conformer(0.0), 0.0, kt=math.inf, memory=memory, random_fn=lambda: 0.0
+    )
+    w1 = MCMMWalker(
+        _line_conformer(50.0), 0.0, kt=math.inf, memory=memory, random_fn=lambda: 0.0
+    )
+    n_basins_initial = memory.n_basins  # 2
+
+    # Both propose to the SAME conformer (x=100). The first to dispatch
+    # adds it; the second finds it as known and increments.
+    batch_fn = _scripted_batch_propose_fn(
+        [
+            [(100.0, 0.0, 1.0, True), (100.0, 0.0, 1.0, True)],
+        ]
+    )
+    driver = ParallelMCMMDriver([w0, w1], batch_fn)
+    driver.step()
+
+    assert memory.n_basins == n_basins_initial + 1  # only one new basin, not two
+    new_basin_idx = n_basins_initial
+    assert int(memory.usages[new_basin_idx].item()) == 2  # 1 (add) + 1 (re-visit)
+
+
+def test_parallel_driver_proposal_count_mismatch_raises():
+    """If the batch proposer returns a list of the wrong length, step()
+    raises before mutating any walker."""
+    memory = BasinMemory(n_atoms=_TEST_N_ATOMS, rmsd_threshold=0.5)
+    w0 = MCMMWalker(_line_conformer(0.0), 0.0, kt=1.0, memory=memory)
+    w1 = MCMMWalker(_line_conformer(10.0), 0.0, kt=1.0, memory=memory)
+
+    def wrong_count_fn(coords_list):
+        return [(coords_list[0], 0.0, 1.0, True)]  # only 1 proposal for 2 walkers
+
+    driver = ParallelMCMMDriver([w0, w1], wrong_count_fn)
+    with pytest.raises(ValueError, match="returned 1 proposals; expected 2"):
+        driver.step()
+
+
+def test_parallel_driver_run_total_accept_count():
+    """run(N) returns total accepts across all walkers and steps for this
+    call only."""
+    memory = BasinMemory(n_atoms=_TEST_N_ATOMS, rmsd_threshold=0.5)
+    walkers = [
+        MCMMWalker(
+            _line_conformer(x),
+            0.0,
+            kt=math.inf,
+            memory=memory,
+            random_fn=lambda: 0.0,
+        )
+        for x in [0.0, 50.0, 100.0]
+    ]
+    # 2 steps, 3 walkers each, all distinct novel basins, all accepts.
+    batch_fn = _scripted_batch_propose_fn(
+        [
+            [(10.0, 0.0, 1.0, True), (60.0, 0.0, 1.0, True), (110.0, 0.0, 1.0, True)],
+            [(20.0, 0.0, 1.0, True), (70.0, 0.0, 1.0, True), (120.0, 0.0, 1.0, True)],
+        ]
+    )
+    driver = ParallelMCMMDriver(walkers, batch_fn)
+    n_accepted = driver.run(2)
+    assert n_accepted == 6  # 3 walkers × 2 steps
+    assert driver.n_accepted == 6  # cumulative property
+    assert driver.n_steps == 2
+
+
+def test_parallel_driver_n_accepted_property_aggregates_walkers():
+    """`driver.n_accepted` reflects the live accept counter sum across all
+    walkers — even if walkers are stepped through other paths."""
+    memory = BasinMemory(n_atoms=_TEST_N_ATOMS, rmsd_threshold=0.5)
+    w0 = MCMMWalker(
+        _line_conformer(0.0), 0.0, kt=math.inf, memory=memory, random_fn=lambda: 0.0
+    )
+    w1 = MCMMWalker(
+        _line_conformer(50.0), 0.0, kt=math.inf, memory=memory, random_fn=lambda: 0.0
+    )
+    driver = ParallelMCMMDriver(
+        [w0, w1],
+        _scripted_batch_propose_fn([[(5.0, 0.0, 1.0, True), (55.0, 0.0, 1.0, True)]]),
+    )
+    assert driver.n_accepted == 0
+    driver.step()
+    assert driver.n_accepted == 2
+    # Stepping a walker outside the driver also reflects in n_accepted.
+    w0.step(_fixed_proposer(target_x=100.0, target_e=0.0))
+    assert driver.n_accepted == 3

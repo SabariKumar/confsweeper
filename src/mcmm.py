@@ -489,6 +489,11 @@ class MCMMWalker:
         """
         Run one MC step.
 
+        Convenience wrapper around `apply_proposal` for the single-walker
+        case where the proposal is generated on demand from the walker's
+        current coordinates. The parallel driver bypasses this and calls
+        `apply_proposal` directly with proposals batched across walkers.
+
         Params:
             propose_fn: callable : `propose_fn(coords) -> (new_coords,
                 new_energy, det_j, success)`. `new_coords` is a torch
@@ -500,8 +505,39 @@ class MCMMWalker:
             bool : True iff the move was accepted and the walker state
                 advanced.
         """
-        self.n_steps += 1
         new_coords, new_energy, det_j, success = propose_fn(self.coords)
+        return self.apply_proposal(new_coords, new_energy, det_j, success)
+
+    def apply_proposal(
+        self,
+        new_coords: torch.Tensor,
+        new_energy: float,
+        det_j: float,
+        success: bool,
+    ) -> bool:
+        """
+        Apply a precomputed proposal: query memory, run Metropolis
+        accept/reject, update state on accept.
+
+        Separated from `step` so the parallel driver can batch the
+        proposal-generation stage (DBT moves + MMFF + MACE on GPU
+        across N walkers) and dispatch the per-walker accept/reject
+        decisions in a loop. Single-walker callers normally use
+        `step(propose_fn)`; this is the underlying primitive.
+
+        Params:
+            new_coords: torch.Tensor (n_atoms, 3) : proposed coords
+            new_energy: float : proposed energy in the same units as
+                `self.energy`
+            det_j: float : Wu-Deem Jacobian factor (must be > 0 for
+                accept; 0 forces rejection)
+            success: bool : whether the geometry move closed the ring
+                successfully (False means rejection without consulting
+                memory or energy)
+        Returns:
+            bool : True iff the move was accepted.
+        """
+        self.n_steps += 1
         if not success:
             return False
 
@@ -565,3 +601,115 @@ class MCMMWalker:
             # numerically clean.
             energy_factor = float(np.exp(-delta_e / self.kt))
         return min(1.0, energy_factor * bias * det_j)
+
+
+# ---------------------------------------------------------------------------
+# Parallel walkers — batched MMFF/MACE across N walkers
+# ---------------------------------------------------------------------------
+
+
+class ParallelMCMMDriver:
+    """
+    Coordinates N MCMM walkers sharing one BasinMemory, batching the
+    GPU-bound stages (MMFF minimisation + MACE scoring) across walkers
+    so each MC step costs roughly one GPU call rather than N.
+
+    Per `step()`:
+
+      1. Collect every walker's current coordinates.
+      2. Hand them to a single `batch_propose_fn` call. The batch
+         proposer is responsible for: per-walker DBT move generation
+         (CPU, sequential), batched MMFF on the resulting N candidate
+         conformers (one GPU call), batched MACE scoring (one GPU
+         call), and per-walker Wu-Deem Jacobian estimates. It returns
+         a list of N (new_coords, new_energy, det_j, success) tuples.
+      3. Walk the list in order, dispatching each tuple to the
+         corresponding walker's `apply_proposal`.
+
+    Step 3 is sequential by design: walker `i` sees memory updates
+    from walker `j < i` made earlier in the same step. This matters
+    when two walkers propose into the same novel basin: the first to
+    accept creates the basin (with usage = 1); the second sees it as
+    a known basin and increments instead of duplicating. The
+    alternative — buffering all proposals and committing to memory
+    atomically at end of step — would let two walkers create
+    duplicate basins for the same conformation. Sequential dispatch
+    is the standard MCMM-with-shared-memory convention.
+
+    The walker list defines the dispatch order. For deterministic
+    behaviour across runs, pre-seed each walker's `random_fn`
+    explicitly.
+
+    Real-use note: at Step 8, `batch_propose_fn` will be a closure
+    over the shared RDKit mol that stages all N walker conformers as
+    distinct conformer IDs on one mol, runs
+    `nvmolkit.mmffOptimization.MMFFOptimizeMoleculesConfs` in one
+    pass, and dispatches MACE scoring through the existing
+    `_mace_batch_energies` path. For unit testing, a synthetic
+    `batch_propose_fn` mock is enough to verify the orchestration
+    contract (this module's job).
+
+    Params:
+        walkers: list[MCMMWalker] : the walkers to drive. Must share
+            the same `BasinMemory` instance — the driver does not
+            check this; the test for shared-state behaviour is the
+            caller's responsibility.
+        batch_propose_fn: callable : `batch_propose_fn(coords_list)
+            -> list[(new_coords, new_energy, det_j, success)]`. The
+            list lengths must match (N in, N out); otherwise
+            `step()` raises ValueError.
+    """
+
+    def __init__(self, walkers: list, batch_propose_fn):
+        if not walkers:
+            raise ValueError("walkers list must be non-empty")
+        self.walkers = list(walkers)
+        self.batch_propose_fn = batch_propose_fn
+        self.n_steps = 0
+
+    @property
+    def n_walkers(self) -> int:
+        return len(self.walkers)
+
+    @property
+    def n_accepted(self) -> int:
+        """Cumulative accepts across all walkers (this driver's lifetime)."""
+        return sum(w.n_accepted for w in self.walkers)
+
+    def step(self) -> list:
+        """
+        Run one MC step across every walker.
+
+        Returns:
+            list[bool] : per-walker accept/reject result, in walker order.
+        Raises:
+            ValueError: if the batch proposer returns a list of the
+                wrong length.
+        """
+        coords_list = [w.coords for w in self.walkers]
+        proposals = self.batch_propose_fn(coords_list)
+        if len(proposals) != self.n_walkers:
+            raise ValueError(
+                f"batch_propose_fn returned {len(proposals)} proposals; "
+                f"expected {self.n_walkers}"
+            )
+        self.n_steps += 1
+        return [
+            walker.apply_proposal(*proposal)
+            for walker, proposal in zip(self.walkers, proposals)
+        ]
+
+    def run(self, n_steps: int) -> int:
+        """
+        Run `n_steps` MC steps across every walker.
+
+        Params:
+            n_steps: int : number of step() calls to make
+        Returns:
+            int : total accepts across all walkers during this call
+                (not cumulative; for cumulative use `self.n_accepted`).
+        """
+        n_accepted_before = self.n_accepted
+        for _ in range(n_steps):
+            self.step()
+        return self.n_accepted - n_accepted_before

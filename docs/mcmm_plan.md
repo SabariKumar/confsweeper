@@ -13,7 +13,7 @@ This document is the working design for the third sampler in the issue-#10 bench
 | 3 | Backbone window enumeration (`src/mcmm.py`) | ✓ complete |
 | 4 | Basin memory (`src/mcmm.py`) | ✓ complete |
 | 5 | Single-walker MCMM driver (`src/mcmm.py`) | ✓ complete |
-| 6 | Parallel walkers (batched) | pending |
+| 6 | Parallel walkers (batched) (`src/mcmm.py`) | ✓ complete |
 | 7 | Replica exchange | pending |
 | 8 | `get_mol_PE_mcmm` entry point | pending |
 | 9 | Sampler benchmark wiring | pending |
@@ -120,13 +120,15 @@ Tests:
 
 **Outcome.** `MCMMWalker` class added to `src/mcmm.py`. Architectural decision: the walker is generic over the proposal mechanism — it takes a `propose_fn(coords) → (new_coords, new_energy, det_j, success)` callable rather than constructing the proposal internally. This separates the MC logic (Metropolis + Saunders bias + Wu-Deem Jacobian + memory bookkeeping) from the geometry application (DBT move + side-chain coupling + MMFF), so the MC logic is unit-testable without an RDKit mol or MMFF backend. The real RDKit-coupled proposer is the Step 5b / Step 6 integration target. T=0 and T=∞ limits are special-cased in `_acceptance_prob` to avoid `exp(-ΔE/kT)` overflow at the boundaries; numpy's `exp` handles intermediate overflow gracefully (returns `inf` rather than raising). Initial-state handling: walker queries memory on construction and only adds the basin if novel, so passing one shared `BasinMemory` to N walkers does not artificially inflate the discovery basin's count. 13 walker tests in `tests/test_mcmm.py` covering init contract (fresh and shared memory), kT=0 / kT=∞ limits, geometric rejection, memory growth and re-visit bookkeeping, the Saunders 1/√k decay (deterministic random_fn = 0.5 → bias < 0.5 at usage = 4 rejects, bias ≥ 1/√3 at usage = 3 admits), and the `run(n_steps)` convenience loop's accept counter semantics.
 
-### Step 6: Parallel walkers (batched) — pending (next)
+### Step 6: Parallel walkers (batched) — ✓ complete
 
 N walkers proposing concurrently. Each walker contributes one conformer to a shared mol; MMFF runs on the full set in one `nvmolkit.mmffOptimization.MMFFOptimizeMoleculesConfs` call. Basin memory is shared across walkers; each walker's accept/reject decision is independent given the post-MMFF energy.
 
 Verification: small-N batched results match the single-walker reference run sequentially with the same RNG seeds.
 
-### Step 7: Replica exchange
+**Outcome.** `ParallelMCMMDriver` class added to `src/mcmm.py`. Architectural refactor: `MCMMWalker.step` was split into `step` (single-walker convenience that calls a `propose_fn`) and `apply_proposal` (lower-level primitive that takes a precomputed proposal). The parallel driver builds on `apply_proposal` so it can batch the proposal-generation stage across walkers (one GPU call per step) and dispatch accept/reject decisions in a sequential walker loop. Sequential dispatch is intentional: walker `i` sees memory updates from walkers `j < i` made earlier in the same step. This avoids duplicate-basin creation when two walkers propose into the same novel conformation and matches the standard MCMM-with-shared-memory convention. The `batch_propose_fn(coords_list) → list[(coords, energy, det_j, success)]` abstraction is the integration target for Step 8 — at that point a closure over the shared RDKit mol will stage all N walker conformers as distinct conformer IDs and run nvmolkit MMFF + MACE in single batched calls. Eight driver tests in `tests/test_mcmm.py` covering construction validation, N=1 equivalence with single walker, per-walker accept-list ordering, disjoint-basin independence, shared-basin serialisation (the load-bearing test that two walkers proposing into the same novel basin produce one basin with usage=2), proposal-count mismatch error, run-loop accept aggregation, and `n_accepted` property aggregation across walkers.
+
+### Step 7: Replica exchange — pending (next)
 
 8 temperatures geometric 300 K → 600 K. N walkers per temperature (default 8 → 64 walkers total). Swap attempts between adjacent temperatures every 20 steps via standard Metropolis on ΔE × Δβ. Replica indices are tracked so the basin memory's per-temperature provenance can be inspected if needed (though the memory itself is shared across temperatures).
 
@@ -168,4 +170,4 @@ Update `src/README.md` and `scripts/README.md`: new module(s), function, sampler
 2. DBT geometry as a standalone `src/concerted_rotation.py` (potentially reusable for any macrocycle MC code) vs. inlined into `src/mcmm.py`. Standalone is preferred — clean separation, the geometry has no MCMM-specific state.
 3. Implement DBT from scratch. No published reference exists in the pixi `mace` environment. v0 uses numerical closure (Option B above); the analytical polynomial (Option A) is deferred to a future PR if benchmark data shows multi-branch enumeration is necessary.
 
-All three locked. Steps 1–5 complete (see Progress table at top); Step 6 (parallel walkers) is next.
+All three locked. Steps 1–6 complete (see Progress table at top); Step 7 (replica exchange) is next.
