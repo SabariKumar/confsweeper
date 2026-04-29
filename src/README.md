@@ -89,6 +89,26 @@ The seven-stage pipeline:
    which picks dense cluster centres.
 7. Returns one centroid per basin, ordered by ascending energy.
 
+**`get_mol_PE_pool_b`** — sister function to `get_mol_PE_exhaustive` for the
+sampler benchmark (issue #10). Same `(mol, conf_ids, energies)` contract and
+the same post-sampling tail (MMFF → MACE batched scoring → 5 kT energy filter
+→ `_energy_ranked_dedup` → non-centroid pruning), but Phase 1 swaps nvmolkit
+ETKDG for `sample_constrained_confs`, which embeds each conformer with the
+bounds matrix tightened to a CREMP-derived (phi, psi) target. **Macrocyclic
+peptides only** — `sample_constrained_confs` requires backbone (phi, psi)
+atoms. Defaults are calibrated for matched-budget benchmarking against
+`get_mol_PE_exhaustive`: `n_samples=10000`, `n_attempts=1` (caps the raw pool
+near 10k), `strategy='inverse'` (oversamples rare-but-accessible Ramachandran
+cells, which is the design intent — fill the gaps ETKDG misses).
+
+> **Refactor flag**: the post-sampling tail is duplicated between
+> `get_mol_PE_exhaustive` and `get_mol_PE_pool_b`. Once two more samplers
+> (CREST-fast, MCMM, REMD; see issue #10) land, refactor the shared MMFF /
+> MACE / energy-filter / dedup / prune block into a private
+> `_minimize_score_filter_dedup(mol, calc, hardware_opts, ...)` helper. The
+> duplication is intentional in this PR to avoid touching the production-
+> default exhaustive path inside a benchmarking branch.
+
 **`get_mol_PE_mmff`** — like `get_mol_PE_batched` but scores with MMFF94. No GPU
 required for the scoring step; GPU is still used for embedding and Butina.
 
@@ -133,6 +153,20 @@ than symmetric RMSD but is much cheaper to compute across thousands of conformer
 | `n_constrained_samples` | `int` | Pool B (phi, psi) draws (default 0) |
 | `torsion_strategy` | `str` | `'uniform'` or `'inverse'` (default `'uniform'`) |
 | `torsion_seed` | `int` | RNG seed for Pool B reproducibility (default 0) |
+
+**`get_mol_PE_pool_b`** — same shape as `get_mol_PE_exhaustive` minus the
+ETKDG-specific knobs (`embed_chunk_size`, `dihedral_jitter_deg`), plus the
+constrained-DG knobs:
+
+| Argument | Type | Notes |
+|----------|------|-------|
+| `smi`, `hardware_opts`, `calc` | — | as above (no `params` — Pool B uses CPU ETKDGv3 internally) |
+| `grids` | `dict` | from `load_ramachandran_grids()`; required |
+| `n_samples` | `int` | (phi, psi) draw budget (default 10000) |
+| `n_attempts` | `int` | ETKDGv3 attempts per draw (default 1, see refactor flag) |
+| `tolerance_deg` | `float` | dihedral constraint half-width (default 30°) |
+| `strategy` | `str` | `'inverse'` (default) or `'uniform'` |
+| `score_chunk_size`, `e_window_kT`, `rmsd_threshold`, `minimize`, `mmff_backend`, `seed` | — | as in `get_mol_PE_exhaustive` |
 
 **`get_mol_PE_exhaustive`** — different parameter space (no Butina cutoff, no
 torsional sampling, no `gpu_clustering` toggle):

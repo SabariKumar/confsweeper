@@ -60,6 +60,32 @@ list. The diagnostic columns are `n_basins`, `max_bw`, `eff_n`, `entropy`,
 `ground_truth_max_bw` and `ground_truth_n_confs` are populated only for
 CREMP rows (NaN for PAMPA).
 
+### `sampler_benchmark.py`
+
+Head-to-head benchmark of structurally distinct conformer samplers
+against the same MACE-OFF scoring path on the same five peptides used by
+`saturation_etkdg.py`. Companion script for issue #10: `saturation_etkdg.py`
+sweeps the *budget* knob for one sampler; `sampler_benchmark.py` sweeps the
+*sampler* knob at a fixed budget. The motivating question is which (if
+any) sampler clears the `pampa_large`-style ceiling that randomized
+ETKDG + MMFF cannot push through, regardless of `n_seeds`.
+
+Sampler dispatch table — keyed by name, each entry is an adapter that
+takes `(peptide, n_seeds, hardware_opts, calc, grids)` and returns a
+list of MACE energies for the basin centroids. Currently:
+
+- `exhaustive_etkdg` — `get_mol_PE_exhaustive` at saturation-validated
+  defaults (the production baseline).
+- `pool_b` — `get_mol_PE_pool_b` with `strategy='inverse'` and
+  `n_attempts=1` (matched-budget default — see refactor flag in
+  `src/README.md`).
+
+Future entries (CREST-fast, MCMM, REMD) plug in as a new adapter function
+plus a single dispatch-table key. The benchmark protocol stays unchanged.
+
+Output CSV is keyed by `(peptide_id, sampler, n_seeds)` and is resume-aware.
+Failed runs are logged and skipped — the loop moves on to the next cell.
+
 ### `minimize_ablation.py`
 
 Controlled ablation: same nvmolkit ETKDG starting pool, two scoring
@@ -112,5 +138,12 @@ per-conformer CSV (`--out_csv`) preserves both energies for follow-up.
 - Reads from `peptide_electrostatics:data/fine_tune/CycPeptMPDB_PAMPA_deduped.csv`
   (in the sibling repo).
 - Calls `confsweeper.get_mol_PE_exhaustive`,
+  `confsweeper.get_mol_PE_pool_b` (`sampler_benchmark.py` only),
   `get_embed_params_macrocycle`, `get_hardware_opts`, `get_mace_calc`,
   and the private constant `_KT_EV_298K`.
+- `sampler_benchmark.py` reuses `select_cremp_peptides`,
+  `select_pampa_peptides`, and `_bw_metrics` from `saturation_etkdg.py`
+  so both benchmarks operate on the same peptide library and produce
+  directly-comparable rows.
+- `pool_b` requires `data/processed/cremp/ramachandran_grids.npz` (the
+  CREMP-derived backbone Ramachandran prior).
