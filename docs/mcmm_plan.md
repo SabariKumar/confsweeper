@@ -11,7 +11,7 @@ This document is the working design for the third sampler in the issue-#10 bench
 | 1 | Refactor shared post-sampling tail | ✓ complete |
 | 2 | DBT concerted rotation geometry (`src/concerted_rotation.py`) | ✓ complete |
 | 3 | Backbone window enumeration (`src/mcmm.py`) | ✓ complete |
-| 4 | Basin memory | pending |
+| 4 | Basin memory (`src/mcmm.py`) | ✓ complete |
 | 5 | Single-walker MCMM driver | pending |
 | 6 | Parallel walkers (batched) | pending |
 | 7 | Replica exchange | pending |
@@ -92,7 +92,7 @@ Tests on cyclo(Ala)4 and cyclo(Ala)6: verify expected window count and that ever
 
 **Outcome.** `src/mcmm.py` created with `enumerate_backbone_windows(mol)` and the private `_ordered_backbone_residues(mol)` helper. Walks the macrocycle ring via C → N peptide bonds, emits 3K cyclic windows for a K-residue cyclic peptide. Reuses `get_backbone_dihedrals` from `torsional_sampling.py` (rather than the private `_BACKBONE_SMARTS` constant). 13 tests in `tests/test_mcmm.py` covering window count, sequential bonding, cyclic shifts, full backbone coverage, plus error cases (linear peptides raise `ValueError`, non-peptide cyclic mols return `[]`). The initial `len(ordered) != len(residues)` closure check was too weak for linear peptides where only the fully-internal residues match the SMARTS; replaced with an explicit `ring_closed` flag set only when the walk's `next_n` equals `start_n`.
 
-### Step 4: Basin memory — pending (next)
+### Step 4: Basin memory — ✓ complete
 
 `class BasinMemory` backed by torch tensors `[K, n_atoms, 3]` for stored basin coordinates and `[K]` for usage counts.
 
@@ -105,7 +105,9 @@ Operations:
 
 Tests: threshold behavior (boundary cases match `_energy_ranked_dedup`), usage counter monotonicity, batched novelty query against many proposals returns vector of indices in one call.
 
-### Step 5: Single-walker MCMM driver
+**Outcome.** `BasinMemory` class added to `src/mcmm.py` with the four operations above plus a batched `query_novelty_batch(coords_batch) → (indices, distances)` for the parallel-walkers driver (Step 6) and read-only properties for `coords`, `energies`, `usages`, `n_basins`. Default `rmsd_threshold=0.1` matches `_energy_ranked_dedup`'s default; the strict `<` boundary convention matches it too. Stored representative is the first conformer found per basin — re-visits don't update coordinates or energy (the post-MCMM `_minimize_score_filter_dedup` re-deduplicates at the MACE level, so this simplification doesn't change the final basin set materially). 19 tests in `tests/test_mcmm.py` covering construction, add/query contracts, threshold-boundary matching `_energy_ranked_dedup`, batched-vs-individual query equivalence, usage monotonicity, Saunders 1/√usage decay, error cases, and a driver-flow integration smoke test.
+
+### Step 5: Single-walker MCMM driver — pending (next)
 
 Sequential reference implementation. One step is: propose DBT move (random window, random drive dihedral, Gaussian Δθ) → MMFF minimize → query basin memory → Metropolis accept/reject with Saunders 1/√usage bias multiplied into the standard min(1, exp(−ΔE/kT)) factor → update memory and walker state.
 
@@ -164,4 +166,4 @@ Update `src/README.md` and `scripts/README.md`: new module(s), function, sampler
 2. DBT geometry as a standalone `src/concerted_rotation.py` (potentially reusable for any macrocycle MC code) vs. inlined into `src/mcmm.py`. Standalone is preferred — clean separation, the geometry has no MCMM-specific state.
 3. Implement DBT from scratch. No published reference exists in the pixi `mace` environment. v0 uses numerical closure (Option B above); the analytical polynomial (Option A) is deferred to a future PR if benchmark data shows multi-branch enumeration is necessary.
 
-All three locked. Steps 1–3 complete (see Progress table at top); Step 4 (Basin memory) is next.
+All three locked. Steps 1–4 complete (see Progress table at top); Step 5 (single-walker MCMM driver) is next.
