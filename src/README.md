@@ -101,13 +101,11 @@ atoms. Defaults are calibrated for matched-budget benchmarking against
 near 10k), `strategy='inverse'` (oversamples rare-but-accessible Ramachandran
 cells, which is the design intent — fill the gaps ETKDG misses).
 
-> **Refactor flag**: the post-sampling tail is duplicated between
-> `get_mol_PE_exhaustive` and `get_mol_PE_pool_b`. Once two more samplers
-> (CREST-fast, MCMM, REMD; see issue #10) land, refactor the shared MMFF /
-> MACE / energy-filter / dedup / prune block into a private
-> `_minimize_score_filter_dedup(mol, calc, hardware_opts, ...)` helper. The
-> duplication is intentional in this PR to avoid touching the production-
-> default exhaustive path inside a benchmarking branch.
+The shared post-sampling tail is implemented in the private
+`_minimize_score_filter_dedup(mol, all_conf_ids, hardware_opts, calc, ...)`
+helper. Both `get_mol_PE_exhaustive` and `get_mol_PE_pool_b` are thin
+wrappers around their respective Phase 1 sampler plus a single call to that
+helper; future samplers (MCMM, CREST-fast, REMD) follow the same pattern.
 
 **`get_mol_PE_mmff`** — like `get_mol_PE_batched` but scores with MMFF94. No GPU
 required for the scoring step; GPU is still used for embedding and Butina.

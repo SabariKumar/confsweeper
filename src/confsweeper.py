@@ -568,6 +568,138 @@ def _jitter_rotatable_dihedrals(
     return len(dihedrals)
 
 
+def _minimize_score_filter_dedup(
+    mol: Chem.Mol,
+    all_conf_ids: List[int],
+    hardware_opts,
+    calc,
+    score_chunk_size: int,
+    e_window_kT: float,
+    rmsd_threshold: float,
+    minimize: bool,
+    mmff_backend: str,
+) -> Tuple[Chem.Mol, List[int], List[float]]:
+    """
+    Shared post-sampling pipeline tail used by every get_mol_PE_* family
+    function whose Phase 1 sampler produces a pool of raw conformers attached
+    to a single mol.
+
+    Pipeline:
+      1. Optional MMFF94 minimization in place. Two backends:
+         'gpu' calls nvmolkit.mmffOptimization.MMFFOptimizeMoleculesConfs in a
+         single batched CUDA pass. 'cpu' calls RDKit's serial
+         AllChem.MMFFOptimizeMolecule per conformer.
+      2. Batched MACE scoring in chunks of score_chunk_size.
+      3. Energy filter: drop conformers with (E - E_min) > e_window_kT * kT
+         (kT_298K ≈ 26 meV). At least one conformer is always retained even
+         when every scored energy is degenerate (e.g. all NaN); the
+         argmin-energy conformer is force-kept in that case.
+      4. Energy-ranked geometric dedup via _energy_ranked_dedup, keeping the
+         lowest-energy member of each geometric basin defined by
+         rmsd_threshold (normalised L1 units). Singleton survivors skip
+         dedup entirely.
+      5. Drop non-centroid conformers from the mol so the returned object
+         matches the (mol, conf_ids, energies) contract used across the
+         get_mol_PE_* family.
+
+    Callers must guarantee all_conf_ids is non-empty. The empty-pool case is
+    handled at the Phase 1 layer where it can be detected before the helper
+    is invoked (returning (mol, [], []) without paying for MMFF or MACE).
+
+    Params:
+        mol: Chem.Mol : input mol with the raw conformer pool already attached
+        all_conf_ids: List[int] : conformer IDs to process (must be non-empty)
+        hardware_opts : nvmolkit hardware options (only used when mmff_backend='gpu')
+        calc : MACECalculator from get_mace_calc()
+        score_chunk_size: int : per-batch MACE forward pass cap
+        e_window_kT: float : energy filter window in units of kT_298K
+        rmsd_threshold: float : geometric dedup exclusion radius (normalised L1)
+        minimize: bool : MMFF94-minimize each conformer before scoring
+        mmff_backend: str : 'gpu' (nvmolkit batched CUDA) or 'cpu' (RDKit serial).
+            Only consulted when minimize=True.
+    Returns:
+        rdkit.Chem.Mol : mol with only basin-representative conformers attached
+        List[int] : conformer IDs of basin representatives, ordered by ascending energy
+        List[float] : potential energies in eV for each representative
+    """
+    # 1. Optional MMFF94 minimization. Errors leave the conformer at its
+    # pre-minimize geometry; we don't track per-conformer success/failure
+    # because MACE scoring afterwards naturally surfaces any pathological
+    # geometries through extreme energies.
+    if minimize:
+        if mmff_backend == "gpu":
+            # nvmolkit batched CUDA implementation — single call optimises
+            # every conformer of `mol` in place. Order-dependent import:
+            # nvmolkit.embedMolecules must be loaded first to register some
+            # global C++ state, which the module-level import already did.
+            from nvmolkit.mmffOptimization import MMFFOptimizeMoleculesConfs
+
+            MMFFOptimizeMoleculesConfs([mol], hardwareOptions=hardware_opts)
+        elif mmff_backend == "cpu":
+            from rdkit.Chem import AllChem
+
+            for cid in all_conf_ids:
+                AllChem.MMFFOptimizeMolecule(mol, confId=cid)
+        else:
+            raise ValueError(
+                f"unknown mmff_backend {mmff_backend!r}; expected 'gpu' or 'cpu'"
+            )
+
+    # 2. Batched MACE scoring, chunked to bound the GPU forward-pass batch size.
+    atomic_nums = [a.GetAtomicNum() for a in mol.GetAtoms()]
+    energies: List[float] = []
+    for start in range(0, len(all_conf_ids), score_chunk_size):
+        chunk_ids = all_conf_ids[start : start + score_chunk_size]
+        ase_mols = [
+            ase.Atoms(
+                positions=mol.GetConformer(cid).GetPositions(),
+                numbers=atomic_nums,
+            )
+            for cid in chunk_ids
+        ]
+        energies.extend(_mace_batch_energies(calc, ase_mols))
+
+    energies_arr = np.asarray(energies, dtype=np.float64)
+
+    # 3. Energy filter: keep conformers within e_window_kT * kT of the minimum.
+    e_min = energies_arr.min()
+    keep_mask = (energies_arr - e_min) <= e_window_kT * _KT_EV_298K
+    if not keep_mask.any():
+        # Only reachable on degenerate inputs (e.g. NaN energies). Force the
+        # caller's contract: at least one centroid is always returned.
+        keep_mask = np.zeros_like(keep_mask)
+        keep_mask[int(np.argmin(energies_arr))] = True
+
+    kept_pool_idx = np.where(keep_mask)[0].tolist()
+    kept_conf_ids = [all_conf_ids[i] for i in kept_pool_idx]
+    kept_energies = energies_arr[kept_pool_idx]
+
+    # 4. Energy-ranked geometric dedup. With a single survivor there is
+    # nothing to cluster; otherwise use the basin-energy primitive.
+    if len(kept_conf_ids) == 1:
+        centroid_ids = list(kept_conf_ids)
+        centroid_energies = [float(kept_energies[0])]
+    else:
+        coords = torch.tensor(
+            np.array([mol.GetConformer(cid).GetPositions() for cid in kept_conf_ids])
+        )
+        centroid_pool_idx = _energy_ranked_dedup(
+            coords, kept_energies, rmsd_threshold=rmsd_threshold
+        )
+        centroid_ids = [kept_conf_ids[i] for i in centroid_pool_idx]
+        centroid_energies = [float(kept_energies[i]) for i in centroid_pool_idx]
+
+    # 5. Output: drop non-centroid conformers from the mol so the returned
+    # object matches the (mol, ids, energies) contract used across the
+    # get_mol_PE_* family.
+    centroid_set = set(centroid_ids)
+    for cid in all_conf_ids:
+        if cid not in centroid_set:
+            mol.RemoveConformer(cid)
+
+    return mol, centroid_ids, centroid_energies
+
+
 def get_mol_PE_exhaustive(
     smi: str,
     params,
@@ -722,82 +854,20 @@ def get_mol_PE_exhaustive(
             + 1_000_003,  # large prime offset to avoid clashing with chunked embed seeds
         )
 
-    # 3. Optional MMFF94 minimization. Errors leave the conformer at its
-    # pre-minimize geometry; we don't track per-conformer success/failure
-    # because MACE scoring afterwards naturally surfaces any pathological
-    # geometries through extreme energies.
-    if minimize:
-        if mmff_backend == "gpu":
-            # nvmolkit batched CUDA implementation — single call optimises
-            # every conformer of `mol` in place. Order-dependent import:
-            # nvmolkit.embedMolecules must be loaded first to register some
-            # global C++ state, which the embed call above already did.
-            from nvmolkit.mmffOptimization import MMFFOptimizeMoleculesConfs
-
-            MMFFOptimizeMoleculesConfs([mol], hardwareOptions=hardware_opts)
-        elif mmff_backend == "cpu":
-            from rdkit.Chem import AllChem
-
-            for cid in all_conf_ids:
-                AllChem.MMFFOptimizeMolecule(mol, confId=cid)
-        else:
-            raise ValueError(
-                f"unknown mmff_backend {mmff_backend!r}; expected 'gpu' or 'cpu'"
-            )
-
-    # 4. Batched MACE scoring, chunked to bound the GPU forward-pass batch size.
-    atomic_nums = [a.GetAtomicNum() for a in mol.GetAtoms()]
-    energies: List[float] = []
-    for start in range(0, len(all_conf_ids), score_chunk_size):
-        chunk_ids = all_conf_ids[start : start + score_chunk_size]
-        ase_mols = [
-            ase.Atoms(
-                positions=mol.GetConformer(cid).GetPositions(),
-                numbers=atomic_nums,
-            )
-            for cid in chunk_ids
-        ]
-        energies.extend(_mace_batch_energies(calc, ase_mols))
-
-    energies_arr = np.asarray(energies, dtype=np.float64)
-
-    # 5. Energy filter: keep conformers within e_window_kT * kT of the minimum.
-    e_min = energies_arr.min()
-    keep_mask = (energies_arr - e_min) <= e_window_kT * _KT_EV_298K
-    if not keep_mask.any():
-        # Only reachable on degenerate inputs (e.g. NaN energies). Force the
-        # caller's contract: at least one centroid is always returned.
-        keep_mask = np.zeros_like(keep_mask)
-        keep_mask[int(np.argmin(energies_arr))] = True
-
-    kept_pool_idx = np.where(keep_mask)[0].tolist()
-    kept_conf_ids = [all_conf_ids[i] for i in kept_pool_idx]
-    kept_energies = energies_arr[kept_pool_idx]
-
-    # 6. Energy-ranked geometric dedup. With a single survivor there is
-    # nothing to cluster; otherwise use the basin-energy primitive.
-    if len(kept_conf_ids) == 1:
-        centroid_ids = list(kept_conf_ids)
-        centroid_energies = [float(kept_energies[0])]
-    else:
-        coords = torch.tensor(
-            np.array([mol.GetConformer(cid).GetPositions() for cid in kept_conf_ids])
-        )
-        centroid_pool_idx = _energy_ranked_dedup(
-            coords, kept_energies, rmsd_threshold=rmsd_threshold
-        )
-        centroid_ids = [kept_conf_ids[i] for i in centroid_pool_idx]
-        centroid_energies = [float(kept_energies[i]) for i in centroid_pool_idx]
-
-    # 7. Output: drop non-centroid conformers from the mol so the returned
-    # object matches the (mol, ids, energies) contract used by callers of
-    # get_mol_PE / get_mol_PE_batched.
-    centroid_set = set(centroid_ids)
-    for cid in all_conf_ids:
-        if cid not in centroid_set:
-            mol.RemoveConformer(cid)
-
-    return mol, centroid_ids, centroid_energies
+    # 3-7. MMFF + MACE batched score + 5 kT energy filter + energy-ranked
+    # dedup + non-centroid prune. Shared with get_mol_PE_pool_b (and any
+    # future sampler with the same post-Phase-1 pipeline).
+    return _minimize_score_filter_dedup(
+        mol,
+        all_conf_ids,
+        hardware_opts,
+        calc,
+        score_chunk_size=score_chunk_size,
+        e_window_kT=e_window_kT,
+        rmsd_threshold=rmsd_threshold,
+        minimize=minimize,
+        mmff_backend=mmff_backend,
+    )
 
 
 def get_mol_PE_pool_b(
@@ -842,13 +912,9 @@ def get_mol_PE_pool_b(
         in the GFN2-xTB distribution. Use 'uniform' for an unbiased sweep over
         the full CREMP-accessible region.
 
-    NOTE: the post-sampling tail (MMFF, MACE batched scoring, energy filter,
-    energy-ranked dedup, non-centroid pruning) is duplicated from
-    get_mol_PE_exhaustive. Once two more samplers (CREST-fast, MCMM, REMD) land
-    in this benchmark, refactor the shared tail out into a private
-    `_minimize_score_filter_dedup(mol, calc, hardware_opts, ...)` helper. Not
-    done here to avoid touching the production-default exhaustive path inside
-    a benchmarking branch.
+    The post-sampling tail (MMFF → MACE batched scoring → 5 kT energy filter
+    → energy-ranked dedup → non-centroid pruning) is shared with
+    get_mol_PE_exhaustive via the private _minimize_score_filter_dedup helper.
 
     Params:
         smi: str : input SMILES string (must be a head-to-tail cyclic peptide;
@@ -889,65 +955,17 @@ def get_mol_PE_pool_b(
     if not all_conf_ids:
         return mol, [], []
 
-    if minimize:
-        if mmff_backend == "gpu":
-            from nvmolkit.mmffOptimization import MMFFOptimizeMoleculesConfs
-
-            MMFFOptimizeMoleculesConfs([mol], hardwareOptions=hardware_opts)
-        elif mmff_backend == "cpu":
-            from rdkit.Chem import AllChem
-
-            for cid in all_conf_ids:
-                AllChem.MMFFOptimizeMolecule(mol, confId=cid)
-        else:
-            raise ValueError(
-                f"unknown mmff_backend {mmff_backend!r}; expected 'gpu' or 'cpu'"
-            )
-
-    atomic_nums = [a.GetAtomicNum() for a in mol.GetAtoms()]
-    energies: List[float] = []
-    for start in range(0, len(all_conf_ids), score_chunk_size):
-        chunk_ids = all_conf_ids[start : start + score_chunk_size]
-        ase_mols = [
-            ase.Atoms(
-                positions=mol.GetConformer(cid).GetPositions(),
-                numbers=atomic_nums,
-            )
-            for cid in chunk_ids
-        ]
-        energies.extend(_mace_batch_energies(calc, ase_mols))
-
-    energies_arr = np.asarray(energies, dtype=np.float64)
-
-    e_min = energies_arr.min()
-    keep_mask = (energies_arr - e_min) <= e_window_kT * _KT_EV_298K
-    if not keep_mask.any():
-        keep_mask = np.zeros_like(keep_mask)
-        keep_mask[int(np.argmin(energies_arr))] = True
-
-    kept_pool_idx = np.where(keep_mask)[0].tolist()
-    kept_conf_ids = [all_conf_ids[i] for i in kept_pool_idx]
-    kept_energies = energies_arr[kept_pool_idx]
-
-    if len(kept_conf_ids) == 1:
-        centroid_ids = list(kept_conf_ids)
-        centroid_energies = [float(kept_energies[0])]
-    else:
-        coords = torch.tensor(
-            np.array([mol.GetConformer(cid).GetPositions() for cid in kept_conf_ids])
-        )
-        centroid_pool_idx = _energy_ranked_dedup(
-            coords, kept_energies, rmsd_threshold=rmsd_threshold
-        )
-        centroid_ids = [kept_conf_ids[i] for i in centroid_pool_idx]
-        centroid_energies = [float(kept_energies[i]) for i in centroid_pool_idx]
-
-    centroid_set = set(centroid_ids)
-    for cid in all_conf_ids:
-        if cid not in centroid_set:
-            mol.RemoveConformer(cid)
-
-    return mol, centroid_ids, centroid_energies
+    return _minimize_score_filter_dedup(
+        mol,
+        all_conf_ids,
+        hardware_opts,
+        calc,
+        score_chunk_size=score_chunk_size,
+        e_window_kT=e_window_kT,
+        rmsd_threshold=rmsd_threshold,
+        minimize=minimize,
+        mmff_backend=mmff_backend,
+    )
 
 
 def get_mol_PE_mmff(
