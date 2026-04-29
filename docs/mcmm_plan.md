@@ -15,7 +15,7 @@ This document is the working design for the third sampler in the issue-#10 bench
 | 5 | Single-walker MCMM driver (`src/mcmm.py`) | ✓ complete |
 | 6 | Parallel walkers (batched) (`src/mcmm.py`) | ✓ complete |
 | 7 | Replica exchange (`src/mcmm.py`) | ✓ complete |
-| 8 | `get_mol_PE_mcmm` entry point | pending |
+| 8 | `get_mol_PE_mcmm` entry point + proposer stub (`src/confsweeper.py`, `src/mcmm.py`) | ✓ complete (orchestration); 8b pending (real proposer) |
 | 9 | Sampler benchmark wiring | pending |
 | 10 | Documentation | pending |
 
@@ -142,11 +142,39 @@ One test-fixture lesson: `_make_remd_walkers` initially placed within-temp walke
 
 ## Phase 3 — Integration
 
-### Step 8: `get_mol_PE_mcmm` entry point — pending (next)
+### Step 8: `get_mol_PE_mcmm` entry point — ✓ complete (orchestration); Step 8b pending (real proposer)
 
 New function in `src/confsweeper.py`. Pipeline: enumerate backbone windows → initialize walkers from a seed conformer (e.g., one ETKDG conformer minimized with MMFF) → run replica-exchange MC for the configured step budget → MACE-rescore the basin set → call refactored `_minimize_score_filter_dedup` for the final filter/dedup/prune. Returns `(mol, conf_ids, energies)`.
 
 Integration tests mirror `tests/test_pool_b.py`: mock GPU stages (MMFF, MACE, basin-memory if needed) and verify the contract — return shape, energy ordering, conformer-count consistency, zero-conformer safety, etc.
+
+**Outcome.** `get_mol_PE_mcmm` lives in `src/confsweeper.py` alongside the other `get_mol_PE_*` family members. Pipeline: SMILES → `Chem.AddHs` → ETKDG embed (1 seed conformer) → MMFF minimise → MACE-score for initial energy → build shared `BasinMemory` and a temperature ladder of walkers (default 8 temps × 8 walkers) → build the batch proposer via `make_mcmm_proposer` → run `ReplicaExchangeMCMMDriver` for `n_steps` → extract every basin in memory as a conformer on the mol → pass through `_minimize_score_filter_dedup` for final MACE rescoring + 5 kT energy filter + `_energy_ranked_dedup` + non-centroid pruning. Defaults match issue #11: 64 walkers, 200 steps (12,800 minimisations), 300 K → 600 K geometric ladder, 20-step swap interval. Companion helper `_geometric_temperature_ladder(kt_low, kt_high, n)` computes the ladder.
+
+**Step 8 is the orchestration; Step 8b is the real proposer.** `make_mcmm_proposer` in `src/mcmm.py` is currently a v0 stub that returns `success=False` for every walker — no MC moves are accepted, but the orchestration is fully wired and tested. Step 8b will replace the stub body with: per-walker DBT move proposal via `concerted_rotation.propose_move`, full-mol coordinate update with side-chain coupling, batched MMFF on a shared throwaway mol, batched MACE scoring, finite-difference Wu-Deem Jacobians. Splitting the work this way matched the pool_b PR pattern of mocked GPU stages in tests and let the orchestration shape land before sinking time into the geometry + GPU integration.
+
+**One real architectural decision surfaced**: the lazy `from mcmm import …` inside `get_mol_PE_mcmm` made `confsweeper.make_mcmm_proposer` non-patchable (the name was never bound at module level), so test mocking failed. Moved the imports — `BasinMemory`, `MCMMWalker`, `ReplicaExchangeMCMMDriver`, `make_mcmm_proposer` — to `src/confsweeper.py`'s top-level imports. No circular dependency since `mcmm` doesn't import from `confsweeper`.
+
+**Minor BasinMemory contract change**: `rmsd_threshold` validation went from `> 0` to `≥ 0`. The strict `<` comparison in `query_novelty` means threshold = 0 disables matching (every basin is unique), which matches the "disable geometric dedup" idiom used in pool_b and exhaustive tests.
+
+11 entry-point tests in `tests/test_get_mol_PE_mcmm.py` covering the geometric ladder primitive, smoke test under the no-exploration stub, zero-conformers safety, proposer call count per step, basin-memory growth under an accepting mock proposer (4 init basins + 12 accepted = 16 final), unknown-mmff-backend rejection, and default-temperature-endpoint match (300 K / 600 K). Plus 3 stub tests for `make_mcmm_proposer` itself in `tests/test_mcmm.py` (callable contract, always-reject behaviour, length-matching across batch sizes).
+
+### Step 8b: Real `make_mcmm_proposer` implementation — pending (next)
+
+Replace the v0 no-op stub in `src/mcmm.py` with the real DBT + MMFF + MACE proposer. The factory closure captures `mol` topology and GPU resources at build time; the returned `batch_propose_fn(coords_list)` per call:
+
+1. **Per walker, generate a move**: pick a random backbone window (uniform over the 3K windows), a random drive index in {0..3}, and `drive_delta ~ N(0, drive_sigma_rad²)`. Call `concerted_rotation.propose_move` on the 7-atom backbone window positions. Record success/failure.
+2. **Apply moves to the full mol**: for successful walkers, apply the resulting 4 dihedral deltas to the FULL coordinate array (rotate window backbone atoms r3..r6 plus side chains of r2..r6 around the appropriate bond axes — same chain-rebuild logic as `concerted_rotation.apply_dihedral_changes`, but operating on the full atom set). Side-chain coupling rule: each backbone atom's side-chain group transports rigidly with its parent (atoms reachable via non-backbone bonds, not crossing other backbone atoms).
+3. **Stage as batched conformer set**: assemble the N candidate conformations as conformer IDs on a throwaway mol (one per walker). Run nvmolkit `MMFFOptimizeMoleculesConfs` in one batched call.
+4. **Score in batches**: run MACE in chunks via `_mace_batch_energies` (or compute MMFF energies — pending the MMFF-vs-MACE inner-loop decision flagged in the plan's risk register).
+5. **Compute per-walker Wu-Deem Jacobians** via finite differences (the `concerted_rotation.propose_move` helper already does this; we just need to plumb the result through).
+6. **Return** `(coords_tensor, energy_float, det_j_float, success_bool)` per walker. Failed walkers (closure failure or MMFF blowup) get `success=False`.
+
+Two sub-pieces to land before Step 8b's body:
+
+- **`concerted_rotation.propose_move` returning the deltas**: currently returns `(new_positions, det_j, success)`. Step 8b needs the 4 dihedral deltas too so the full-mol application can replay them on the side chains. Refactor to a NamedTuple or 4-tuple return.
+- **Side-chain group enumeration**: helper `_side_chain_group(mol, backbone_atom, backbone_atom_set)` doing BFS through non-backbone bonds. Used to precompute per-window downstream sets at factory-build time so the per-step move is fast.
+
+Once 8b lands, Step 9 (sampler benchmark wiring) plugs `mcmm` into `scripts/sampler_benchmark.py`'s `SAMPLERS` dispatch and the end-to-end pipeline can run on real peptides.
 
 ### Step 9: Sampler benchmark wiring
 
@@ -174,4 +202,4 @@ Update `src/README.md` and `scripts/README.md`: new module(s), function, sampler
 2. DBT geometry as a standalone `src/concerted_rotation.py` (potentially reusable for any macrocycle MC code) vs. inlined into `src/mcmm.py`. Standalone is preferred — clean separation, the geometry has no MCMM-specific state.
 3. Implement DBT from scratch. No published reference exists in the pixi `mace` environment. v0 uses numerical closure (Option B above); the analytical polynomial (Option A) is deferred to a future PR if benchmark data shows multi-branch enumeration is necessary.
 
-All three locked. Steps 1–7 complete (see Progress table at top); Step 8 (`get_mol_PE_mcmm` entry point) is next.
+All three locked. Steps 1–8 complete (orchestration shape; see Progress table at top). Step 8b (the real `make_mcmm_proposer` implementation) is next, then Steps 9–10.

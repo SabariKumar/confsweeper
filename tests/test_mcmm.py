@@ -22,6 +22,7 @@ from mcmm import (
     _ordered_backbone_residues,
     _swap_walker_configs,
     enumerate_backbone_windows,
+    make_mcmm_proposer,
 )
 
 # ---------------------------------------------------------------------------
@@ -203,8 +204,8 @@ def test_basin_memory_starts_empty():
 def test_basin_memory_invalid_constructor_raises():
     with pytest.raises(ValueError, match="n_atoms must be positive"):
         BasinMemory(n_atoms=0)
-    with pytest.raises(ValueError, match="rmsd_threshold must be positive"):
-        BasinMemory(n_atoms=4, rmsd_threshold=0.0)
+    with pytest.raises(ValueError, match="rmsd_threshold must be non-negative"):
+        BasinMemory(n_atoms=4, rmsd_threshold=-0.1)
 
 
 def test_basin_memory_default_threshold_matches_dedup():
@@ -1182,3 +1183,52 @@ def test_remd_run_accumulates_accepts_across_walkers_and_steps():
     # so p_accept = min(1, 1*1*1) = 1. random_fn = lambda: 0.5 < 1.
     n_accepted = driver.run(3)
     assert n_accepted == 4 * 3  # 4 walkers × 3 steps
+
+
+# ---------------------------------------------------------------------------
+# make_mcmm_proposer (v0 stub behaviour)
+# ---------------------------------------------------------------------------
+
+
+def test_make_mcmm_proposer_returns_callable_for_cyclic_peptide():
+    """The factory accepts a real cyclic peptide mol and returns a
+    `batch_propose_fn(coords_list) → list` callable."""
+    mol = _cycloala_mol(4)
+    proposer = make_mcmm_proposer(
+        mol, hardware_opts=None, calc=None, drive_sigma_rad=0.1, seed=0
+    )
+    assert callable(proposer)
+
+
+def test_make_mcmm_proposer_stub_rejects_every_proposal():
+    """The v0 stub returns success=False for every walker. Any walker
+    paired with this proposer never accepts a move; basin memory stays
+    at its initial state. Step 8b replaces this body."""
+    mol = _cycloala_mol(4)
+    proposer = make_mcmm_proposer(mol, hardware_opts=None, calc=None, seed=0)
+
+    # Synthetic coords list mimicking 3 walkers' state. Shape doesn't have
+    # to match mol's atom count for this stub since it ignores coords.
+    coords_list = [
+        torch.zeros(_TEST_N_ATOMS, 3, dtype=torch.float64),
+        torch.zeros(_TEST_N_ATOMS, 3, dtype=torch.float64),
+        torch.zeros(_TEST_N_ATOMS, 3, dtype=torch.float64),
+    ]
+    proposals = proposer(coords_list)
+    assert len(proposals) == 3
+    for proposal in proposals:
+        new_coords, new_energy, det_j, success = proposal
+        assert success is False
+
+
+def test_make_mcmm_proposer_stub_returns_proposal_per_walker():
+    """The stub respects the input list length: N input coords → N output
+    proposals."""
+    mol = _cycloala_mol(4)
+    proposer = make_mcmm_proposer(mol, hardware_opts=None, calc=None, seed=42)
+    for n in [1, 5, 64]:
+        coords_list = [
+            torch.zeros(_TEST_N_ATOMS, 3, dtype=torch.float64) for _ in range(n)
+        ]
+        proposals = proposer(coords_list)
+        assert len(proposals) == n

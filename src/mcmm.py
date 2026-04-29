@@ -215,8 +215,10 @@ class BasinMemory:
     ):
         if n_atoms <= 0:
             raise ValueError(f"n_atoms must be positive, got {n_atoms}")
-        if rmsd_threshold <= 0:
-            raise ValueError(f"rmsd_threshold must be positive, got {rmsd_threshold}")
+        if rmsd_threshold < 0:
+            raise ValueError(
+                f"rmsd_threshold must be non-negative, got {rmsd_threshold}"
+            )
         self.n_atoms = n_atoms
         self.rmsd_threshold = float(rmsd_threshold)
         self.device = torch.device(device)
@@ -957,3 +959,82 @@ class ReplicaExchangeMCMMDriver:
         if arg >= 0.0:
             return 1.0
         return float(np.exp(arg))
+
+
+# ---------------------------------------------------------------------------
+# Real-mol proposer factory
+# ---------------------------------------------------------------------------
+
+
+def make_mcmm_proposer(
+    mol: Chem.Mol,
+    hardware_opts,
+    calc,
+    drive_sigma_rad: float = 0.1,
+    closure_tol: float = 0.01,
+    seed: int = 0,
+):
+    """
+    Build a `batch_propose_fn` for `ReplicaExchangeMCMMDriver` that
+    proposes DBT moves on the backbone windows of `mol`, batches MMFF +
+    MACE across walkers per call, and returns per-walker
+    `(new_coords, new_energy, det_j, success)` tuples.
+
+    **v0 STUB**: this implementation is a no-op proposer that returns
+    `success=False` for every walker, so no MC moves are accepted and
+    the basin set ends with only walkers' starting states. The
+    orchestration in `get_mol_PE_mcmm` is fully testable through this
+    stub via the no-exploration path. The real geometry + MMFF + MACE
+    wiring is the Step 8b deliverable; see docs/mcmm_plan.md.
+
+    The Step 8b implementation will:
+      1. Per walker, pick a random backbone window, drive dihedral, and
+         drive_delta ~ N(0, drive_sigma_rad²).
+      2. Apply DBT closure via `concerted_rotation.propose_move` on the
+         7-atom window backbone positions.
+      3. Apply the resulting deltas to the FULL molecule (rotating
+         backbone window atoms r3..r6 plus side chains of r2..r6) so
+         side chains transport rigidly with their backbone parents.
+      4. Stage every successful candidate as a conformer on a shared
+         throwaway mol, run nvmolkit MMFF in one batched call, then
+         MACE-score in chunks via `_mace_batch_energies`.
+      5. Compute per-walker Wu-Deem |det J| via finite differences.
+      6. Return `(coords_tensor, energy_float, det_j_float, success_bool)`
+         per walker. Failed walkers (closure failure or MMFF blowup)
+         pass through with `success=False` and the existing coords.
+
+    Params:
+        mol: Chem.Mol : a head-to-tail cyclic peptide with explicit Hs.
+            Topology is captured at factory-build time; the mol must
+            not be mutated structurally afterwards (conformer additions
+            and edits are fine).
+        hardware_opts : nvmolkit hardware options for batched MMFF.
+        calc : MACECalculator from get_mace_calc().
+        drive_sigma_rad: float : Gaussian standard deviation for the
+            drive-angle perturbation in radians (default 0.1 ≈ 5.7°).
+            Larger values give bigger moves at lower closure-success
+            rate; couples to closure_tol per docs/mcmm_plan.md.
+        closure_tol: float : passed through to `propose_move` as the
+            maximum r5+r6 displacement-norm tolerated as ring-closed.
+        seed: int : seed for the move-RNG.
+    Returns:
+        callable : `batch_propose_fn(coords_list) -> list[tuple]` matching
+            the contract expected by `ParallelMCMMDriver` and
+            `ReplicaExchangeMCMMDriver`.
+    """
+    # Capture topology at factory-build time so the closure has stable
+    # state. Step 8b will use these.
+    _ = enumerate_backbone_windows(mol)
+    _ = hardware_opts
+    _ = calc
+    _ = drive_sigma_rad
+    _ = closure_tol
+    _ = seed
+
+    def batch_propose_fn(coords_list):
+        # v0 stub: reject every proposal so no MC exploration occurs.
+        # Step 8b replaces this body with the real DBT + MMFF + MACE
+        # pipeline described in the docstring above.
+        return [(coords, 0.0, 0.0, False) for coords in coords_list]
+
+    return batch_propose_fn
