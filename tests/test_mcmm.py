@@ -16,6 +16,7 @@ from mcmm import (
     DEFAULT_RMSD_THRESHOLD,
     WINDOW_SIZE,
     BasinMemory,
+    MCMMWalker,
     _ordered_backbone_residues,
     enumerate_backbone_windows,
 )
@@ -416,3 +417,228 @@ def test_basin_memory_driver_loop_smoke():
     assert mem.usages.tolist() == [1, 3, 1]
     # Saunders bias against re-visiting basin 1 should be 1/√3.
     assert mem.acceptance_bias(1) == pytest.approx(1.0 / math.sqrt(3))
+
+
+# ---------------------------------------------------------------------------
+# MCMMWalker — proposer mocks and helpers
+# ---------------------------------------------------------------------------
+
+
+def _fixed_proposer(
+    target_x: float, target_e: float, det_j: float = 1.0, success: bool = True
+):
+    """
+    Build a propose_fn that always proposes a specific (coords, energy).
+
+    Returns a callable matching the MCMMWalker propose_fn contract:
+        (current_coords) -> (new_coords, new_energy, det_j, success).
+    """
+
+    def fn(_current_coords):
+        return _line_conformer(target_x), target_e, det_j, success
+
+    return fn
+
+
+def _make_walker(
+    initial_x: float = 0.0,
+    initial_e: float = 0.0,
+    kt: float = 1.0,
+    threshold: float = 0.5,
+    random_fn=None,
+    memory=None,
+):
+    """Construct an MCMMWalker over a fresh BasinMemory unless one is provided."""
+    coords = _line_conformer(initial_x)
+    if memory is None:
+        memory = BasinMemory(n_atoms=_TEST_N_ATOMS, rmsd_threshold=threshold)
+    return MCMMWalker(coords, initial_e, kt=kt, memory=memory, random_fn=random_fn)
+
+
+# ---------------------------------------------------------------------------
+# MCMMWalker — construction
+# ---------------------------------------------------------------------------
+
+
+def test_walker_initial_state_added_to_fresh_memory():
+    walker = _make_walker(initial_x=0.0, initial_e=-2.5)
+    assert walker.energy == -2.5
+    assert walker.memory.n_basins == 1
+    assert walker.current_basin_idx == 0
+    assert walker.n_steps == 0 and walker.n_accepted == 0
+
+
+def test_walker_initial_state_latches_to_existing_memory_basin():
+    """If the memory already contains the initial basin (e.g. shared with
+    other walkers), the walker latches onto the existing index without
+    incrementing its usage count."""
+    memory = BasinMemory(n_atoms=_TEST_N_ATOMS, rmsd_threshold=0.5)
+    memory.add_basin(_line_conformer(0.0), energy=-1.0)  # usage = 1
+    assert memory.n_basins == 1 and int(memory.usages[0].item()) == 1
+
+    walker = MCMMWalker(_line_conformer(0.0), 0.0, kt=1.0, memory=memory)
+    assert walker.current_basin_idx == 0
+    assert memory.n_basins == 1  # no duplicate added
+    assert int(memory.usages[0].item()) == 1  # not incremented
+
+
+def test_walker_negative_kt_raises():
+    with pytest.raises(ValueError, match="kt must be non-negative"):
+        _make_walker(kt=-1.0)
+
+
+# ---------------------------------------------------------------------------
+# MCMMWalker — temperature limits
+# ---------------------------------------------------------------------------
+
+
+def test_walker_kt_zero_rejects_uphill():
+    """Greedy descent: a worse-energy proposal is always rejected at T=0."""
+    walker = _make_walker(initial_e=0.0, kt=0.0, random_fn=lambda: 0.5)
+    accepted = walker.step(_fixed_proposer(target_x=5.0, target_e=10.0))
+    assert not accepted
+    assert walker.energy == 0.0  # state unchanged
+
+
+def test_walker_kt_zero_accepts_downhill():
+    """Greedy descent: a better-energy proposal is always accepted at T=0,
+    regardless of bias × det_J (the energy term dominates in the limit)."""
+    walker = _make_walker(initial_e=0.0, kt=0.0, random_fn=lambda: 0.999)
+    accepted = walker.step(_fixed_proposer(target_x=5.0, target_e=-10.0))
+    assert accepted
+    assert walker.energy == -10.0
+
+
+def test_walker_kt_inf_accepts_iso_energy_iso_bias():
+    """At T=∞ with bias=1 and det_J=1, every proposal is accepted regardless
+    of the energy difference."""
+    walker = _make_walker(kt=math.inf, random_fn=lambda: 0.999)
+    accepted = walker.step(_fixed_proposer(target_x=5.0, target_e=1000.0))
+    assert accepted
+    assert walker.energy == 1000.0
+
+
+# ---------------------------------------------------------------------------
+# MCMMWalker — geometry rejection
+# ---------------------------------------------------------------------------
+
+
+def test_walker_rejects_geometrically_infeasible_proposal():
+    """When the proposer signals success=False, the walker rejects without
+    inspecting energy or memory."""
+    walker = _make_walker()
+    accepted = walker.step(_fixed_proposer(target_x=5.0, target_e=-10.0, success=False))
+    assert not accepted
+    assert walker.energy == 0.0
+    assert walker.memory.n_basins == 1  # no new basin recorded
+    assert walker.n_steps == 1
+
+
+# ---------------------------------------------------------------------------
+# MCMMWalker — memory bookkeeping
+# ---------------------------------------------------------------------------
+
+
+def test_walker_memory_grows_monotonically_under_always_accept():
+    """Visiting a sequence of distinct basins under always-accept mode
+    grows the basin set by exactly one per accept."""
+    walker = _make_walker(kt=math.inf, random_fn=lambda: 0.0)
+    for x in [5.0, 10.0, 15.0, 20.0, 25.0]:
+        walker.step(_fixed_proposer(target_x=x, target_e=0.0))
+    # Initial basin + 5 distinct novel basins
+    assert walker.memory.n_basins == 6
+    assert walker.memory.usages.tolist() == [1, 1, 1, 1, 1, 1]
+    assert walker.n_accepted == 5
+    assert walker.acceptance_rate == 1.0
+
+
+def test_walker_revisit_increments_existing_basin_usage():
+    """Returning to a previously-visited basin increments its usage rather
+    than adding a duplicate."""
+    walker = _make_walker(kt=math.inf, random_fn=lambda: 0.0)
+    walker.step(_fixed_proposer(target_x=5.0, target_e=0.0))  # add basin 1
+    walker.step(_fixed_proposer(target_x=0.0, target_e=0.0))  # back to 0; usage[0]=2
+    walker.step(_fixed_proposer(target_x=5.0, target_e=0.0))  # back to 1; usage[1]=2
+    assert walker.memory.n_basins == 2
+    assert walker.memory.usages.tolist() == [2, 2]
+
+
+def test_walker_rejected_step_leaves_memory_unchanged():
+    """Memory is mutated only on accept. A rejected proposal does not
+    increment any counter or add a basin."""
+    walker = _make_walker(initial_e=0.0, kt=0.0, random_fn=lambda: 0.5)
+    n_basins_before = walker.memory.n_basins
+    walker.step(_fixed_proposer(target_x=5.0, target_e=10.0))  # uphill, T=0 → reject
+    assert walker.memory.n_basins == n_basins_before
+    assert walker.memory.usages.tolist() == [1]
+
+
+# ---------------------------------------------------------------------------
+# MCMMWalker — Saunders bias
+# ---------------------------------------------------------------------------
+
+
+def test_walker_saunders_bias_eventually_rejects_revisit():
+    """With deterministic random_fn = 0.5 and ΔE = 0, acceptance is equivalent
+    to bias × det_J ≥ 0.5. The 1/√k Saunders form drops below 0.5 at k=4
+    (1/√4 = 0.5, fails the strict `<` check), so re-visit attempts to a
+    basin already at usage=4 are rejected."""
+    threshold = 10.0  # large so all `_line_conformer` offsets within 5.0 hit memory
+    memory = BasinMemory(n_atoms=_TEST_N_ATOMS, rmsd_threshold=threshold)
+    # Pre-populate basin B (at offset 5) with usage=4 so the next attempted
+    # entry has bias = 1/√4 = 0.5.
+    memory.add_basin(_line_conformer(0.0), energy=0.0)
+    memory.add_basin(_line_conformer(5.0), energy=0.0)
+    memory.record_visit(1)
+    memory.record_visit(1)
+    memory.record_visit(1)
+    assert int(memory.usages[1].item()) == 4
+
+    walker = MCMMWalker(
+        _line_conformer(0.0), 0.0, kt=1.0, memory=memory, random_fn=lambda: 0.5
+    )
+
+    # Propose entry into basin B (ΔE=0, bias=1/√4=0.5). With rng=0.5 the
+    # strict `<` rejects.
+    accepted = walker.step(_fixed_proposer(target_x=5.0, target_e=0.0))
+    assert not accepted
+    assert int(memory.usages[1].item()) == 4  # unchanged
+
+
+def test_walker_saunders_bias_admits_revisit_below_threshold():
+    """Below the bias threshold (usage ≤ 3 → bias ≥ 1/√3 ≈ 0.577 > 0.5),
+    re-visits with rng = 0.5 and ΔE = 0 are accepted."""
+    memory = BasinMemory(n_atoms=_TEST_N_ATOMS, rmsd_threshold=10.0)
+    memory.add_basin(_line_conformer(0.0), energy=0.0)
+    memory.add_basin(_line_conformer(5.0), energy=0.0)
+    memory.record_visit(1)
+    memory.record_visit(1)
+    assert int(memory.usages[1].item()) == 3  # bias = 1/√3 ≈ 0.577
+
+    walker = MCMMWalker(
+        _line_conformer(0.0), 0.0, kt=1.0, memory=memory, random_fn=lambda: 0.5
+    )
+
+    accepted = walker.step(_fixed_proposer(target_x=5.0, target_e=0.0))
+    assert accepted
+    assert int(memory.usages[1].item()) == 4  # incremented after accept
+
+
+# ---------------------------------------------------------------------------
+# MCMMWalker — run loop
+# ---------------------------------------------------------------------------
+
+
+def test_walker_run_returns_accept_count_for_this_call():
+    """`run(N)` returns the number of accepts during this call only —
+    cumulative count is `walker.n_accepted`."""
+    walker = _make_walker(kt=math.inf, random_fn=lambda: 0.0)
+    n1 = walker.run(3, _fixed_proposer(target_x=10.0, target_e=0.0))
+    n2 = walker.run(2, _fixed_proposer(target_x=20.0, target_e=0.0))
+    # First run: initial basin (1) → step at x=10 (new basin), then 2 more
+    # to the same basin. n1 = 3 accepts (all proposals accepted under T=∞).
+    # Second run: 2 more accepts to a third basin.
+    assert n1 == 3
+    assert n2 == 2
+    assert walker.n_accepted == 5
+    assert walker.n_steps == 5

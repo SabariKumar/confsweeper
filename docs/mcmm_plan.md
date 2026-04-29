@@ -12,7 +12,7 @@ This document is the working design for the third sampler in the issue-#10 bench
 | 2 | DBT concerted rotation geometry (`src/concerted_rotation.py`) | ✓ complete |
 | 3 | Backbone window enumeration (`src/mcmm.py`) | ✓ complete |
 | 4 | Basin memory (`src/mcmm.py`) | ✓ complete |
-| 5 | Single-walker MCMM driver | pending |
+| 5 | Single-walker MCMM driver (`src/mcmm.py`) | ✓ complete |
 | 6 | Parallel walkers (batched) | pending |
 | 7 | Replica exchange | pending |
 | 8 | `get_mol_PE_mcmm` entry point | pending |
@@ -107,7 +107,7 @@ Tests: threshold behavior (boundary cases match `_energy_ranked_dedup`), usage c
 
 **Outcome.** `BasinMemory` class added to `src/mcmm.py` with the four operations above plus a batched `query_novelty_batch(coords_batch) → (indices, distances)` for the parallel-walkers driver (Step 6) and read-only properties for `coords`, `energies`, `usages`, `n_basins`. Default `rmsd_threshold=0.1` matches `_energy_ranked_dedup`'s default; the strict `<` boundary convention matches it too. Stored representative is the first conformer found per basin — re-visits don't update coordinates or energy (the post-MCMM `_minimize_score_filter_dedup` re-deduplicates at the MACE level, so this simplification doesn't change the final basin set materially). 19 tests in `tests/test_mcmm.py` covering construction, add/query contracts, threshold-boundary matching `_energy_ranked_dedup`, batched-vs-individual query equivalence, usage monotonicity, Saunders 1/√usage decay, error cases, and a driver-flow integration smoke test.
 
-### Step 5: Single-walker MCMM driver — pending (next)
+### Step 5: Single-walker MCMM driver — ✓ complete
 
 Sequential reference implementation. One step is: propose DBT move (random window, random drive dihedral, Gaussian Δθ) → MMFF minimize → query basin memory → Metropolis accept/reject with Saunders 1/√usage bias multiplied into the standard min(1, exp(−ΔE/kT)) factor → update memory and walker state.
 
@@ -118,7 +118,9 @@ Tests:
 - Basin memory grows monotonically across steps.
 - Saunders bias suppresses re-discovery: a walker repeatedly visiting the same basin sees acceptance probability decay as 1/√k where k is the visit count.
 
-### Step 6: Parallel walkers (batched)
+**Outcome.** `MCMMWalker` class added to `src/mcmm.py`. Architectural decision: the walker is generic over the proposal mechanism — it takes a `propose_fn(coords) → (new_coords, new_energy, det_j, success)` callable rather than constructing the proposal internally. This separates the MC logic (Metropolis + Saunders bias + Wu-Deem Jacobian + memory bookkeeping) from the geometry application (DBT move + side-chain coupling + MMFF), so the MC logic is unit-testable without an RDKit mol or MMFF backend. The real RDKit-coupled proposer is the Step 5b / Step 6 integration target. T=0 and T=∞ limits are special-cased in `_acceptance_prob` to avoid `exp(-ΔE/kT)` overflow at the boundaries; numpy's `exp` handles intermediate overflow gracefully (returns `inf` rather than raising). Initial-state handling: walker queries memory on construction and only adds the basin if novel, so passing one shared `BasinMemory` to N walkers does not artificially inflate the discovery basin's count. 13 walker tests in `tests/test_mcmm.py` covering init contract (fresh and shared memory), kT=0 / kT=∞ limits, geometric rejection, memory growth and re-visit bookkeeping, the Saunders 1/√k decay (deterministic random_fn = 0.5 → bias < 0.5 at usage = 4 rejects, bias ≥ 1/√3 at usage = 3 admits), and the `run(n_steps)` convenience loop's accept counter semantics.
+
+### Step 6: Parallel walkers (batched) — pending (next)
 
 N walkers proposing concurrently. Each walker contributes one conformer to a shared mol; MMFF runs on the full set in one `nvmolkit.mmffOptimization.MMFFOptimizeMoleculesConfs` call. Basin memory is shared across walkers; each walker's accept/reject decision is independent given the post-MMFF energy.
 
@@ -166,4 +168,4 @@ Update `src/README.md` and `scripts/README.md`: new module(s), function, sampler
 2. DBT geometry as a standalone `src/concerted_rotation.py` (potentially reusable for any macrocycle MC code) vs. inlined into `src/mcmm.py`. Standalone is preferred — clean separation, the geometry has no MCMM-specific state.
 3. Implement DBT from scratch. No published reference exists in the pixi `mace` environment. v0 uses numerical closure (Option B above); the analytical polynomial (Option A) is deferred to a future PR if benchmark data shows multi-branch enumeration is necessary.
 
-All three locked. Steps 1–4 complete (see Progress table at top); Step 5 (single-walker MCMM driver) is next.
+All three locked. Steps 1–5 complete (see Progress table at top); Step 6 (parallel walkers) is next.

@@ -4,10 +4,10 @@ search. Issue #11; companion module to src/concerted_rotation.py, which
 holds the move geometry.
 
 This module is being built up incrementally per docs/mcmm_plan.md. Steps
-3 and 4 (current) implement backbone window enumeration and the shared
-basin-memory data structure. Future steps:
+3, 4, and 5 (current) implement backbone window enumeration, the shared
+basin-memory data structure, and the single-walker MCMM driver. Future
+steps:
 
-    Step 5: single-walker MCMM driver
     Step 6: parallel walkers (batched MMFF)
     Step 7: replica exchange across temperatures
     Step 8: get_mol_PE_mcmm entry point in src/confsweeper.py
@@ -21,6 +21,7 @@ runs MMFF + accept/reject.
 
 import math
 
+import numpy as np
 import torch
 from rdkit import Chem
 
@@ -390,3 +391,177 @@ class BasinMemory:
                 f"coords must be ({self.n_atoms}, 3), got {tuple(coords.shape)}"
             )
         return coords
+
+
+# ---------------------------------------------------------------------------
+# Single-walker MCMM driver
+# ---------------------------------------------------------------------------
+
+
+class MCMMWalker:
+    """
+    Sequential single-walker MCMM driver: Metropolis accept/reject with
+    Saunders 1/√usage bias and Wu-Deem detailed-balance correction.
+
+    Generic over the proposal mechanism. The walker tracks `(coords,
+    energy)` and asks an injected `propose_fn` for new states. The
+    proposer is responsible for the geometry move, MMFF minimisation,
+    and energy scoring; the walker is responsible only for acceptance
+    decisions and memory bookkeeping. This separation keeps the MC
+    logic unit-testable without an RDKit mol or MMFF backend — the
+    real RDKit-coupled proposer wires in at Step 5b / 6.
+
+    Per `step()`:
+
+        new_coords, new_energy, det_j, success = propose_fn(self.coords)
+        if not success: return False  # geometry rejection
+        idx, _ = memory.query_novelty(new_coords)
+        bias = memory.acceptance_bias(idx)
+        p = min(1, exp(-ΔE / kT) * bias * det_j)
+        if random_fn() < p:
+            accept; update memory (add or record_visit)
+            return True
+        return False
+
+    Special temperature limits:
+      * `kt = 0`   pure greedy descent. Uphill always rejects; downhill
+                   always accepts (the Saunders bias is dominated by
+                   the infinite energy term in the limit).
+      * `kt = inf` energy term collapses to 1; bias × det_j is the only
+                   gate. Approaches uniform sampling over basins as
+                   bias → 1 (i.e. on novel basins).
+
+    Initial state handling: on construction, the walker queries memory
+    for the initial coordinates. If novel (the typical fresh-memory
+    case), the basin is added with usage=1. If the memory already
+    contains the initial basin (e.g. shared across walkers), the
+    walker latches onto the existing index without incrementing
+    usage — so passing the same `BasinMemory` to N walkers does not
+    artificially inflate the discovery basin's count.
+
+    Params:
+        coords: torch.Tensor (n_atoms, 3) : initial conformer
+            coordinates. Stored as float64 on the memory's device.
+        energy: float : initial conformer energy (eV by convention)
+        kt: float : Boltzmann temperature in energy units (kT in eV
+            for MACE-OFF compatibility, or any consistent unit). Use
+            0 for greedy descent and `math.inf` for uniform sampling.
+        memory: BasinMemory : shared basin memory; mutated by accept
+        random_fn: callable | None : zero-argument callable returning
+            a uniform random float in [0, 1). Defaults to
+            `np.random.default_rng().random`. Tests inject a fixed
+            value to make accept/reject deterministic.
+    """
+
+    def __init__(
+        self,
+        coords: torch.Tensor,
+        energy: float,
+        kt: float,
+        memory: BasinMemory,
+        random_fn=None,
+    ):
+        if kt < 0:
+            raise ValueError(f"kt must be non-negative, got {kt}")
+        self.coords = coords.to(memory.device, dtype=torch.float64).clone()
+        self.energy = float(energy)
+        self.kt = float(kt)
+        self.memory = memory
+        self._random = (
+            random_fn if random_fn is not None else np.random.default_rng().random
+        )
+        self.n_steps = 0
+        self.n_accepted = 0
+        # Latch onto the initial basin in memory. Add only if it is novel —
+        # avoids double-counting when a shared memory already contains it.
+        idx, _ = memory.query_novelty(self.coords)
+        if idx is None:
+            self.current_basin_idx = memory.add_basin(self.coords, self.energy)
+        else:
+            self.current_basin_idx = idx
+
+    @property
+    def acceptance_rate(self) -> float:
+        """Fraction of attempted steps that were accepted."""
+        return self.n_accepted / max(self.n_steps, 1)
+
+    def step(self, propose_fn) -> bool:
+        """
+        Run one MC step.
+
+        Params:
+            propose_fn: callable : `propose_fn(coords) -> (new_coords,
+                new_energy, det_j, success)`. `new_coords` is a torch
+                tensor of shape (n_atoms, 3). `det_j > 0` is the
+                Wu-Deem Jacobian factor. `success=False` signals
+                geometric infeasibility (the move is rejected at the
+                geometry stage, before energy scoring).
+        Returns:
+            bool : True iff the move was accepted and the walker state
+                advanced.
+        """
+        self.n_steps += 1
+        new_coords, new_energy, det_j, success = propose_fn(self.coords)
+        if not success:
+            return False
+
+        proposed_idx, _ = self.memory.query_novelty(new_coords)
+        bias = self.memory.acceptance_bias(proposed_idx)
+        delta_e = float(new_energy) - self.energy
+        p_accept = self._acceptance_prob(delta_e, bias, float(det_j))
+
+        if self._random() < p_accept:
+            self.coords = new_coords.to(self.memory.device, dtype=torch.float64).clone()
+            self.energy = float(new_energy)
+            if proposed_idx is None:
+                self.current_basin_idx = self.memory.add_basin(self.coords, self.energy)
+            else:
+                self.memory.record_visit(proposed_idx)
+                self.current_basin_idx = proposed_idx
+            self.n_accepted += 1
+            return True
+        return False
+
+    def run(self, n_steps: int, propose_fn) -> int:
+        """
+        Run `n_steps` MC steps.
+
+        Params:
+            n_steps: int : number of step() calls to make
+            propose_fn: callable : same as `step`
+        Returns:
+            int : number of accepted moves during this call (not
+                cumulative — for the cumulative count use
+                `walker.n_accepted`).
+        """
+        n_accepted_before = self.n_accepted
+        for _ in range(n_steps):
+            self.step(propose_fn)
+        return self.n_accepted - n_accepted_before
+
+    def _acceptance_prob(self, delta_e: float, bias: float, det_j: float) -> float:
+        """
+        Metropolis-Hastings acceptance probability with Saunders bias and
+        Wu-Deem Jacobian.
+
+        Handles the kt = 0 and kt = inf limits explicitly to avoid
+        overflow / NaN from `exp(-ΔE / kT)` at the boundary.
+        """
+        if self.kt == 0.0:
+            if delta_e > 0.0:
+                return 0.0
+            if delta_e < 0.0:
+                # Energy factor → ∞ at T=0 for downhill moves; the
+                # min(1, ∞ × bias × det_j) clamps to 1 since both bias
+                # and det_j are strictly positive.
+                return 1.0
+            # delta_e == 0: energy factor is exactly 1 in the limit.
+            return min(1.0, bias * det_j)
+        if math.isinf(self.kt):
+            energy_factor = 1.0
+        else:
+            # np.exp returns inf on overflow rather than raising; keeps
+            # the boundary case (very downhill move at small kt)
+            # numerically clean.
+            energy_factor = float(np.exp(-delta_e / self.kt))
+        return min(1.0, energy_factor * bias * det_j)
