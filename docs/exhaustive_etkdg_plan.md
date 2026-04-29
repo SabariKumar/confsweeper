@@ -302,15 +302,71 @@ Run via `pixi run pytest tests/test_exhaustive_etkdg.py -v`.
 
 ---
 
-## Phase 5 — downstream integration (separate follow-up PR)
+## Phase 5 — downstream integration and the non-ETKDG benchmark (out of scope for this PR)
 
-Lives in `peptide_electrostatics`, not this branch:
-1. Update `finetune_generate_conformers.py` to call `get_mol_PE_exhaustive`.
-2. Add `--n_seeds` and (optional) `--minimize` CLI args.
-3. Regenerate `data/fine_tune/pampa_conformers.pkl` (Falcon Slurm).
-4. Re-run Stage 1b + Stage 2 fine-tuning.
+Two pieces of follow-up work, both scoped to separate branches/PRs:
+
+### 5a. PAMPA fine-tuning re-run with `get_mol_PE_exhaustive`
+
+Lives in `peptide_electrostatics`, not in this branch:
+1. Update `finetune_generate_conformers.py` to call `get_mol_PE_exhaustive`
+   (with the saturation-validated defaults: `n_seeds=10000`, `minimize=True`,
+   `mmff_backend='gpu'`).
+2. Add `--n_seeds` and (optional) `--minimize` CLI args so the fine-tuning
+   pipeline retains the knobs.
+3. Regenerate `data/fine_tune/pampa_conformers.pkl` on Falcon (Slurm batch).
+4. Re-run Stage 1b (latent extraction) + Stage 2 (PropertyHead training).
 5. Compare `val/mae` and learned `α` against the previous one-hot run.
-   Expectation: α drifts toward 1, MAE drops noticeably.
+   Expectation: α drifts toward 1 (vs the current 0.01 hedge), MAE drops
+   noticeably on the peptides where exhaustive ETKDG produces rich
+   ensembles (which is most of PAMPA below ~70 heavy atoms).
+6. Flag any peptides where exhaustive ETKDG still produces one-hot
+   ensembles (likely ≥ 70 heavy atoms with low ETKDG basin diversity)
+   so the property head can be evaluated separately on them.
+
+### 5b. Non-ETKDG sampler benchmark
+
+The exhaustive ETKDG pipeline is the *first* sampling strategy to clear
+the bar of producing CREST-quality ensembles at GPU speed for cyclic
+peptides. It is not necessarily the *best*. The bursty saturation
+behaviour and the residual one-hot results on `pampa_large` both
+suggest there's room above the ceiling that pure randomization plus
+MMFF reaches. Future work should benchmark at least one structurally
+different sampler against the same peptide library and the same MACE
+scoring path, using the same evaluation harness
+(`scripts/saturation_etkdg.py`-style sweep + `scripts/mace_vs_xtb.py`-style
+energy-backend check + `scripts/minimize_ablation.py`-style controlled
+ablation). Candidates worth evaluating in priority order:
+
+1. **CREST itself**, but parameterised for speed (low metadynamics
+   pushing pressure, short MD windows). The whole premise of this
+   project is "we don't need CREST", so a head-to-head against a fast
+   CREST configuration is the cleanest sanity check we can run.
+2. **Replica-exchange MD** with MACE-OFF as the energy. Each replica
+   independently samples a different temperature; exchanges propose
+   to swap conformations between adjacent temperatures based on a
+   Metropolis criterion. Avoids ETKDG's "stuck in one basin" failure
+   mode for large peptides. Substantially more expensive per
+   conformer than ETKDG, so the comparison should be at matched
+   wall-clock budget.
+3. **Backbone dihedral sampling via the existing
+   `torsional_sampling.py` (Pool B) at scale**. We have it already;
+   we never tried it at n=10k with MMFF post-minimisation. Cheap
+   experiment, would tell us whether the issue with the saturation
+   stuck cases is geometric (Pool B targets dihedrals ETKDG misses)
+   or topological (Pool B can't fix it either).
+4. **Conformer prediction from a generative ML model** (Boltzmann
+   generator, conformer flow matching). High-effort but the
+   genuinely novel direction. Out of scope for the immediate
+   follow-up.
+
+For all of (1)–(3) the benchmark protocol is unchanged: pick the same
+five representative peptides, run the new sampler at matched
+compute, score with MACE-OFF23 batched, dedup with energy-ranked
+basin clustering, report `max_bw`, `n_basins`, `n_within_3kT`, and
+wall-clock against the exhaustive ETKDG saturation numbers in this
+document. The CREMP ground truth on `cremp_typical` and `cremp_sharp`
+remains the same anchor.
 
 ---
 
