@@ -21,6 +21,7 @@ runs MMFF + accept/reject.
 
 import math
 
+import ase
 import numpy as np
 import torch
 from rdkit import Chem
@@ -146,6 +147,114 @@ def _ordered_backbone_residues(mol: Chem.Mol) -> list[tuple[int, int, int]]:
         )
 
     return ordered
+
+
+# ---------------------------------------------------------------------------
+# Side-chain enumeration — used by the MCMM proposer for full-mol moves
+# ---------------------------------------------------------------------------
+
+
+def _backbone_atom_set(mol: Chem.Mol) -> set:
+    """
+    Return the set of atom indices that lie on the macrocycle backbone.
+
+    Backbone atoms are the (N, Cα, C) triples returned by
+    `_ordered_backbone_residues`, flattened. Used as the "stop set" for
+    the side-chain BFS in `_side_chain_group` — atoms outside this set
+    are side-chain candidates; atoms inside are part of the ring and
+    must not be crossed during the BFS.
+
+    Params:
+        mol: Chem.Mol : a head-to-tail cyclic peptide
+    Returns:
+        set[int] : 3K atom indices for a K-residue cyclic peptide
+    """
+    residues = _ordered_backbone_residues(mol)
+    return {atom_idx for residue in residues for atom_idx in residue}
+
+
+def _side_chain_group(mol: Chem.Mol, atom_idx: int, backbone_atom_set: set) -> set:
+    """
+    BFS from `atom_idx` through non-backbone bonds.
+
+    Returns the set of atom indices reachable from `atom_idx` without
+    crossing any backbone atom (the starting atom itself is excluded
+    from the result; only its non-backbone neighbours and beyond are
+    included). For a backbone atom in a cyclic peptide, this returns
+    the side chain attached at that residue — Hα, Cβ, side-chain
+    branches, etc. — without leaking into adjacent residues' side
+    chains via the macrocycle.
+
+    For a non-backbone starting atom, the result is the connected
+    non-backbone component containing it (minus the starting atom),
+    which is rarely what callers want; pass a backbone atom.
+
+    Params:
+        mol: Chem.Mol : input molecule
+        atom_idx: int : starting atom (typically a backbone atom)
+        backbone_atom_set: set[int] : atoms forming the macrocycle ring;
+            traversal does not cross these
+    Returns:
+        set[int] : reachable atom indices, excluding `atom_idx` itself
+    """
+    side_chain: set = set()
+    queue: list = []
+    for nb in mol.GetAtomWithIdx(atom_idx).GetNeighbors():
+        nb_idx = nb.GetIdx()
+        if nb_idx not in backbone_atom_set:
+            queue.append(nb_idx)
+    while queue:
+        idx = queue.pop()
+        if idx in side_chain:
+            continue
+        side_chain.add(idx)
+        for nb in mol.GetAtomWithIdx(idx).GetNeighbors():
+            nb_idx = nb.GetIdx()
+            if nb_idx in backbone_atom_set or nb_idx in side_chain:
+                continue
+            queue.append(nb_idx)
+    return side_chain
+
+
+def _compute_window_downstream_sets(
+    mol: Chem.Mol, window: tuple, backbone_atom_set: set
+) -> list:
+    """
+    Compute the full-mol atom indices that should rotate per dihedral
+    when a DBT move acts on `window`.
+
+    For dihedral k around bond (window[k+1], window[k+2]):
+      - Window backbone atoms strictly downstream: window[k+3..6].
+      - Side chains of window[k+2..6] (the pivot atom k+2's side chain
+        rotates with the local frame at the pivot; downstream backbone
+        atoms' side chains rigidly follow their parents).
+
+    The pivot atom window[k+2] itself stays on the rotation axis and
+    does not move. Side chains of window[0..k+1] are upstream of the
+    bond and do not rotate.
+
+    Params:
+        mol: Chem.Mol : input molecule
+        window: tuple[int, ...] : 7 atom indices, in chain order
+        backbone_atom_set: set[int] : from `_backbone_atom_set(mol)`,
+            passed in to avoid recomputation across windows
+    Returns:
+        list of 4 frozenset[int] : per-dihedral rotation set, suitable
+            for `concerted_rotation.apply_dihedral_changes_full_mol`
+    """
+    side_chains = {
+        atom_idx: _side_chain_group(mol, atom_idx, backbone_atom_set)
+        for atom_idx in window
+    }
+    downstream_sets: list = []
+    for k in range(4):
+        rotated: set = set()
+        rotated.update(side_chains[window[k + 2]])
+        for j in range(k + 3, 7):
+            rotated.add(window[j])
+            rotated.update(side_chains[window[j]])
+        downstream_sets.append(frozenset(rotated))
+    return downstream_sets
 
 
 # ---------------------------------------------------------------------------
@@ -972,6 +1081,8 @@ def make_mcmm_proposer(
     calc,
     drive_sigma_rad: float = 0.1,
     closure_tol: float = 0.01,
+    score_chunk_size: int = 500,
+    mmff_backend: str = "gpu",
     seed: int = 0,
 ):
     """
@@ -980,61 +1091,195 @@ def make_mcmm_proposer(
     MACE across walkers per call, and returns per-walker
     `(new_coords, new_energy, det_j, success)` tuples.
 
-    **v0 STUB**: this implementation is a no-op proposer that returns
-    `success=False` for every walker, so no MC moves are accepted and
-    the basin set ends with only walkers' starting states. The
-    orchestration in `get_mol_PE_mcmm` is fully testable through this
-    stub via the no-exploration path. The real geometry + MMFF + MACE
-    wiring is the Step 8b deliverable; see docs/mcmm_plan.md.
+    Per-call pipeline:
 
-    The Step 8b implementation will:
-      1. Per walker, pick a random backbone window, drive dihedral, and
-         drive_delta ~ N(0, drive_sigma_rad²).
-      2. Apply DBT closure via `concerted_rotation.propose_move` on the
-         7-atom window backbone positions.
-      3. Apply the resulting deltas to the FULL molecule (rotating
-         backbone window atoms r3..r6 plus side chains of r2..r6) so
-         side chains transport rigidly with their backbone parents.
-      4. Stage every successful candidate as a conformer on a shared
-         throwaway mol, run nvmolkit MMFF in one batched call, then
-         MACE-score in chunks via `_mace_batch_energies`.
-      5. Compute per-walker Wu-Deem |det J| via finite differences.
-      6. Return `(coords_tensor, energy_float, det_j_float, success_bool)`
-         per walker. Failed walkers (closure failure or MMFF blowup)
-         pass through with `success=False` and the existing coords.
+      1. **Per-walker move generation** (CPU, sequential): pick a random
+         backbone window, drive dihedral, and `drive_delta ~ N(0,
+         drive_sigma_rad²)`. Run `concerted_rotation.propose_move` on
+         the 7-atom backbone window positions to solve for the closure
+         deltas. Walkers whose closure fails are flagged.
+      2. **Full-mol coordinate update** (CPU, sequential): for
+         successful walkers, replay the per-dihedral rotations on the
+         full atom array via
+         `concerted_rotation.apply_dihedral_changes_full_mol`,
+         transporting side-chain atoms rigidly with their backbone
+         parents according to the precomputed
+         `_compute_window_downstream_sets` for the chosen window.
+      3. **Batched MMFF** (GPU, one call): stage every successful
+         candidate as a conformer on a shared throwaway mol and run
+         `nvmolkit.mmffOptimization.MMFFOptimizeMoleculesConfs`
+         (`mmff_backend='gpu'`) or RDKit's serial MMFF
+         (`mmff_backend='cpu'`) for in-place minimisation.
+      4. **Batched MACE** (GPU, chunked): score every minimised
+         candidate via `_mace_batch_energies` in chunks of
+         `score_chunk_size`.
+      5. **Return** `(coords_tensor, energy_float, det_j_float,
+         success_bool)` per walker, in walker order. Failed walkers
+         pass through with their pre-move coords and `success=False`
+         so the driver's `apply_proposal` rejects without further work.
+
+    Topology — backbone windows, side-chain groups, the throwaway-mol
+    template — is captured at factory build time and reused per call,
+    keeping the per-step CPU overhead bounded by the move-generation
+    loop and the conformer-staging step.
+
+    Lazy import of `_mace_batch_energies` from `confsweeper` avoids the
+    confsweeper → mcmm circular dependency at module load time.
 
     Params:
         mol: Chem.Mol : a head-to-tail cyclic peptide with explicit Hs.
             Topology is captured at factory-build time; the mol must
             not be mutated structurally afterwards (conformer additions
             and edits are fine).
-        hardware_opts : nvmolkit hardware options for batched MMFF.
-        calc : MACECalculator from get_mace_calc().
+        hardware_opts : nvmolkit hardware options for batched MMFF
+            (only consulted when `mmff_backend='gpu'`).
+        calc : MACECalculator from `get_mace_calc()`.
         drive_sigma_rad: float : Gaussian standard deviation for the
             drive-angle perturbation in radians (default 0.1 ≈ 5.7°).
             Larger values give bigger moves at lower closure-success
             rate; couples to closure_tol per docs/mcmm_plan.md.
         closure_tol: float : passed through to `propose_move` as the
             maximum r5+r6 displacement-norm tolerated as ring-closed.
-        seed: int : seed for the move-RNG.
+        score_chunk_size: int : MACE per-batch forward pass cap
+            (default 500, matches `_minimize_score_filter_dedup`).
+        mmff_backend: str : 'gpu' (nvmolkit batched CUDA, default) or
+            'cpu' (RDKit serial). MMFF runs on the throwaway mol.
+        seed: int : base seed for the move-RNG; deterministic across
+            replicate runs.
     Returns:
         callable : `batch_propose_fn(coords_list) -> list[tuple]` matching
             the contract expected by `ParallelMCMMDriver` and
             `ReplicaExchangeMCMMDriver`.
+    Raises:
+        ValueError: if `mol` has no enumerable backbone windows (input
+            is not a cyclic peptide of ≥ 3 residues).
     """
-    # Capture topology at factory-build time so the closure has stable
-    # state. Step 8b will use these.
-    _ = enumerate_backbone_windows(mol)
-    _ = hardware_opts
-    _ = calc
-    _ = drive_sigma_rad
-    _ = closure_tol
-    _ = seed
+    from concerted_rotation import (
+        N_DIHEDRALS,
+        apply_dihedral_changes_full_mol,
+        propose_move,
+    )
+
+    if mmff_backend not in ("gpu", "cpu"):
+        raise ValueError(
+            f"unknown mmff_backend {mmff_backend!r}; expected 'gpu' or 'cpu'"
+        )
+
+    windows = enumerate_backbone_windows(mol)
+    if not windows:
+        raise ValueError(
+            "mol has no enumerable backbone windows; "
+            "check that it is a head-to-tail cyclic peptide of at least 3 residues"
+        )
+    backbone_atoms = _backbone_atom_set(mol)
+    window_downstream_sets = [
+        _compute_window_downstream_sets(mol, w, backbone_atoms) for w in windows
+    ]
+    n_windows = len(windows)
+    n_atoms = mol.GetNumAtoms()
+    atomic_nums = [a.GetAtomicNum() for a in mol.GetAtoms()]
+
+    # Throwaway-mol template: structure-only, no conformers. Cloning per
+    # call is required because nvmolkit MMFF mutates conformers in place
+    # and we don't want to corrupt walker state across step() calls.
+    template_mol = Chem.Mol(mol)
+    template_mol.RemoveAllConformers()
+
+    rng = np.random.default_rng(seed)
 
     def batch_propose_fn(coords_list):
-        # v0 stub: reject every proposal so no MC exploration occurs.
-        # Step 8b replaces this body with the real DBT + MMFF + MACE
-        # pipeline described in the docstring above.
-        return [(coords, 0.0, 0.0, False) for coords in coords_list]
+        # Lazy import: confsweeper imports from mcmm at module load time;
+        # importing _mace_batch_energies here defers resolution until the
+        # closure is actually called, breaking the circular dependency.
+        from confsweeper import _mace_batch_energies
+
+        n_walkers = len(coords_list)
+
+        # Stage 1: per-walker DBT closure on the backbone window.
+        # Successful walkers contribute a (new_full_coords, det_j) entry.
+        successful_meta: list = []
+        success_walker_indices: list = []
+        for w_idx, coords in enumerate(coords_list):
+            window_idx = int(rng.integers(n_windows))
+            window = windows[window_idx]
+            drive_idx = int(rng.integers(N_DIHEDRALS))
+            drive_delta = float(rng.normal(0.0, drive_sigma_rad))
+
+            coords_np = coords.detach().cpu().numpy().astype(np.float64)
+            window_pos = coords_np[list(window)]
+            result = propose_move(
+                window_pos, drive_idx, drive_delta, closure_tol=closure_tol
+            )
+            if not result.success:
+                continue
+            new_full = apply_dihedral_changes_full_mol(
+                coords_np,
+                list(window),
+                result.deltas,
+                window_downstream_sets[window_idx],
+            )
+            successful_meta.append(
+                {"new_full": new_full, "det_j": float(result.det_jacobian)}
+            )
+            success_walker_indices.append(w_idx)
+
+        # Stage 2: short-circuit if every walker failed.
+        if not successful_meta:
+            return [(coords_list[i], 0.0, 0.0, False) for i in range(n_walkers)]
+
+        # Stage 3: stage successful candidates as conformers on a fresh
+        # throwaway mol, run batched MMFF.
+        throwaway = Chem.Mol(template_mol)
+        for meta in successful_meta:
+            conf = Chem.Conformer(n_atoms)
+            new_full = meta["new_full"]
+            for a_idx in range(n_atoms):
+                x, y, z = new_full[a_idx]
+                conf.SetAtomPosition(a_idx, (float(x), float(y), float(z)))
+            throwaway.AddConformer(conf, assignId=True)
+
+        if mmff_backend == "gpu":
+            from nvmolkit.mmffOptimization import MMFFOptimizeMoleculesConfs
+
+            MMFFOptimizeMoleculesConfs([throwaway], hardwareOptions=hardware_opts)
+        else:
+            from rdkit.Chem import AllChem as _AllChem
+
+            for cid in [c.GetId() for c in throwaway.GetConformers()]:
+                _AllChem.MMFFOptimizeMolecule(throwaway, confId=cid)
+
+        # Stage 4: batched MACE scoring, chunked.
+        post_mmff_conf_ids = [c.GetId() for c in throwaway.GetConformers()]
+        energies: list = []
+        for start in range(0, len(post_mmff_conf_ids), score_chunk_size):
+            chunk_ids = post_mmff_conf_ids[start : start + score_chunk_size]
+            ase_mols = [
+                ase.Atoms(
+                    positions=throwaway.GetConformer(cid).GetPositions(),
+                    numbers=atomic_nums,
+                )
+                for cid in chunk_ids
+            ]
+            energies.extend(_mace_batch_energies(calc, ase_mols))
+
+        # Stage 5: assemble per-walker proposals in walker order.
+        proposals: list = [None] * n_walkers
+        for slot, w_idx in enumerate(success_walker_indices):
+            cid = post_mmff_conf_ids[slot]
+            new_coords = torch.tensor(
+                throwaway.GetConformer(cid).GetPositions(), dtype=torch.float64
+            )
+            proposals[w_idx] = (
+                new_coords,
+                float(energies[slot]),
+                successful_meta[slot]["det_j"],
+                True,
+            )
+        # Failed walkers get a no-op proposal in their original slot.
+        for w_idx in range(n_walkers):
+            if proposals[w_idx] is None:
+                proposals[w_idx] = (coords_list[w_idx], 0.0, 0.0, False)
+
+        return proposals
 
     return batch_propose_fn

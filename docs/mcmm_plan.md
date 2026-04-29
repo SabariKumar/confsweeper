@@ -15,7 +15,8 @@ This document is the working design for the third sampler in the issue-#10 bench
 | 5 | Single-walker MCMM driver (`src/mcmm.py`) | ✓ complete |
 | 6 | Parallel walkers (batched) (`src/mcmm.py`) | ✓ complete |
 | 7 | Replica exchange (`src/mcmm.py`) | ✓ complete |
-| 8 | `get_mol_PE_mcmm` entry point + proposer stub (`src/confsweeper.py`, `src/mcmm.py`) | ✓ complete (orchestration); 8b pending (real proposer) |
+| 8 | `get_mol_PE_mcmm` entry point + proposer stub (`src/confsweeper.py`, `src/mcmm.py`) | ✓ complete (orchestration) |
+| 8b | Real `make_mcmm_proposer` (DBT + side-chain coupling + MMFF + MACE) | ✓ complete |
 | 9 | Sampler benchmark wiring | pending |
 | 10 | Documentation | pending |
 
@@ -158,7 +159,7 @@ Integration tests mirror `tests/test_pool_b.py`: mock GPU stages (MMFF, MACE, ba
 
 11 entry-point tests in `tests/test_get_mol_PE_mcmm.py` covering the geometric ladder primitive, smoke test under the no-exploration stub, zero-conformers safety, proposer call count per step, basin-memory growth under an accepting mock proposer (4 init basins + 12 accepted = 16 final), unknown-mmff-backend rejection, and default-temperature-endpoint match (300 K / 600 K). Plus 3 stub tests for `make_mcmm_proposer` itself in `tests/test_mcmm.py` (callable contract, always-reject behaviour, length-matching across batch sizes).
 
-### Step 8b: Real `make_mcmm_proposer` implementation — pending (next)
+### Step 8b: Real `make_mcmm_proposer` implementation — ✓ complete
 
 Replace the v0 no-op stub in `src/mcmm.py` with the real DBT + MMFF + MACE proposer. The factory closure captures `mol` topology and GPU resources at build time; the returned `batch_propose_fn(coords_list)` per call:
 
@@ -175,6 +176,27 @@ Two sub-pieces to land before Step 8b's body:
 - **Side-chain group enumeration**: helper `_side_chain_group(mol, backbone_atom, backbone_atom_set)` doing BFS through non-backbone bonds. Used to precompute per-window downstream sets at factory-build time so the per-step move is fast.
 
 Once 8b lands, Step 9 (sampler benchmark wiring) plugs `mcmm` into `scripts/sampler_benchmark.py`'s `SAMPLERS` dispatch and the end-to-end pipeline can run on real peptides.
+
+**Outcome.** Three pieces shipped, in dependency order:
+
+1. **`concerted_rotation.MoveProposal`** — `propose_move` now returns a NamedTuple with fields `(new_positions, det_jacobian, deltas, success)`. Tuple-unpackable as a 4-tuple so existing 3-tuple-style call sites need updating; the `deltas` field is the (4,) array of dihedral changes the closure solver applied. Updated 5 tests in `tests/test_concerted_rotation.py` to use attribute access.
+
+2. **`concerted_rotation.apply_dihedral_changes_full_mol`** — generalises the 7-atom chain-rebuild primitive to operate on a full-molecule coordinate array, with explicit per-dihedral atom rotation sets. Pure numpy, no RDKit dependency. 4 tests cover the zero-deltas identity, the window-only equivalence with `apply_dihedral_changes`, side-chain bond-length preservation under rotation with parent, and shape-validation errors.
+
+3. **Side-chain helpers in `src/mcmm.py`** — `_backbone_atom_set(mol)`, `_side_chain_group(mol, atom_idx, backbone_atom_set)`, `_compute_window_downstream_sets(mol, window, backbone_atom_set)`. The first returns the 3K backbone atom indices for a K-residue cyclic peptide; the second BFS-traverses non-backbone bonds without crossing the macrocycle; the third combines the two to produce the 4 per-dihedral rotation sets that `apply_dihedral_changes_full_mol` consumes. 9 tests cover residue-class-specific side chain sizes (Ala Cα → 5 atoms, amide N → 1 H, amide C → 1 O), disjointness across residues, downstream-set monotonicity, pivot-not-included, and pivot-side-chain-included invariants.
+
+4. **Real `make_mcmm_proposer` body** — replaces the stub with the 5-stage pipeline:
+   1. Per-walker DBT closure on the backbone window (CPU, sequential).
+   2. Full-mol coordinate update with side-chain coupling (CPU, sequential).
+   3. Batched MMFF on a fresh throwaway mol (one nvmolkit GPU call, or RDKit serial fallback).
+   4. Batched MACE scoring chunked by `score_chunk_size` (one GPU call per chunk).
+   5. Per-walker proposal assembly in walker order — failed walkers get pass-through with `success=False`.
+
+   Tests cover: factory-build validation (rejects non-cyclic input, rejects unknown mmff_backend), proposal-count contract, the load-bearing "at least one of 8 walkers succeeds" closure check, finite energy + non-negative |det J| on success, failed-proposal pass-through with original coords, and the no-mutate invariant on input tensors.
+
+**One real architectural decision recorded**: the proposer's lazy `from confsweeper import _mace_batch_energies` inside the closure body is intentional — it defers resolution past `confsweeper`'s module-load `from mcmm import make_mcmm_proposer`, breaking the circular dependency without splitting the MACE primitive into a third module.
+
+**Test count delta**: +4 in `test_concerted_rotation.py` (24 total), +5 in `test_mcmm.py` (90 total), no changes in `test_get_mol_PE_mcmm.py` since it patches `confsweeper.make_mcmm_proposer` and is unaffected by the body swap. All 158 tests pass across the 5 directly-affected suites.
 
 ### Step 9: Sampler benchmark wiring
 
@@ -202,4 +224,4 @@ Update `src/README.md` and `scripts/README.md`: new module(s), function, sampler
 2. DBT geometry as a standalone `src/concerted_rotation.py` (potentially reusable for any macrocycle MC code) vs. inlined into `src/mcmm.py`. Standalone is preferred — clean separation, the geometry has no MCMM-specific state.
 3. Implement DBT from scratch. No published reference exists in the pixi `mace` environment. v0 uses numerical closure (Option B above); the analytical polynomial (Option A) is deferred to a future PR if benchmark data shows multi-branch enumeration is necessary.
 
-All three locked. Steps 1–8 complete (orchestration shape; see Progress table at top). Step 8b (the real `make_mcmm_proposer` implementation) is next, then Steps 9–10.
+All three locked. Steps 1–8b complete (see Progress table at top). Step 9 (sampler benchmark wiring) is next, then Step 10 (final docs).

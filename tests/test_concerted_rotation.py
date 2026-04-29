@@ -15,6 +15,7 @@ from concerted_rotation import (
     DEFAULT_CLOSURE_TOL,
     N_DIHEDRALS,
     apply_dihedral_changes,
+    apply_dihedral_changes_full_mol,
     closure_residual,
     dihedral_angle,
     propose_move,
@@ -263,10 +264,12 @@ def test_closure_residual_nonzero_when_drive_perturbed_alone():
 
 def test_propose_move_zero_perturbation_is_identity():
     pos = _twisted_chain(seed=8)
-    new_pos, det_j, success = propose_move(pos, drive_idx=1, drive_delta=0.0)
+    new_pos, det_j, deltas, success = propose_move(pos, drive_idx=1, drive_delta=0.0)
     assert success
     assert np.allclose(new_pos, pos, atol=DEFAULT_CLOSURE_TOL)
     assert np.isfinite(det_j)
+    # All four deltas should be (essentially) zero at zero perturbation.
+    assert np.allclose(deltas, 0.0, atol=1e-9)
 
 
 def test_propose_move_outer_atoms_preserved():
@@ -283,12 +286,14 @@ def test_propose_move_outer_atoms_preserved():
     succeeded_at_least_once = False
     for drive_idx in range(N_DIHEDRALS):
         for drive_delta in [0.05, -0.05, 0.02, -0.1]:
-            new_pos, _, success = propose_move(pos, drive_idx, drive_delta)
-            if not success:
+            result = propose_move(pos, drive_idx, drive_delta)
+            if not result.success:
                 continue
             succeeded_at_least_once = True
             joint_residual = np.linalg.norm(
-                np.concatenate([new_pos[5] - pos[5], new_pos[6] - pos[6]])
+                np.concatenate(
+                    [result.new_positions[5] - pos[5], result.new_positions[6] - pos[6]]
+                )
             )
             assert joint_residual < DEFAULT_CLOSURE_TOL
     assert succeeded_at_least_once, "No closure succeeded across the sweep"
@@ -300,9 +305,10 @@ def test_propose_move_drive_dihedral_changed_by_delta():
     drive_delta = 0.05
 
     for drive_idx in range(N_DIHEDRALS):
-        new_pos, _, success = propose_move(pos, drive_idx, drive_delta)
-        if not success:
+        result = propose_move(pos, drive_idx, drive_delta)
+        if not result.success:
             continue
+        new_pos = result.new_positions
         old = dihedral_angle(
             pos[drive_idx],
             pos[drive_idx + 1],
@@ -321,6 +327,8 @@ def test_propose_move_drive_dihedral_changed_by_delta():
         assert (
             abs(diff - drive_delta) < 1e-4
         ), f"drive_idx={drive_idx}: Δτ={diff}, expected {drive_delta}"
+        # The drive index should hold drive_delta (within solver slack).
+        assert abs(result.deltas[drive_idx] - drive_delta) < 1e-9
 
 
 def test_propose_move_invalid_drive_idx_raises():
@@ -333,10 +341,10 @@ def test_propose_move_invalid_drive_idx_raises():
 
 def test_propose_move_returns_finite_jacobian():
     pos = _twisted_chain(seed=12)
-    _, det_j, success = propose_move(pos, drive_idx=1, drive_delta=0.05)
-    if success:
-        assert np.isfinite(det_j)
-        assert det_j >= 0
+    result = propose_move(pos, drive_idx=1, drive_delta=0.05)
+    if result.success:
+        assert np.isfinite(result.det_jacobian)
+        assert result.det_jacobian >= 0
 
 
 def test_propose_move_failure_returns_input_positions():
@@ -351,9 +359,108 @@ def test_propose_move_failure_returns_input_positions():
     """
     pos = _twisted_chain(seed=13)
     impossible_tol = 1e-30
-    new_pos, det_j, success = propose_move(
-        pos, drive_idx=1, drive_delta=0.1, closure_tol=impossible_tol
+    result = propose_move(pos, drive_idx=1, drive_delta=0.1, closure_tol=impossible_tol)
+    assert not result.success
+    assert result.det_jacobian == 0.0
+    assert np.allclose(result.new_positions, pos)
+    # On failure, deltas are all zeros (no move applied).
+    assert np.allclose(result.deltas, 0.0)
+
+
+# ---------------------------------------------------------------------------
+# apply_dihedral_changes_full_mol
+# ---------------------------------------------------------------------------
+
+
+def _embed_window_in_full_array(window_pos: np.ndarray, n_extra: int = 5):
+    """
+    Build a full-mol coords array of shape (7+n_extra, 3) by appending
+    `n_extra` "side-chain" atoms after the 7-atom backbone window. The
+    side-chain atoms sit at fixed offsets (1, 1, 1) above each of the
+    last n_extra backbone atoms — gives us non-trivial rotation tests.
+
+    Returns:
+        full_positions: np.ndarray (7+n_extra, 3)
+        window_indices: list[int] : the 7 indices for the backbone window (0..6)
+        side_chain_atom_idx_map: dict[int, list[int]] : for each backbone
+            atom in window, the side-chain atom indices attached to it
+    """
+    full = np.zeros((7 + n_extra, 3), dtype=float)
+    full[:7] = window_pos
+    side_chain_map = {}
+    for k in range(n_extra):
+        # Attach a side-chain atom to backbone atom (7-n_extra+k) at offset (0,0,1)
+        backbone_idx = 7 - n_extra + k
+        sc_idx = 7 + k
+        full[sc_idx] = full[backbone_idx] + np.array([0.0, 0.0, 1.0])
+        side_chain_map.setdefault(backbone_idx, []).append(sc_idx)
+    return full, list(range(7)), side_chain_map
+
+
+def test_full_mol_zero_deltas_is_identity():
+    """Zero deltas → no atom moves, regardless of downstream-set contents."""
+    base = _twisted_chain(seed=20)
+    full, window, _ = _embed_window_in_full_array(base, n_extra=3)
+    downstream_sets = [{8}, {7, 9}, {7, 8, 9}, set()]  # arbitrary, exercises shapes
+    new_full = apply_dihedral_changes_full_mol(
+        full, window, np.zeros(N_DIHEDRALS), downstream_sets
     )
-    assert not success
-    assert det_j == 0.0
-    assert np.allclose(new_pos, pos)
+    assert np.allclose(new_full, full, atol=1e-12)
+
+
+def test_full_mol_window_only_matches_apply_dihedral_changes():
+    """When the downstream sets contain ONLY the 7-atom window's
+    naturally-downstream indices (k+3..6) per dihedral, the 7-atom
+    subset of the full-mol output equals what `apply_dihedral_changes`
+    would produce on the window alone."""
+    base = _twisted_chain(seed=21)
+    full, window, _ = _embed_window_in_full_array(base, n_extra=3)
+    deltas = np.array([0.1, -0.2, 0.3, -0.05])
+
+    # Reference: 7-atom backbone-only result
+    ref_window = apply_dihedral_changes(base, deltas)
+    # Full-mol with empty side-chain extensions, just window-downstream sets
+    downstream_sets = [set(window[k + 3 : 7]) for k in range(N_DIHEDRALS)]
+    new_full = apply_dihedral_changes_full_mol(full, window, deltas, downstream_sets)
+    assert np.allclose(new_full[:7], ref_window, atol=1e-12)
+    # Extra atoms (side chains, not in any downstream set) didn't move
+    assert np.allclose(new_full[7:], full[7:], atol=1e-12)
+
+
+def test_full_mol_side_chain_rotates_with_parent():
+    """When a side-chain atom is included in the same downstream set as
+    its backbone parent, it rotates by the same rigid transformation —
+    bond lengths from parent to side-chain atom are preserved."""
+    base = _twisted_chain(seed=22)
+    full, window, side_chain_map = _embed_window_in_full_array(base, n_extra=3)
+    deltas = np.array([0.0, 0.5, 0.0, 0.0])  # only dihedral 1 active
+
+    # Dihedral 1 rotates atoms downstream of bond (window[2], window[3]).
+    # Backbone atoms 4, 5, 6 in the window. Plus their side chains.
+    # Side chains (from _embed_window_in_full_array, n_extra=3): 7→backbone 4,
+    # 8→backbone 5, 9→backbone 6. So downstream of dihedral 1 includes
+    # {4, 5, 6, 7, 8, 9}.
+    downstream_sets = [set(window[k + 3 : 7]) | {7, 8, 9} for k in range(N_DIHEDRALS)]
+    new_full = apply_dihedral_changes_full_mol(full, window, deltas, downstream_sets)
+
+    # Each side-chain atom maintained its bond length to its backbone parent.
+    for backbone_idx, sc_idxs in side_chain_map.items():
+        for sc_idx in sc_idxs:
+            old_bond = np.linalg.norm(full[sc_idx] - full[backbone_idx])
+            new_bond = np.linalg.norm(new_full[sc_idx] - new_full[backbone_idx])
+            assert abs(new_bond - old_bond) < 1e-10
+
+
+def test_full_mol_invalid_shapes_raise():
+    base = _twisted_chain(seed=23)
+    full, window, _ = _embed_window_in_full_array(base, n_extra=2)
+    with pytest.raises(ValueError, match="positions must be"):
+        apply_dihedral_changes_full_mol(
+            np.zeros((9,)), window, np.zeros(4), [set()] * 4
+        )
+    with pytest.raises(ValueError, match="window must have 7"):
+        apply_dihedral_changes_full_mol(full, [0, 1, 2], np.zeros(4), [set()] * 4)
+    with pytest.raises(ValueError, match="deltas must be"):
+        apply_dihedral_changes_full_mol(full, window, np.zeros(3), [set()] * 4)
+    with pytest.raises(ValueError, match="downstream_sets must have"):
+        apply_dihedral_changes_full_mol(full, window, np.zeros(4), [set()] * 3)

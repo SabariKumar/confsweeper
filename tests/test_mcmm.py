@@ -8,6 +8,7 @@ torch tensors to isolate the metric and bookkeeping invariants.
 
 import math
 
+import numpy as np
 import pytest
 import torch
 from rdkit import Chem
@@ -19,7 +20,10 @@ from mcmm import (
     MCMMWalker,
     ParallelMCMMDriver,
     ReplicaExchangeMCMMDriver,
+    _backbone_atom_set,
+    _compute_window_downstream_sets,
     _ordered_backbone_residues,
+    _side_chain_group,
     _swap_walker_configs,
     enumerate_backbone_windows,
     make_mcmm_proposer,
@@ -1200,35 +1204,309 @@ def test_make_mcmm_proposer_returns_callable_for_cyclic_peptide():
     assert callable(proposer)
 
 
-def test_make_mcmm_proposer_stub_rejects_every_proposal():
-    """The v0 stub returns success=False for every walker. Any walker
-    paired with this proposer never accepts a move; basin memory stays
-    at its initial state. Step 8b replaces this body."""
+def test_make_mcmm_proposer_rejects_for_non_cyclic_input():
+    """The factory raises `ValueError` for a mol with no enumerable
+    backbone windows (caught at build time, before any moves are
+    proposed)."""
+    cyclohexane = Chem.AddHs(Chem.MolFromSmiles("C1CCCCC1"))
+    with pytest.raises(ValueError, match="no enumerable backbone windows"):
+        make_mcmm_proposer(cyclohexane, hardware_opts=None, calc=None, seed=0)
+
+
+def test_make_mcmm_proposer_invalid_mmff_backend_raises():
+    """An unrecognised mmff_backend value raises at build time."""
     mol = _cycloala_mol(4)
-    proposer = make_mcmm_proposer(mol, hardware_opts=None, calc=None, seed=0)
-
-    # Synthetic coords list mimicking 3 walkers' state. Shape doesn't have
-    # to match mol's atom count for this stub since it ignores coords.
-    coords_list = [
-        torch.zeros(_TEST_N_ATOMS, 3, dtype=torch.float64),
-        torch.zeros(_TEST_N_ATOMS, 3, dtype=torch.float64),
-        torch.zeros(_TEST_N_ATOMS, 3, dtype=torch.float64),
-    ]
-    proposals = proposer(coords_list)
-    assert len(proposals) == 3
-    for proposal in proposals:
-        new_coords, new_energy, det_j, success = proposal
-        assert success is False
+    with pytest.raises(ValueError, match="unknown mmff_backend"):
+        make_mcmm_proposer(
+            mol, hardware_opts=None, calc=None, mmff_backend="other", seed=0
+        )
 
 
-def test_make_mcmm_proposer_stub_returns_proposal_per_walker():
-    """The stub respects the input list length: N input coords → N output
-    proposals."""
+def _make_real_proposer_with_mocks(
+    mol, drive_sigma_rad: float = 0.05, closure_tol: float = 0.01, seed: int = 0
+):
+    """Build a real `make_mcmm_proposer` callable while patching the GPU
+    stages — `nvmolkit.mmffOptimization.MMFFOptimizeMoleculesConfs` as
+    a no-op and `confsweeper._mace_batch_energies` as a sequential
+    monotone mock. Returns an `(proposer, mock_mace, mock_mmff)` tuple
+    plus a context manager that activates the patches; the caller
+    enters the context before calling the proposer."""
+    from contextlib import contextmanager
+    from unittest.mock import patch as _patch
+
+    proposer = make_mcmm_proposer(
+        mol,
+        hardware_opts=None,
+        calc=None,
+        drive_sigma_rad=drive_sigma_rad,
+        closure_tol=closure_tol,
+        seed=seed,
+    )
+
+    counter = [0]
+
+    def _mock_mace(_calc, ase_mols):
+        out = [(counter[0] + i) * 0.01 for i in range(len(ase_mols))]
+        counter[0] += len(ase_mols)
+        return out
+
+    @contextmanager
+    def patched():
+        with (
+            _patch("confsweeper._mace_batch_energies", side_effect=_mock_mace),
+            _patch(
+                "nvmolkit.mmffOptimization.MMFFOptimizeMoleculesConfs",
+                return_value=[[]],
+            ),
+        ):
+            yield
+
+    return proposer, patched
+
+
+def _seed_full_mol_coords(mol) -> torch.Tensor:
+    """ETKDG-embed one conformer on `mol` and return its coords as a
+    `(n_atoms, 3)` float64 torch tensor. Used as a starting state for
+    walkers when calling the real proposer."""
+    from rdkit.Chem import AllChem
+
+    mol_copy = Chem.Mol(mol)
+    mol_copy.RemoveAllConformers()
+    AllChem.EmbedMolecule(mol_copy, randomSeed=42)
+    return torch.tensor(mol_copy.GetConformer(0).GetPositions(), dtype=torch.float64)
+
+
+def test_make_mcmm_proposer_returns_proposal_per_walker():
+    """The proposer respects the input list length: N input coords → N
+    output proposals, each a 4-tuple `(coords, energy, det_j, success)`."""
     mol = _cycloala_mol(4)
-    proposer = make_mcmm_proposer(mol, hardware_opts=None, calc=None, seed=42)
-    for n in [1, 5, 64]:
-        coords_list = [
-            torch.zeros(_TEST_N_ATOMS, 3, dtype=torch.float64) for _ in range(n)
-        ]
-        proposals = proposer(coords_list)
+    proposer, patched = _make_real_proposer_with_mocks(mol, seed=42)
+    seed_coords = _seed_full_mol_coords(mol)
+    for n in [1, 3, 8]:
+        coords_list = [seed_coords.clone() for _ in range(n)]
+        with patched():
+            proposals = proposer(coords_list)
         assert len(proposals) == n
+        for prop in proposals:
+            assert len(prop) == 4
+            new_coords, new_energy, det_j, success = prop
+            assert isinstance(new_coords, torch.Tensor)
+            assert new_coords.shape == seed_coords.shape
+
+
+def test_make_mcmm_proposer_can_accept_a_move():
+    """For a small cyclic peptide with a small drive_sigma, at least one
+    walker out of a batch should produce `success=True` — i.e. the
+    closure solver finds a feasible move and the full-mol pipeline
+    flows through MMFF/MACE without error."""
+    mol = _cycloala_mol(4)
+    proposer, patched = _make_real_proposer_with_mocks(
+        mol, drive_sigma_rad=0.05, seed=0
+    )
+    seed_coords = _seed_full_mol_coords(mol)
+    coords_list = [seed_coords.clone() for _ in range(8)]
+    with patched():
+        proposals = proposer(coords_list)
+    assert any(
+        p[3] for p in proposals
+    ), "Expected at least one closure success across 8 walkers; got 0"
+
+
+def test_make_mcmm_proposer_successful_proposal_has_finite_energy_and_jacobian():
+    """Successful proposals carry a finite energy from the MACE mock and
+    a non-negative Wu-Deem |det J| from the closure solver."""
+    mol = _cycloala_mol(4)
+    proposer, patched = _make_real_proposer_with_mocks(mol, seed=1)
+    seed_coords = _seed_full_mol_coords(mol)
+    coords_list = [seed_coords.clone() for _ in range(8)]
+    with patched():
+        proposals = proposer(coords_list)
+    for new_coords, new_energy, det_j, success in proposals:
+        if not success:
+            continue
+        assert np.isfinite(new_energy)
+        assert det_j >= 0.0
+
+
+def test_make_mcmm_proposer_failed_proposal_passes_through_input_coords():
+    """Failed proposals (closure tolerance not met) pass through the
+    walker's original coords with success=False, so the driver's
+    `apply_proposal` rejects without further work."""
+    mol = _cycloala_mol(4)
+    # Tight closure_tol forces failure on most moves
+    proposer, patched = _make_real_proposer_with_mocks(
+        mol, drive_sigma_rad=0.5, closure_tol=1e-30, seed=99
+    )
+    seed_coords = _seed_full_mol_coords(mol)
+    coords_list = [seed_coords.clone() for _ in range(4)]
+    with patched():
+        proposals = proposer(coords_list)
+    # All should fail with this absurdly-tight tolerance
+    for i, (new_coords, new_energy, det_j, success) in enumerate(proposals):
+        assert not success
+        assert det_j == 0.0
+        assert torch.allclose(new_coords, coords_list[i])
+
+
+def test_make_mcmm_proposer_does_not_mutate_input_coords():
+    """The proposer treats input coords as immutable — even on accepted
+    proposals, the input tensor is not modified in place."""
+    mol = _cycloala_mol(4)
+    proposer, patched = _make_real_proposer_with_mocks(mol, seed=2)
+    seed_coords = _seed_full_mol_coords(mol)
+    coords_before = seed_coords.clone()
+    coords_list = [seed_coords]
+    with patched():
+        proposer(coords_list)
+    # The original tensor's contents are unchanged
+    assert torch.allclose(seed_coords, coords_before)
+
+
+# ---------------------------------------------------------------------------
+# Side-chain helpers — _backbone_atom_set, _side_chain_group, _compute_window_downstream_sets
+# ---------------------------------------------------------------------------
+
+
+def test_backbone_atom_set_size_for_cyclic_peptide():
+    """A K-residue cyclic peptide has 3K backbone atoms."""
+    mol4 = _cycloala_mol(4)
+    mol6 = _cycloala_mol(6)
+    assert len(_backbone_atom_set(mol4)) == 12
+    assert len(_backbone_atom_set(mol6)) == 18
+
+
+def test_backbone_atom_set_excludes_hydrogens_and_side_chains():
+    """Atoms in the backbone-atom set are all heavy atoms (N, Cα, C);
+    Hs and side-chain methyls (Cβ for Ala) are not."""
+    mol = _cycloala_mol(4)
+    backbone = _backbone_atom_set(mol)
+    for idx in backbone:
+        atom = mol.GetAtomWithIdx(idx)
+        assert atom.GetAtomicNum() in (
+            6,
+            7,
+        ), f"backbone atom {idx} is element {atom.GetAtomicNum()}, expected C or N"
+
+
+def test_side_chain_group_for_alanine_ca():
+    """For an Ala Cα atom, the side-chain group is the Cβ methyl carbon
+    plus its three Hs plus the Hα. With explicit Hs on cyclo(Ala)4
+    the Cα has 4 non-backbone neighbours (= side chain), and the
+    methyl Cβ has 3 H neighbours that join via BFS."""
+    mol = _cycloala_mol(4)
+    backbone = _backbone_atom_set(mol)
+    residues = _ordered_backbone_residues(mol)
+    # Ala: Cα → Cβ + Hα + 3 methyl Hs = 5 side-chain atoms total
+    for n_idx, ca_idx, c_idx in residues:
+        sc = _side_chain_group(mol, ca_idx, backbone)
+        assert (
+            len(sc) == 5
+        ), f"Ala Cα {ca_idx} side chain has {len(sc)} atoms, expected 5"
+        # Side-chain atoms are all non-backbone
+        assert sc.isdisjoint(backbone)
+
+
+def test_side_chain_group_for_amide_n_is_just_h():
+    """For an Ala backbone amide N (non-NMe), the side chain is the
+    single NH hydrogen."""
+    mol = _cycloala_mol(4)
+    backbone = _backbone_atom_set(mol)
+    residues = _ordered_backbone_residues(mol)
+    for n_idx, _, _ in residues:
+        sc = _side_chain_group(mol, n_idx, backbone)
+        assert len(sc) == 1
+        h_idx = next(iter(sc))
+        assert mol.GetAtomWithIdx(h_idx).GetAtomicNum() == 1
+
+
+def test_side_chain_group_for_carbonyl_c_is_just_o():
+    """For an amide C, the side chain is the single carbonyl oxygen."""
+    mol = _cycloala_mol(4)
+    backbone = _backbone_atom_set(mol)
+    residues = _ordered_backbone_residues(mol)
+    for _, _, c_idx in residues:
+        sc = _side_chain_group(mol, c_idx, backbone)
+        assert len(sc) == 1
+        o_idx = next(iter(sc))
+        assert mol.GetAtomWithIdx(o_idx).GetAtomicNum() == 8
+
+
+def test_side_chain_group_does_not_cross_macrocycle():
+    """Starting from one backbone atom, the BFS doesn't reach atoms
+    attached to other backbone atoms — the macrocycle cycle is
+    blocked at every other backbone atom."""
+    mol = _cycloala_mol(4)
+    backbone = _backbone_atom_set(mol)
+    residues = _ordered_backbone_residues(mol)
+    # Each residue's Cα has its own 5-atom side chain, all disjoint
+    # from other residues' side chains.
+    side_chains = [
+        _side_chain_group(mol, ca_idx, backbone) for _, ca_idx, _ in residues
+    ]
+    union = set().union(*side_chains)
+    # Sum of individual sizes equals the union size → all disjoint.
+    assert sum(len(sc) for sc in side_chains) == len(union)
+
+
+def test_compute_window_downstream_sets_length_and_disjoint_from_upstream():
+    """Each of the 4 downstream sets should be a subset of the full mol's
+    atoms and should NOT contain any of the upstream window backbone
+    atoms (window[0..k+1])."""
+    mol = _cycloala_mol(4)
+    backbone = _backbone_atom_set(mol)
+    windows = enumerate_backbone_windows(mol)
+    window = windows[0]
+    sets = _compute_window_downstream_sets(mol, window, backbone)
+    assert len(sets) == 4
+    for k, ds in enumerate(sets):
+        upstream_window_atoms = set(window[: k + 2])  # window[0..k+1]
+        assert ds.isdisjoint(
+            upstream_window_atoms
+        ), f"dihedral {k}: downstream set leaks into upstream window atoms"
+
+
+def test_compute_window_downstream_sets_pivot_not_included():
+    """The pivot atom window[k+2] sits ON the rotation axis and does
+    not move — it must NOT be in downstream_sets[k]. (Its side-chain
+    atoms DO appear, however, since they rotate with the local frame
+    at the pivot.)"""
+    mol = _cycloala_mol(4)
+    backbone = _backbone_atom_set(mol)
+    windows = enumerate_backbone_windows(mol)
+    sets = _compute_window_downstream_sets(mol, windows[0], backbone)
+    for k, ds in enumerate(sets):
+        pivot = windows[0][k + 2]
+        assert pivot not in ds
+
+
+def test_compute_window_downstream_sets_includes_pivot_side_chain():
+    """The side-chain group of the pivot atom window[k+2] (e.g. Cα's
+    Cβ + Hα + methyl Hs) IS included in the downstream set, because
+    it rotates rigidly with the local frame at the pivot when the
+    dihedral around the bond ending at the pivot changes."""
+    mol = _cycloala_mol(4)
+    backbone = _backbone_atom_set(mol)
+    windows = enumerate_backbone_windows(mol)
+    window = windows[0]
+    sets = _compute_window_downstream_sets(mol, window, backbone)
+    for k, ds in enumerate(sets):
+        pivot_sc = _side_chain_group(mol, window[k + 2], backbone)
+        assert pivot_sc.issubset(
+            ds
+        ), f"dihedral {k}: pivot's side chain not in downstream set"
+
+
+def test_compute_window_downstream_sets_monotone_in_dihedral_index():
+    """Downstream-set sizes shrink as k increases: dihedral 0 affects
+    the most atoms (pivot side chain + 4 downstream backbone atoms +
+    their side chains); dihedral 3 affects the fewest (pivot side
+    chain + just window[6] + its side chain)."""
+    mol = _cycloala_mol(6)  # use a longer ring so all 4 are non-trivial
+    backbone = _backbone_atom_set(mol)
+    windows = enumerate_backbone_windows(mol)
+    sets = _compute_window_downstream_sets(mol, windows[0], backbone)
+    sizes = [len(s) for s in sets]
+    for k in range(3):
+        assert (
+            sizes[k] >= sizes[k + 1]
+        ), f"size[{k}]={sizes[k]} should be >= size[{k+1}]={sizes[k+1]}"

@@ -31,8 +31,39 @@ closure solver could not drive the residual below tolerance and the move
 should be rejected geometrically (before MMFF) by the caller.
 """
 
+from typing import NamedTuple
+
 import numpy as np
 from scipy.optimize import least_squares
+
+
+class MoveProposal(NamedTuple):
+    """
+    Outcome of a single DBT concerted-rotation closure attempt.
+
+    Returned by `propose_move`. Tuple-unpacking compatible (the previous
+    3-tuple return was `(new_positions, det_jacobian, success)`); the
+    `deltas` field was added in Step 8b so the caller can replay the
+    same per-dihedral rotations on a full-mol coordinate array (with
+    side-chain coupling) via `apply_dihedral_changes_full_mol`.
+
+    Fields:
+        new_positions: np.ndarray (7, 3) : new 7-atom backbone window
+            geometry. Equals the input positions when `success=False`.
+        det_jacobian: float : Wu-Deem |det J| at the closure solution
+            (or 0.0 on failure).
+        deltas: np.ndarray (4,) : the four dihedral changes applied
+            (drive_delta at drive_idx; the three closure-solver
+            outputs at the other indices). All zeros on failure.
+        success: bool : True iff the closure residual norm fell below
+            the tolerance.
+    """
+
+    new_positions: np.ndarray
+    det_jacobian: float
+    deltas: np.ndarray
+    success: bool
+
 
 # Closure tolerance: 6-residual norm (sum of squared r5 and r6 displacements)
 # below this counts as a successful close. The system is generically
@@ -172,6 +203,79 @@ def apply_dihedral_changes(positions: np.ndarray, deltas: np.ndarray) -> np.ndar
     return pos
 
 
+def apply_dihedral_changes_full_mol(
+    positions: np.ndarray,
+    window: list,
+    deltas: np.ndarray,
+    downstream_sets: list,
+) -> np.ndarray:
+    """
+    Apply DBT dihedral changes to a full-molecule coordinate array,
+    transporting side-chain atoms rigidly with their backbone parents.
+
+    Generalises `apply_dihedral_changes` from a self-contained 7-atom
+    chain to an arbitrary atom count. The 7-atom chain is identified by
+    indices into `positions` via `window`; per-dihedral rotation sets
+    are passed explicitly via `downstream_sets`.
+
+    For dihedral k (around the axis from positions[window[k+2]] to
+    positions[window[k+1]]), every atom in `downstream_sets[k]` rotates
+    rigidly by `deltas[k]` around the axis, with the pivot at
+    `positions[window[k+2]]`. Atoms not in any downstream set are left
+    untouched.
+
+    For a cyclic peptide window the appropriate `downstream_sets[k]` is
+    the union of the window's strictly-downstream backbone atoms
+    (window[k+3..6]) and the side-chain groups of window[k+2..6] —
+    see `mcmm._compute_window_downstream_sets`. The MCMM proposer
+    precomputes these sets once per window at factory-build time.
+
+    The 7-atom subset of positions[window] is updated identically to
+    `apply_dihedral_changes`, plus full-mol downstream atoms get the
+    same rigid rotation; bond lengths and bond angles are preserved
+    everywhere by construction (rigid rotations).
+
+    Params:
+        positions: np.ndarray (n_atoms, 3) : full-mol starting positions
+        window: list[int] : 7 atom indices into `positions`, in chain order
+        deltas: np.ndarray (4,) : dihedral changes in radians
+        downstream_sets: list of 4 iterables of int : full-mol atom
+            indices to rotate per dihedral. Order matches `deltas`.
+    Returns:
+        np.ndarray (n_atoms, 3) : new full-mol positions
+    """
+    if positions.ndim != 2 or positions.shape[1] != 3:
+        raise ValueError(f"positions must be (n_atoms, 3), got {positions.shape}")
+    if len(window) != 7:
+        raise ValueError(f"window must have 7 atom indices, got {len(window)}")
+    deltas = np.asarray(deltas, dtype=float)
+    if deltas.shape != (N_DIHEDRALS,):
+        raise ValueError(f"deltas must be ({N_DIHEDRALS},), got {deltas.shape}")
+    if len(downstream_sets) != N_DIHEDRALS:
+        raise ValueError(
+            f"downstream_sets must have {N_DIHEDRALS} entries, "
+            f"got {len(downstream_sets)}"
+        )
+
+    pos = positions.copy().astype(float)
+    for k in range(N_DIHEDRALS):
+        delta = float(deltas[k])
+        if delta == 0.0:
+            continue
+        a = window[k + 1]
+        b = window[k + 2]
+        axis_vec = pos[a] - pos[b]
+        axis_norm = float(np.linalg.norm(axis_vec))
+        if axis_norm < 1e-12:
+            continue
+        axis = axis_vec / axis_norm
+        R = rotation_matrix(axis, delta)
+        pivot = pos[b]
+        for idx in downstream_sets[k]:
+            pos[idx] = pivot + R @ (pos[idx] - pivot)
+    return pos
+
+
 def _expand_deltas(
     drive_idx: int, drive_delta: float, free_deltas: np.ndarray
 ) -> np.ndarray:
@@ -228,7 +332,7 @@ def propose_move(
     drive_delta: float,
     closure_tol: float = DEFAULT_CLOSURE_TOL,
     max_solver_iter: int = 50,
-) -> tuple:
+) -> MoveProposal:
     """
     Propose a concerted-rotation move with the given drive perturbation.
 
@@ -239,8 +343,9 @@ def propose_move(
          r5 and r6) and 3 unknowns; least_squares handles the
          over-constraint gracefully.
       2. Check closure: if the residual norm exceeds closure_tol, the
-         move is geometrically infeasible. Return (positions, 0.0, False)
-         so the caller can reject without paying for MMFF.
+         move is geometrically infeasible. Return a MoveProposal with
+         `success=False` so the caller can reject without paying for
+         MMFF.
       3. Compute |det J| via finite differences (Wu-Deem 1999 detailed
          balance correction).
 
@@ -251,11 +356,11 @@ def propose_move(
         closure_tol: float : maximum acceptable residual norm in Å
         max_solver_iter: int : least_squares iteration cap
     Returns:
-        new_positions: np.ndarray (7, 3) : new chain geometry; equal to
-            input positions when success=False
-        det_jacobian: float : |det J| of the 3 free dihedrals w.r.t. the
-            drive angle, evaluated at the solution; 0.0 when success=False
-        success: bool : True iff the closure residual is below closure_tol
+        MoveProposal : NamedTuple with fields (new_positions,
+            det_jacobian, deltas, success). Tuple-unpackable as a
+            4-tuple. The `deltas` field is the (4,) array of dihedral
+            changes applied — drive_delta at drive_idx, closure-solver
+            outputs at the other three positions. All zeros on failure.
     """
     if not (0 <= drive_idx < N_DIHEDRALS):
         raise ValueError(
@@ -276,7 +381,12 @@ def propose_move(
 
     residual_norm = float(np.linalg.norm(result.fun))
     if residual_norm > closure_tol:
-        return positions.copy(), 0.0, False
+        return MoveProposal(
+            new_positions=positions.copy(),
+            det_jacobian=0.0,
+            deltas=np.zeros(N_DIHEDRALS),
+            success=False,
+        )
 
     deltas = _expand_deltas(drive_idx, drive_delta, result.x)
     new_positions = apply_dihedral_changes(positions, deltas)
@@ -284,7 +394,12 @@ def propose_move(
         positions, drive_idx, drive_delta, result.x, closure_tol
     )
 
-    return new_positions, det_j, True
+    return MoveProposal(
+        new_positions=new_positions,
+        det_jacobian=det_j,
+        deltas=deltas,
+        success=True,
+    )
 
 
 def _finite_difference_det_jacobian(
