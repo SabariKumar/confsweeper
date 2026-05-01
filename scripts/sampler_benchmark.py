@@ -61,6 +61,7 @@ import click
 import numpy as np
 import pandas as pd
 import torch
+from rdkit import Chem
 
 # fmt: off
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -111,8 +112,71 @@ OUTPUT_COLUMNS = [
 ]
 
 
+def _maybe_dump_sdf(
+    mol: Chem.Mol,
+    conf_ids: list,
+    energies_eV: list,
+    peptide_id: str,
+    sampler: str,
+    dump_sdf_dir,
+) -> None:
+    """
+    Write the basin centroids of a single (peptide, sampler) run to an SDF
+    file, one conformer per centroid, with per-conformer `MACE_ENERGY`
+    in eV. No-op if `dump_sdf_dir` is None.
+
+    Output path is `<dump_sdf_dir>/<safe_peptide_id>_<sampler>.sdf` where
+    `safe_peptide_id` strips ':' and '/' to make a filesystem-safe name.
+
+    Used for diagnostic visualisation — load these in PyMOL or RDKit's
+    conformer viewer to inspect ring topology, side-chain rotamers, and
+    spread of the basin set. The deferred Step 18 (DBT analytical
+    polynomial branches) is gated on observing whether MCMM runs ever
+    produce ring-topology changes; SDF dumps are how we'll find out.
+
+    Params:
+        mol: Chem.Mol : the mol returned by `get_mol_PE_*`, with basin
+            centroids attached as conformers.
+        conf_ids: list[int] : conformer IDs to write, in the order
+            produced by the sampler (ascending energy by convention).
+        energies_eV: list[float] : per-conformer MACE energies, same
+            order as conf_ids; written as the `MACE_ENERGY` SDF prop.
+        peptide_id: str : peptide identifier, used in the filename.
+        sampler: str : sampler name, used in the filename.
+        dump_sdf_dir: Path | None : directory to write into. None
+            disables the dump entirely.
+    Returns:
+        None
+    """
+    if dump_sdf_dir is None:
+        return
+    dump_sdf_dir = Path(dump_sdf_dir)
+    dump_sdf_dir.mkdir(parents=True, exist_ok=True)
+    safe_id = peptide_id.replace(":", "_").replace("/", "_")
+    out_path = dump_sdf_dir / f"{safe_id}_{sampler}.sdf"
+    writer = Chem.SDWriter(str(out_path))
+    try:
+        mol.SetProp("peptide_id", peptide_id)
+        mol.SetProp("sampler", sampler)
+        for cid, energy in zip(conf_ids, energies_eV):
+            mol.SetDoubleProp("MACE_ENERGY", float(energy))
+            writer.write(mol, confId=cid)
+    finally:
+        writer.close()
+    logger.info(
+        "  → dumped %d basin centroids to %s",
+        len(conf_ids),
+        out_path,
+    )
+
+
 def _run_exhaustive_etkdg(
-    peptide: dict, n_seeds: int, hardware_opts, calc, grids: dict | None
+    peptide: dict,
+    n_seeds: int,
+    hardware_opts,
+    calc,
+    grids: dict | None,
+    dump_sdf_dir=None,
 ) -> list[float]:
     """
     Adapter: run get_mol_PE_exhaustive at saturation-validated defaults.
@@ -132,18 +196,31 @@ def _run_exhaustive_etkdg(
     """
     del grids  # unused by this adapter
     params = get_embed_params_macrocycle()
-    _, _, energies_eV = get_mol_PE_exhaustive(
+    mol, conf_ids, energies_eV = get_mol_PE_exhaustive(
         peptide["smiles"],
         params,
         hardware_opts,
         calc,
         n_seeds=n_seeds,
     )
+    _maybe_dump_sdf(
+        mol,
+        conf_ids,
+        energies_eV,
+        peptide["peptide_id"],
+        "exhaustive_etkdg",
+        dump_sdf_dir,
+    )
     return energies_eV
 
 
 def _run_pool_b(
-    peptide: dict, n_seeds: int, hardware_opts, calc, grids: dict | None
+    peptide: dict,
+    n_seeds: int,
+    hardware_opts,
+    calc,
+    grids: dict | None,
+    dump_sdf_dir=None,
 ) -> list[float]:
     """
     Adapter: run get_mol_PE_pool_b with strategy='inverse' and n_attempts=1.
@@ -166,30 +243,64 @@ def _run_pool_b(
         raise ValueError(
             "pool_b sampler requires Ramachandran grids; pass --ramachandran_grids"
         )
-    _, _, energies_eV = get_mol_PE_pool_b(
+    mol, conf_ids, energies_eV = get_mol_PE_pool_b(
         peptide["smiles"],
         grids,
         hardware_opts,
         calc,
         n_samples=n_seeds,
     )
+    _maybe_dump_sdf(
+        mol,
+        conf_ids,
+        energies_eV,
+        peptide["peptide_id"],
+        "pool_b",
+        dump_sdf_dir,
+    )
     return energies_eV
 
 
 def _run_mcmm(
-    peptide: dict, n_seeds: int, hardware_opts, calc, grids: dict | None
+    peptide: dict,
+    n_seeds: int,
+    hardware_opts,
+    calc,
+    grids: dict | None,
+    dump_sdf_dir=None,
 ) -> list[float]:
     """
     Adapter: run get_mol_PE_mcmm with the issue-#11 default temperature
-    ladder (8 temps × 8 walkers = 64 walkers, 300 K → 600 K geometric)
-    and `n_steps` derived from `n_seeds` so the total MMFF minimisation
-    budget matches `exhaustive_etkdg`'s for the same `--n_seeds`.
+    ladder (8 temps × 8 walkers = 64 walkers) and `n_steps` derived from
+    `n_seeds` so the total MMFF minimisation budget matches
+    `exhaustive_etkdg`'s for the same `--n_seeds`.
 
     Mapping: MCMM costs roughly one MMFF call per walker per step. At
-    the default 64 walkers, `n_steps = n_seeds // 64` keeps total MMFF
-    work proportional to `n_seeds`. For the saturation-validated
+    64 walkers, `n_steps = n_seeds // 64` keeps total MMFF work
+    proportional to `n_seeds`. For the saturation-validated
     `n_seeds=10000` this gives 156 steps per walker (12 480 total
     minimisations, within ~25 % of exhaustive ETKDG's headline budget).
+
+    **Tuning experiment (cremp_typical diagnosis, 2026-04-29).** The
+    default `drive_sigma_rad=0.1` / `closure_tol=0.01` / `kt_high=2 ×
+    kT_298K` produced 1 basin on cremp_typical (basin-collapse pattern:
+    160 Metropolis-accepted moves all within `rmsd_threshold=0.1` of
+    the seed; swap_accept_rate=0.96 confirming all replicas in the
+    same basin). Hardcoding more aggressive values here:
+      * `drive_sigma_rad=0.3`  : ~17° backbone moves vs. ~5.7° default;
+        bigger perturbations push past the seed's MMFF gradient.
+      * `closure_tol=0.05`     : pairs with the larger drive; stays
+        within MMFF's basin-recovery range per the module docstring.
+      * `kt_high=4 × kT_298K`  : ~1200 K hot end of the ladder, four
+        times the cold end; widens the swap_accept regime toward
+        ~40 %.
+      * `n_init_confs=8`       : multi-seed initialisation (lever C9 in
+        docs/mcmm_plan.md). Embeds 8 distinct ETKDG seed conformers
+        instead of 1; walkers distribute round-robin across them so
+        each temperature stack gets exposure to every starting basin.
+        Directly addresses the structural problem that all 64 walkers
+        previously started in the same basin.
+    Roll back to defaults once benchmark data confirms the diagnosis.
 
     The `grids` argument is unused — MCMM does not consume the
     Ramachandran prior.
@@ -210,7 +321,10 @@ def _run_mcmm(
     n_temperatures = 8
     n_walkers = n_walkers_per_temp * n_temperatures
     n_steps = max(1, n_seeds // n_walkers)
-    _, _, energies_eV = get_mol_PE_mcmm(
+    # Hardcoded tuning experiment — see docstring above.
+    from confsweeper import _KT_EV_298K
+
+    mol, conf_ids, energies_eV = get_mol_PE_mcmm(
         peptide["smiles"],
         params,
         hardware_opts,
@@ -218,6 +332,18 @@ def _run_mcmm(
         n_walkers_per_temp=n_walkers_per_temp,
         n_temperatures=n_temperatures,
         n_steps=n_steps,
+        drive_sigma_rad=0.3,
+        closure_tol=0.05,
+        kt_high=4.0 * _KT_EV_298K,
+        n_init_confs=8,
+    )
+    _maybe_dump_sdf(
+        mol,
+        conf_ids,
+        energies_eV,
+        peptide["peptide_id"],
+        "mcmm",
+        dump_sdf_dir,
     )
     return energies_eV
 
@@ -276,6 +402,7 @@ def run_one(
     hardware_opts,
     calc,
     grids: dict | None,
+    dump_sdf_dir=None,
 ) -> dict:
     """
     Run one sampler on one peptide, compute basin metrics, return a row dict.
@@ -287,12 +414,17 @@ def run_one(
         hardware_opts : nvmolkit hardware options
         calc : MACE calculator
         grids: dict | None : CREMP Ramachandran grids (required by pool_b)
+        dump_sdf_dir: Path | None : if set, the adapter writes an SDF of
+            the basin centroids to this directory; one file per
+            (peptide, sampler) pair.
     Returns:
         dict with all OUTPUT_COLUMNS populated for this run
     """
     runner = SAMPLERS[sampler]
     t0 = time.perf_counter()
-    energies_eV = runner(peptide, n_seeds, hardware_opts, calc, grids)
+    energies_eV = runner(
+        peptide, n_seeds, hardware_opts, calc, grids, dump_sdf_dir=dump_sdf_dir
+    )
     t_total = time.perf_counter() - t0
 
     metrics = _bw_metrics(energies_eV)
@@ -352,6 +484,15 @@ def run_one(
 @click.option(
     "--smiles_col", default="SMILES", help="SMILES column name in the PAMPA CSV"
 )
+@click.option(
+    "--dump_sdf_dir",
+    default=None,
+    type=Path,
+    help="If set, write basin centroids to <dir>/<peptide_id>_<sampler>.sdf "
+    "for each (peptide, sampler) cell. MACE_ENERGY is set per conformer "
+    "in eV. Diagnostic; PyMOL / RDKit conformer viewer can load these to "
+    "inspect basin geometry, ring topology, and side-chain rotamers.",
+)
 def main(
     cremp_csv: Path,
     pampa_csv: Path,
@@ -360,6 +501,7 @@ def main(
     n_seeds: int,
     ramachandran_grids: Path,
     smiles_col: str,
+    dump_sdf_dir: Path | None,
 ) -> None:
     """
     Benchmark each requested sampler against the same five peptides at a
@@ -433,7 +575,15 @@ def main(
                 n_seeds,
             )
             try:
-                row = run_one(peptide, sampler, n_seeds, hw, calc, grids)
+                row = run_one(
+                    peptide,
+                    sampler,
+                    n_seeds,
+                    hw,
+                    calc,
+                    grids,
+                    dump_sdf_dir=dump_sdf_dir,
+                )
             except Exception as exc:
                 logger.exception(
                     "Failed %s sampler=%s n=%d: %s",

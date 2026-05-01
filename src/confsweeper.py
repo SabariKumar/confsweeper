@@ -40,6 +40,7 @@ The three pipelines share the same return contract, so downstream consumers
 """
 
 import contextlib
+import logging
 import os
 import random
 import uuid
@@ -69,6 +70,8 @@ from torsional_sampling import load_ramachandran_grids, sample_constrained_confs
 
 warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
+
+logger = logging.getLogger("confsweeper")
 
 RANDOM_SEED = 42
 rd = random.Random()
@@ -1015,6 +1018,7 @@ def get_mol_PE_mcmm(
     rmsd_threshold: float = 0.1,
     minimize: bool = True,
     mmff_backend: str = "gpu",
+    n_init_confs: int = 1,
     seed: int = 0,
 ) -> Tuple[Chem.Mol, List[int], List[float]]:
     """
@@ -1081,6 +1085,17 @@ def get_mol_PE_mcmm(
             normalised L1 units (matches `_energy_ranked_dedup`)
         minimize: bool : MMFF94-minimise the seed and final basins
         mmff_backend: str : 'gpu' (nvmolkit) or 'cpu' (RDKit serial)
+        n_init_confs: int : number of distinct ETKDG seed conformers
+            (default 1, the original behaviour). With n_init_confs > 1,
+            ETKDG embeds that many seeds and walkers are distributed
+            round-robin across them — walker `i` starts at seed
+            `i % n_init_confs`. Round-robin (vs. block) means each
+            temperature stack gets exposure to every seed basin, which
+            preserves replica-exchange's mixing behaviour. The basin
+            memory ends up pre-populated with up to `n_init_confs`
+            distinct basins after walker construction (deduped per
+            `rmsd_threshold`), giving MCMM a head start over the
+            single-seed default. Lever C9 in docs/mcmm_plan.md.
         seed: int : base seed; derived seeds are produced for each
             walker, the proposer, and the swap RNG by adding fixed
             offsets, so two runs with the same seed are deterministic
@@ -1096,12 +1111,17 @@ def get_mol_PE_mcmm(
         kt_low = _KT_EV_298K
     if kt_high is None:
         kt_high = 2.0 * _KT_EV_298K
+    if n_init_confs < 1:
+        raise ValueError(f"n_init_confs must be >= 1, got {n_init_confs}")
 
-    # 1. Build seed conformer: ETKDG + MMFF + MACE-score for initial energy.
+    # 1. Build seed conformer(s): ETKDG embed + MMFF + MACE-score per
+    # seed for its initial energy. With n_init_confs > 1 we embed that
+    # many distinct conformers up front; walkers later distribute
+    # round-robin across them (lever C9 in docs/mcmm_plan.md).
     mol = Chem.AddHs(Chem.MolFromSmiles(smi))
     params.randomSeed = seed
     embed.EmbedMolecules(
-        [mol], params, confsPerMolecule=1, hardwareOptions=hardware_opts
+        [mol], params, confsPerMolecule=n_init_confs, hardwareOptions=hardware_opts
     )
     if mol.GetNumConformers() == 0:
         return mol, [], []
@@ -1114,7 +1134,8 @@ def get_mol_PE_mcmm(
         elif mmff_backend == "cpu":
             from rdkit.Chem import AllChem
 
-            AllChem.MMFFOptimizeMolecule(mol, confId=0)
+            for cid in [c.GetId() for c in mol.GetConformers()]:
+                AllChem.MMFFOptimizeMolecule(mol, confId=cid)
         else:
             raise ValueError(
                 f"unknown mmff_backend {mmff_backend!r}; expected 'gpu' or 'cpu'"
@@ -1122,26 +1143,45 @@ def get_mol_PE_mcmm(
 
     n_atoms = mol.GetNumAtoms()
     atomic_nums = [a.GetAtomicNum() for a in mol.GetAtoms()]
-    initial_coords_np = np.asarray(mol.GetConformer(0).GetPositions(), dtype=np.float64)
-    initial_ase = ase.Atoms(positions=initial_coords_np, numbers=atomic_nums)
-    initial_energy = float(_mace_batch_energies(calc, [initial_ase])[0])
-    initial_coords = torch.tensor(initial_coords_np, dtype=torch.float64)
+    seed_conf_ids = [c.GetId() for c in mol.GetConformers()]
+    n_actual_seeds = len(seed_conf_ids)
+
+    # MACE-score every embedded seed in one batched call. Each walker's
+    # initial energy is its assigned seed's energy.
+    seed_ase_mols = [
+        ase.Atoms(
+            positions=mol.GetConformer(cid).GetPositions(),
+            numbers=atomic_nums,
+        )
+        for cid in seed_conf_ids
+    ]
+    seed_energies = [float(e) for e in _mace_batch_energies(calc, seed_ase_mols)]
+    seed_coords_list = [
+        torch.tensor(mol.GetConformer(cid).GetPositions(), dtype=torch.float64)
+        for cid in seed_conf_ids
+    ]
 
     # 2. Build the shared basin memory.
     memory = BasinMemory(n_atoms=n_atoms, rmsd_threshold=rmsd_threshold)
 
     # 3. Build the temperature ladder and walkers. Per-walker random_fns
     # use deterministic offsets from `seed` so replicate runs are
-    # reproducible without sharing global RNG state.
+    # reproducible without sharing global RNG state. Walkers distribute
+    # round-robin across the embedded seeds: walker w (with global index
+    # t * n_walkers_per_temp + i) starts at seed `w % n_actual_seeds`.
+    # Round-robin (rather than block) gives each temperature stack
+    # exposure to every seed basin, preserving REMD's mixing behaviour.
     kts = _geometric_temperature_ladder(kt_low, kt_high, n_temperatures)
     walkers_by_temp: List[List] = []
     for t, kt in enumerate(kts):
         group = []
         for i in range(n_walkers_per_temp):
-            walker_rng = np.random.default_rng(seed + 1_000_003 + t * 100 + i)
+            walker_idx_global = t * n_walkers_per_temp + i
+            seed_idx = walker_idx_global % n_actual_seeds
+            walker_rng = np.random.default_rng(seed + 1_000_003 + walker_idx_global)
             walker = MCMMWalker(
-                initial_coords,
-                initial_energy,
+                seed_coords_list[seed_idx],
+                seed_energies[seed_idx],
                 kt=kt,
                 memory=memory,
                 random_fn=walker_rng.random,
@@ -1169,6 +1209,33 @@ def get_mol_PE_mcmm(
         swap_random_fn=swap_rng.random,
     )
     driver.run(n_steps)
+
+    # Diagnostic log so the "1 basin" pathology on small peptides is
+    # easy to triage: closure-failure rate near 1.0 means DBT can't find
+    # closing geometries (try looser closure_tol or larger
+    # drive_sigma_rad); low Metropolis acceptance with healthy closure
+    # means moves get rejected on energy alone (rare on small peptides);
+    # low swap rate means the temperature ladder is too wide.
+    proposer_stats = getattr(batch_propose_fn, "stats", None) or {}
+    n_proposed = int(proposer_stats.get("n_proposed", 0))
+    n_closure_failures = int(proposer_stats.get("n_closure_failures", 0))
+    closure_failure_rate = (
+        n_closure_failures / n_proposed if n_proposed > 0 else float("nan")
+    )
+    metropolis_accept_rate = (
+        driver.n_accepted / n_proposed if n_proposed > 0 else float("nan")
+    )
+    logger.info(
+        "MCMM diagnostics for %r: n_proposed=%d, closure_failure_rate=%.3f, "
+        "metropolis_accept_rate=%.3f, swap_accept_rate=%.3f, "
+        "basins_in_memory=%d (incl. initial)",
+        smi,
+        n_proposed,
+        closure_failure_rate,
+        metropolis_accept_rate,
+        driver.swap_acceptance_rate,
+        memory.n_basins,
+    )
 
     # 6. Extract the basin set as conformers on the mol. Drop the seed
     # conformer first; we re-add the basin representatives below. Each

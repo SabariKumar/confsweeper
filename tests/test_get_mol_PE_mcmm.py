@@ -372,3 +372,120 @@ def test_mcmm_default_temperature_endpoints():
 
     assert captured["kts"][0] == pytest.approx(_KT_EV_298K)
     assert captured["kts"][-1] == pytest.approx(2.0 * _KT_EV_298K)
+
+
+# ---------------------------------------------------------------------------
+# get_mol_PE_mcmm — multi-seed initialisation (lever C9)
+# ---------------------------------------------------------------------------
+
+
+def test_mcmm_multi_seed_embeds_n_init_confs_etkdg_seeds():
+    """`n_init_confs=K` makes the function call ETKDG with
+    `confsPerMolecule=K`, embedding K distinct seed conformers up
+    front. With the no-exploration stub proposer, no MC moves change
+    the picture; the resulting basin set after dedup reflects the K
+    distinct seeds."""
+    embed_call_args = {}
+
+    def _capture_embed(mols, params, confsPerMolecule, hardwareOptions):
+        embed_call_args["confsPerMolecule"] = confsPerMolecule
+        # Add `confsPerMolecule` random conformers via CPU ETKDG so the
+        # rest of the pipeline has something to MMFF/score.
+        for m in mols:
+            AllChem.EmbedMultipleConfs(
+                m,
+                numConfs=confsPerMolecule,
+                randomSeed=params.randomSeed,
+                clearConfs=False,
+            )
+
+    mock_mace = _make_seq_mock_mace()
+    with (
+        patch("confsweeper.embed.EmbedMolecules", side_effect=_capture_embed),
+        patch("confsweeper._mace_batch_energies", side_effect=mock_mace),
+        patch(
+            "nvmolkit.mmffOptimization.MMFFOptimizeMoleculesConfs",
+            return_value=[[]],
+        ),
+        patch("confsweeper.make_mcmm_proposer", side_effect=_stub_proposer_factory),
+    ):
+        get_mol_PE_mcmm(
+            TEST_SMILES,
+            get_embed_params(),
+            hardware_opts=None,
+            calc=MagicMock(),
+            n_walkers_per_temp=2,
+            n_temperatures=2,
+            n_steps=1,
+            n_init_confs=8,
+            rmsd_threshold=0.0,
+        )
+
+    assert embed_call_args["confsPerMolecule"] == 8
+
+
+def test_mcmm_multi_seed_distributes_walkers_round_robin():
+    """With n_init_confs distinct seeds and N walkers, the basin memory
+    after construction holds up to n_init_confs basins (one per
+    distinct seed). Round-robin distribution: walker w starts at seed
+    `w % n_init_confs`. With rmsd_threshold = 0 every seed is unique,
+    so basin memory exactly hits n_init_confs after construction."""
+
+    def _embed_distinct_seeds(mols, params, confsPerMolecule, hardwareOptions):
+        # Embed distinct conformers via CPU ETKDG. With rmsd_threshold=0
+        # downstream, each seed will be its own basin.
+        for m in mols:
+            AllChem.EmbedMultipleConfs(
+                m,
+                numConfs=confsPerMolecule,
+                randomSeed=params.randomSeed,
+                clearConfs=False,
+            )
+
+    mock_mace = _make_seq_mock_mace()
+    with (
+        patch("confsweeper.embed.EmbedMolecules", side_effect=_embed_distinct_seeds),
+        patch("confsweeper._mace_batch_energies", side_effect=mock_mace),
+        patch(
+            "nvmolkit.mmffOptimization.MMFFOptimizeMoleculesConfs",
+            return_value=[[]],
+        ),
+        patch("confsweeper.make_mcmm_proposer", side_effect=_stub_proposer_factory),
+    ):
+        mol, centroid_ids, energies = get_mol_PE_mcmm(
+            TEST_SMILES,
+            get_embed_params(),
+            hardware_opts=None,
+            calc=MagicMock(),
+            n_walkers_per_temp=2,
+            n_temperatures=2,  # 4 walkers total
+            n_steps=1,
+            n_init_confs=4,
+            rmsd_threshold=0.0,
+            e_window_kT=1e9,  # don't drop any basin via energy filter
+        )
+    # 4 walkers across 4 distinct seeds → 4 distinct basins in memory.
+    # The shared tail with rmsd_threshold=0 / e_window=∞ keeps all 4.
+    assert len(centroid_ids) == 4
+    assert mol.GetNumConformers() == 4
+
+
+def test_mcmm_multi_seed_invalid_count_raises():
+    """`n_init_confs < 1` is rejected at the entry point."""
+    mock_mace = _make_seq_mock_mace()
+    with (
+        patch("confsweeper.embed.EmbedMolecules", side_effect=_mock_etkdg_embed),
+        patch("confsweeper._mace_batch_energies", side_effect=mock_mace),
+        patch("confsweeper.make_mcmm_proposer", side_effect=_stub_proposer_factory),
+    ):
+        with pytest.raises(ValueError, match="n_init_confs must be >= 1"):
+            get_mol_PE_mcmm(
+                TEST_SMILES,
+                get_embed_params(),
+                hardware_opts=None,
+                calc=MagicMock(),
+                n_walkers_per_temp=1,
+                n_temperatures=2,
+                n_steps=1,
+                n_init_confs=0,
+            )

@@ -114,14 +114,15 @@ def test_returns_empty_for_non_peptide():
     assert enumerate_backbone_windows(mol) == []
 
 
-def test_raises_for_linear_peptide():
-    """A linear (non-cyclic) peptide raises ValueError because the C→N walk
-    cannot close the ring."""
+def test_returns_empty_for_linear_peptide():
+    """A linear (non-cyclic) peptide has no rings, so ring-info-based
+    enumeration returns []. The MCMM proposer factory then raises a
+    clearer 'no enumerable backbone windows' error at construction
+    time."""
     # Linear tripeptide H-Ala-Ala-Ala-OH
     linear = "C[C@@H](N)C(=O)N[C@@H](C)C(=O)N[C@@H](C)C(=O)O"
     mol = Chem.AddHs(Chem.MolFromSmiles(linear))
-    with pytest.raises(ValueError, match="ring did not close"):
-        enumerate_backbone_windows(mol)
+    assert enumerate_backbone_windows(mol) == []
 
 
 # ---------------------------------------------------------------------------
@@ -1510,3 +1511,200 @@ def test_compute_window_downstream_sets_monotone_in_dihedral_index():
         assert (
             sizes[k] >= sizes[k + 1]
         ), f"size[{k}]={sizes[k]} should be >= size[{k+1}]={sizes[k+1]}"
+
+
+# ---------------------------------------------------------------------------
+# Regression: real cyclic peptide that triggered the original close-walk bug
+# ---------------------------------------------------------------------------
+
+# Reported in an end-to-end run of scripts/sampler_benchmark.py: this is a
+# head-to-tail cyclic peptide containing several NMe residues, one Pro,
+# and one Phe — a real entry from the PAMPA benchmark set. Under the
+# original strict single-start C→N walk it raised "Backbone ring did not
+# close: walked 8 of 8 residues" because the SMARTS produced extra
+# matches outside the main ring (or the start residue was on a non-cycle
+# spur). The longest-cycle-wins algorithm in `_ordered_backbone_residues`
+# recovers the macrocycle correctly.
+_PROBLEMATIC_REAL_PEPTIDE = (
+    "CC(C)C[C@@H]1C(=O)N(C)[C@@H](CC(C)C)C(=O)N2CCC[C@@H]2C(=O)N(C)"
+    "[C@@H](CC(C)C)C(=O)N[C@@H](Cc2ccccc2)C(=O)N(C)[C@@H](C)C(=O)N1C"
+)
+
+
+def test_ordered_residues_handles_problematic_real_peptide():
+    """Real peptide that originally crashed `_ordered_backbone_residues`
+    under the strict single-start walk. The robust longest-cycle-wins
+    algorithm must recover a non-empty cyclic ordering with proper
+    peptide-bond connectivity."""
+    mol = Chem.AddHs(Chem.MolFromSmiles(_PROBLEMATIC_REAL_PEPTIDE))
+    residues = _ordered_backbone_residues(mol)
+    # The macrocycle has at least 6 backbone residues; the algorithm
+    # should recover all of them (extra SMARTS matches that aren't on
+    # the main ring are silently dropped via the longest-cycle rule).
+    assert len(residues) >= 6
+    # Each (N, Cα, C) tuple has 3 distinct atom indices
+    for n_idx, ca_idx, c_idx in residues:
+        assert len({n_idx, ca_idx, c_idx}) == 3
+    # Peptide-bond connectivity: residue i's C bonds to residue (i+1)'s N,
+    # including the wrap-around from last to first.
+    n_res = len(residues)
+    for i in range(n_res):
+        _, _, c = residues[i]
+        n_next, _, _ = residues[(i + 1) % n_res]
+        assert (
+            mol.GetBondBetweenAtoms(c, n_next) is not None
+        ), f"peptide bond missing between recovered residue {i} and {(i+1) % n_res}"
+
+
+def test_enumerate_windows_for_problematic_real_peptide():
+    """End-to-end: `enumerate_backbone_windows` returns 7-atom windows for
+    every backbone atom of the recovered cycle on the same peptide that
+    originally crashed."""
+    mol = Chem.AddHs(Chem.MolFromSmiles(_PROBLEMATIC_REAL_PEPTIDE))
+    windows = enumerate_backbone_windows(mol)
+    # 3K windows for K-residue cycle; K >= 6 → at least 18 windows
+    assert len(windows) >= 18
+    for window in windows:
+        assert len(window) == WINDOW_SIZE
+        assert len(set(window)) == WINDOW_SIZE
+
+
+# ---------------------------------------------------------------------------
+# make_mcmm_proposer — diagnostic stats counter
+# ---------------------------------------------------------------------------
+
+
+def test_make_mcmm_proposer_stats_initialized_to_zero():
+    """The proposer factory attaches a `.stats` dict initialised to zeros
+    (no calls yet means no proposals counted)."""
+    mol = _cycloala_mol(4)
+    proposer = make_mcmm_proposer(mol, hardware_opts=None, calc=None, seed=0)
+    assert hasattr(proposer, "stats")
+    assert proposer.stats == {
+        "n_proposed": 0,
+        "n_closure_failures": 0,
+        "n_closure_successes": 0,
+    }
+
+
+def test_make_mcmm_proposer_stats_increment_per_call():
+    """After a batched call, `n_proposed` equals the number of walkers and
+    `n_closure_successes + n_closure_failures` matches `n_proposed`."""
+    mol = _cycloala_mol(4)
+    proposer, patched = _make_real_proposer_with_mocks(mol, seed=42)
+    seed_coords = _seed_full_mol_coords(mol)
+
+    # First call: 5 walkers
+    coords_list = [seed_coords.clone() for _ in range(5)]
+    with patched():
+        proposer(coords_list)
+    assert proposer.stats["n_proposed"] == 5
+    closures_so_far = (
+        proposer.stats["n_closure_successes"] + proposer.stats["n_closure_failures"]
+    )
+    assert closures_so_far == 5
+
+    # Second call: 3 walkers — counters accumulate.
+    coords_list = [seed_coords.clone() for _ in range(3)]
+    with patched():
+        proposer(coords_list)
+    assert proposer.stats["n_proposed"] == 8
+    closures_so_far = (
+        proposer.stats["n_closure_successes"] + proposer.stats["n_closure_failures"]
+    )
+    assert closures_so_far == 8
+
+
+def test_make_mcmm_proposer_stats_match_returned_success_flags():
+    """Cumulative closure-success count equals the number of returned
+    proposals with success=True. Locks the bookkeeping against the
+    per-walker proposal contract."""
+    mol = _cycloala_mol(4)
+    proposer, patched = _make_real_proposer_with_mocks(mol, seed=7)
+    seed_coords = _seed_full_mol_coords(mol)
+    coords_list = [seed_coords.clone() for _ in range(8)]
+    with patched():
+        proposals = proposer(coords_list)
+    n_success_returned = sum(1 for p in proposals if p[3])
+    assert proposer.stats["n_closure_successes"] == n_success_returned
+    assert (
+        proposer.stats["n_closure_failures"]
+        == proposer.stats["n_proposed"] - n_success_returned
+    )
+
+
+def test_make_mcmm_proposer_stats_record_failure_when_tol_unreachable():
+    """With an absurdly tight closure_tol, every proposal fails. Stats
+    reflect this: n_closure_failures = n_proposed, n_closure_successes = 0."""
+    mol = _cycloala_mol(4)
+    proposer, patched = _make_real_proposer_with_mocks(
+        mol, drive_sigma_rad=0.5, closure_tol=1e-30, seed=99
+    )
+    seed_coords = _seed_full_mol_coords(mol)
+    coords_list = [seed_coords.clone() for _ in range(4)]
+    with patched():
+        proposals = proposer(coords_list)
+    assert all(not p[3] for p in proposals)
+    assert proposer.stats["n_closure_successes"] == 0
+    assert proposer.stats["n_closure_failures"] == 4
+    assert proposer.stats["n_proposed"] == 4
+
+
+# ---------------------------------------------------------------------------
+# Regression: depsipeptide (peptide with ester linker in the macrocycle ring)
+# ---------------------------------------------------------------------------
+
+# Real PAMPA peptide that originally crashed `_ordered_backbone_residues`
+# because the strict amide-only SMARTS missed the residues adjacent to
+# the ester `OC(=O)` linker. The relaxed `_MCMM_BACKBONE_SMARTS` matches
+# both N and O at the linker positions, so the macrocycle closes
+# correctly.
+_FAILING_DEPSIPEPTIDE = (
+    "[H]N1C(=O)[C@]([H])(C([H])([H])C([H])(C([H])([H])[H])C([H])([H])[H])"
+    "N([H])C(=O)[C@]([H])(C([H])([H])C([H])(C([H])([H])[H])C([H])([H])[H])"
+    "N([H])C(=O)[C@]([H])(C([H])([H])C([H])(C([H])([H])[H])C([H])([H])[H])"
+    "N([H])C(=O)[C@@]([H])(N([H])C(=O)[C@@]([H])(N(C(=O)[C@]2([H])"
+    "N(C(=O)C([H])([H])[H])C([H])([H])C([H])([H])C2([H])[H])C([H])([H])[H])"
+    "C([H])([H])C([H])(C([H])([H])[H])C([H])([H])[H])"
+    "[C@@]([H])(C([H])([H])[H])OC(=O)[C@]2([H])"
+    "N(C(=O)[C@]([H])(C([H])([H])C([H])(C([H])([H])[H])C([H])([H])[H])"
+    "N([H])C(=O)[C@]1([H])C([H])([H])[H])C([H])([H])C([H])([H])C2([H])[H]"
+)
+
+
+def test_enumerate_windows_for_depsipeptide():
+    """Real PAMPA peptide with an `OC(=O)` ester linker AND a Cα-Cα bond
+    closing the macrocycle (canonical SMILES shows ring 1 closing as
+    `[C@@H]1...[C@@H]1`). Both features fall outside the strict
+    amide-residue SMARTS pattern. The ring-info-based
+    `enumerate_backbone_windows` walks the macrocycle directly and
+    handles arbitrary cyclic-backbone topologies."""
+    mol = Chem.MolFromSmiles(_FAILING_DEPSIPEPTIDE)
+    assert mol is not None, "test SMILES failed to parse"
+    windows = enumerate_backbone_windows(mol)
+    # The macrocycle is the largest ring; for this PAMPA peptide it is
+    # well above the 7-atom minimum.
+    assert len(windows) >= 7
+    # Each window: 7 distinct atoms, sequentially bonded around the ring.
+    for window in windows:
+        assert len(window) == WINDOW_SIZE
+        assert len(set(window)) == WINDOW_SIZE
+        for i in range(WINDOW_SIZE - 1):
+            assert mol.GetBondBetweenAtoms(window[i], window[i + 1]) is not None
+
+
+def test_enumerate_windows_handles_macrocycle_with_ester_linker():
+    """The macrocycle of the failing depsipeptide includes at least one
+    oxygen ring atom (the ester O linker). Ring-info enumeration treats
+    it just like any other ring atom, so it can appear at any position
+    in a 7-atom window."""
+    mol = Chem.MolFromSmiles(_FAILING_DEPSIPEPTIDE)
+    ring_atom_set = set()
+    for window in enumerate_backbone_windows(mol):
+        ring_atom_set.update(window)
+    ring_atomic_nums = {mol.GetAtomWithIdx(idx).GetAtomicNum() for idx in ring_atom_set}
+    # Macrocycle backbone contains C and N (peptide), plus O (ester).
+    assert 8 in ring_atomic_nums, (
+        "expected at least one O atom in the macrocycle ring "
+        f"(ester linker); got element atomic numbers {ring_atomic_nums}"
+    )

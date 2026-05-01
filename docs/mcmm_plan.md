@@ -220,6 +220,78 @@ Update `src/README.md` and `scripts/README.md`: new module(s), function, sampler
 
 ---
 
+## Deferred follow-ups
+
+- **Replace the dedup metric with heavy-atom Kabsch RMSD.** `_energy_ranked_dedup` and `BasinMemory` currently use a normalised L1 distance over all atoms (`Σ|Δr| / (3 × n_atoms)`, threshold 0.1) with no alignment and no symmetry handling. CREST and CREMP's `uniqueconfs` are defined by Kabsch-aligned heavy-atom RMSD with a 0.125 Å threshold (and CREST adds atom-permutation symmetry on top). Three differences vs. our metric:
+  1. **No alignment in ours** — translations/rotations between walker proposals would falsely register as different basins. Rare in practice (MMFF doesn't translate) but possible.
+  2. **All atoms incl. H in ours** — H atoms move much more than the heavy framework during dihedral changes, making our metric *more sensitive* than CREST's for the same move.
+  3. **No symmetry correction in ours** — methyl flips / equivalent-atom permutations are different basins to us, same basin to CREST.
+
+  Differences 2 and 3 bias toward over-counting basins relative to CREST. Difference 1 also biases toward over-counting. So the metric mismatch is unlikely to be the cause of *under-counting* (e.g. cremp_typical's 1-basin pathology), but it does mean our `n_basins` numbers can't be directly compared to CREMP's `uniqueconfs` for benchmark purposes.
+
+  **Trigger condition for the actual fix**: if the tuned-drive experiment (`drive_sigma_rad=0.3, closure_tol=0.05, kt_high=4×kT_298K`) still produces 1 basin on cremp_typical, the metric likely matters and we should change it. If basins appear with the tuned drive, the metric is mostly cosmetic and we can defer.
+
+  **Implementation plan when triggered**:
+  1. Add `_heavy_atom_kabsch_rmsd(coords_a, coords_b, heavy_atom_indices)` in `confsweeper.py`. Pure torch (svd-based Kabsch). Skip atom-permutation symmetry (would require storing mols, not just coords; the 5% refinement isn't worth the architectural cost).
+  2. Replace the L1 distance computation in `_energy_ranked_dedup`.
+  3. Update `BasinMemory.query_novelty` / `query_novelty_batch` to use the same heavy-atom Kabsch RMSD.
+  4. Bump default `rmsd_threshold` from 0.1 (normalised-L1 units) to 0.125 Å (Kabsch-RMSD units).
+  5. Update the threshold-arithmetic tests in `test_exhaustive_etkdg.py`, `test_pool_b.py`, `test_mcmm.py` to use the new metric.
+  6. **Re-run baseline benchmark CSVs** — existing `n_basins` numbers were collected under the old metric and aren't directly comparable to new ones.
+
+  Affects all three samplers (`get_mol_PE_exhaustive`, `get_mol_PE_pool_b`, `get_mol_PE_mcmm`) for benchmark consistency.
+
+---
+
+## Lever menu for basin coverage
+
+Brainstormed 2026-04-29 after cremp_typical's "1-basin pathology" diagnostic showed MMFF basin collapse despite 160 Metropolis-accepted moves. Items below are levers we can pull when MCMM under-counts basins relative to CREST. Each is tagged with rough implementation cost and a guess at impact for the small-peptide / basin-collapse case specifically.
+
+Items marked **★** are flagged as initial priorities for implementation if the in-flight tuned-drive experiment (`drive_sigma_rad=0.3, closure_tol=0.05, kt_high=4×kT_298K`) doesn't fully resolve cremp_typical.
+
+### A. Move generation (more diverse proposals)
+
+1. **Larger `drive_sigma_rad`.** Already a tuning knob (default 0.1, currently 0.3 in `_run_mcmm`). Could push to 0.5–1.0 for very aggressive moves. Trade-off: closure failure rate climbs steeply with σ.
+2. ★ **Looser `closure_tol`.** Currently 0.01 default, 0.05 in `_run_mcmm`. Push to 0.1 (the upper end of MMFF tolerance per `concerted_rotation.DEFAULT_CLOSURE_TOL`'s docstring). ~1 line.
+3. ★ **Multi-window compound moves.** Each walker picks ONE window per step today. Apply DBT to 2–3 windows in sequence per step for bigger backbone perturbations. ~30 lines, low risk.
+4. **Side-chain rotamer moves.** Currently backbone-only. Add chi-dihedral perturbations on side chains (Phe/Trp/Leu particularly). ~100 lines, medium impact for peptides with bulky side chains.
+5. ★ **Heavy-tailed drive distribution.** Replace `N(0, σ²)` with Cauchy or a Gaussian mixture so occasional big jumps happen even when σ is small. ~5 lines, helps escape deep basins.
+
+### B. Replica exchange (better mixing)
+
+6. **Higher `kt_high`.** Already tunable (default 2×kT_298K, currently 4× in `_run_mcmm`). Push to 8×–16× for very hot replicas; caveat that very-high-T moves become essentially random Cartesian noise.
+7. **Finer temperature ladder.** Currently 8 temps × 8 walkers. Try 16 × 4. Trades within-temp diversity for between-temp resolution.
+8. ★ **Tighter swap interval.** Currently every 20 steps. Try 5–10 for faster mixing. ~1 line.
+
+### C. Initialization (high-impact for the basin-collapse pathology)
+
+9. ★ **Multi-seed initialization.** *Probably the largest single win for cremp_typical.* All 64 walkers currently start at the same ETKDG conformer, so they explore one basin's neighborhood. Embed K=8 distinct ETKDG conformers, distribute 8 walkers per seed. Each starting basin gets its own walker stack. ~30 lines.
+10. ★ **Periodic ETKDG injection.** Every M steps (e.g. 50), replace the worst-performing walker's state with a fresh ETKDG conformer. Prevents permanent walker stagnation. ~50 lines.
+11. ★ **Skip seed-MMFF.** Use the unminimized ETKDG geometry as the seed for some/all walkers. MMFF on the seed pulls all walkers into the same minimum basin; skipping lets them relax independently from a wider initial spread. ~5 lines.
+
+### D. Walker structure / adaptive
+
+12. **Heterogeneous walkers.** Different walkers use different `drive_sigma`. Some refine (small σ), some explore (big σ). An implicit replica-exchange in σ-space. ~30 lines.
+13. **Walker reset on stagnation.** If a walker hasn't found a novel basin in K steps, reset its state to a random other walker's state (or a fresh ETKDG). Periodic kick. ~30 lines.
+14. ★ **Adaptive `drive_sigma` per walker.** Standard MC trick: bump σ up when a walker's acceptance rate is too high; bump down when too low. Per-walker autotuning. ~50 lines.
+15. ★ **Stronger Saunders bias.** Currently `1/√usage`. Try `1/usage` (decays faster) so re-discovered basins get suppressed harder, forcing exploration. ~3 lines.
+
+### E. Memory / dedup
+
+16. **Tighter `rmsd_threshold`.** Currently 0.1. Try 0.05 for finer basin resolution; reveals sub-basins that 0.1 collapses. ~1 line plus interpretation.
+17. **Heavy-atom Kabsch RMSD.** Already covered in Deferred follow-ups above. Trigger condition is the same (tuned-drive run still produces 1 basin).
+
+### F. Bigger lifts
+
+18. **DBT analytical polynomial branches** (Option A from the plan). Multi-branch closure lets a single move jump to topologically distant ring conformations, not just the same homotopy class as the start. Could be transformative for ring-flip basins. **~400–500 lines.** Visualisation of MCMM basin sets vs. CREST basin sets via the multi-SDF dump (Step 10b of this plan) will show whether ring topology is changing in our runs — if not, this is the next major lever after the priorities above.
+19. **Side-chain coupling refinement.** Currently we transport side chains as rigid bodies with their backbone parents. MMFF then relaxes them — should already handle internal side-chain dihedrals. Worth verifying via SDF visualisation that side-chain geometry isn't being corrupted by the rigid transport.
+
+### Recommended order if the tuned-drive run doesn't resolve cremp_typical
+
+The priorities marked ★ are roughly ordered: **9 → 4 → 10 → 2/3/5 → 14/15 → 8 → 11**. Multi-seed init (#9) is first because it directly addresses the structural problem that all walkers start in one basin; everything else amplifies what already works. Side-chain rotamer moves (#4) is the second priority specifically for *larger* peptides where backbone-only movement misses a chunk of the basin landscape — we don't know yet whether cremp_typical needs it.
+
+---
+
 ## Decision points before coding
 
 1. Land Step 1 (shared-tail refactor) as a standalone commit before any MCMM work, so its behavior-preservation can be verified in isolation against the existing `tests/test_exhaustive_etkdg.py` and `tests/test_pool_b.py` suites.

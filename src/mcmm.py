@@ -26,127 +26,207 @@ import numpy as np
 import torch
 from rdkit import Chem
 
-from torsional_sampling import get_backbone_dihedrals
-
 # 7 consecutive backbone atoms = 4 inner dihedrals = the chain shape
 # expected by concerted_rotation.propose_move.
 WINDOW_SIZE = 7
 
+# Relaxed backbone SMARTS for MCMM's window enumeration. Matches both
+# amide (peptide, [N]) and ester (depsipeptide, [O]) backbone linker
+# positions — broader than torsional_sampling's strict
+# `_BACKBONE_SMARTS`, which is amide-only and is used by
+# `classify_backbone_residues` for L/D/NMe/Gly classification (a
+# concept that only applies to amide backbones).
+#
+# DBT concerted-rotation geometry treats the linker atom kinematically:
+# any backbone atom in the chain works, whether it's N or O. Allowing
+# both at the [:2] and [:5] positions lets us find the macrocycle on
+# depsipeptides (peptides with one or more amide bonds replaced by
+# ester linkages — common in natural cyclic peptides like beauveriolide,
+# valinomycin, and didemnins). The old strict SMARTS produced 2M fewer
+# matches per peptide with M ester bonds, dead-ending the C→next walk.
+_MCMM_BACKBONE_SMARTS = Chem.MolFromSmarts("[C:1](=O)[N,O:2][CX4:3][C:4](=O)[N,O:5]")
 
-def enumerate_backbone_windows(mol: Chem.Mol) -> list[tuple[int, ...]]:
+
+def _ordered_macrocycle_atoms(mol: Chem.Mol) -> list:
     """
-    Return every 7-atom backbone window in a head-to-tail cyclic peptide.
+    Return atom indices of the macrocycle (largest ring), in cyclic order.
 
-    Walks the macrocycle ring N → Cα → C → N → Cα → C → ... and emits
-    one cyclic window per starting backbone atom. For a cyclic peptide
-    of K residues there are 3K backbone atoms and 3K windows.
+    Uses RDKit's ring perception (`mol.GetRingInfo().AtomRings()`,
+    Smallest-Set-of-Smallest-Rings) and selects the longest ring. For
+    typical cyclic peptide and depsipeptide macrocycles this is the
+    backbone ring; for fused-ring or multi-cycle molecules the largest
+    ring is still the most-encompassing cycle and the most useful
+    starting point for DBT moves.
+
+    Why this is the primary path (over the SMARTS-based residue
+    enumeration in `_ordered_backbone_residues`): the SMARTS approach
+    requires the macrocycle to fit a `C(=O)-linker-Cα-C(=O)-linker`
+    repetitive pattern, which fails on real peptides with
+    structural irregularities — depsipeptide ester linkers, Cα-Cα
+    direct bonds (some natural products), side-chain-to-backbone
+    bridges, modified residues. Ring perception just needs a ring;
+    DBT geometry just needs ring atoms in cyclic order. Both work
+    on any macrocycle topology, including peptides whose chemistry
+    falls outside the strict amide-residue model.
+
+    The returned order is RDKit's ring-walk order, which is a valid
+    cyclic traversal. The starting atom and direction are not stable
+    across mols; window enumeration emits one window per starting
+    atom anyway, so the cyclic shift doesn't matter for sampling.
+
+    Params:
+        mol: Chem.Mol : input molecule
+    Returns:
+        list[int] : atom indices in cyclic ring order. Empty if the
+            molecule has no rings or the largest ring has fewer than
+            `WINDOW_SIZE` atoms.
+    """
+    ri = mol.GetRingInfo()
+    atom_rings = ri.AtomRings()
+    if not atom_rings:
+        return []
+    largest = max(atom_rings, key=len)
+    if len(largest) < WINDOW_SIZE:
+        return []
+    return list(largest)
+
+
+def enumerate_backbone_windows(mol: Chem.Mol) -> list:
+    """
+    Return every 7-atom backbone window in a cyclic macromolecule.
+
+    Walks the macrocycle (largest ring per RDKit's ring perception) and
+    emits one cyclic window per starting ring atom. For a K-atom ring
+    there are K windows.
 
     Each window is a tuple of 7 atom indices in the order they appear
     around the ring. The window's atom layout matches what
     `concerted_rotation.propose_move` expects: r0..r6 are 7 consecutive
-    backbone atoms with bonds r0-r1, r1-r2, ..., r5-r6 in the macrocycle.
-    The 4 inner dihedrals (around bonds (1,2)..(4,5)) are what the move
-    perturbs.
+    ring atoms with bonds r0-r1, r1-r2, ..., r5-r6. The 4 inner
+    dihedrals (around bonds (1,2)..(4,5)) are what the move perturbs.
 
-    The MCMM driver picks one window per move uniformly at random from
-    this list. The driver may also choose to enumerate in both ring
-    directions (a window read backwards is a different move); v0 only
-    emits one direction.
+    Switched in Step 8b from a SMARTS-based residue enumeration to
+    direct RDKit ring perception, so it handles arbitrary cyclic
+    macromolecules: standard peptides, depsipeptides (with ester
+    linkers), Cα-Cα-bonded peptides, and other natural-product
+    backbones the SMARTS pattern doesn't fit.
 
     Params:
-        mol: Chem.Mol : a head-to-tail cyclic peptide; explicit Hs are
-            optional. Side chains are ignored.
+        mol: Chem.Mol : a cyclic molecule with a macrocycle of ≥ 7 ring
+            atoms; explicit Hs are optional. Side chains are ignored
+            (only ring atoms participate in the windows).
     Returns:
-        list of 7-tuples of atom indices. Empty if the molecule has fewer
-        than 7 backbone atoms.
-    Raises:
-        ValueError: if the C → N walk fails to close the ring (input
-            is not a head-to-tail cyclic peptide).
+        list of 7-tuples of atom indices in cyclic ring order. Empty if
+        the molecule has no ring of ≥ 7 atoms.
     """
-    residues = _ordered_backbone_residues(mol)
-    if not residues:
+    ring_atoms = _ordered_macrocycle_atoms(mol)
+    n = len(ring_atoms)
+    if n < WINDOW_SIZE:
         return []
-
-    backbone: list[int] = []
-    for n_idx, ca_idx, c_idx in residues:
-        backbone.extend([n_idx, ca_idx, c_idx])
-
-    n_atoms = len(backbone)
-    if n_atoms < WINDOW_SIZE:
-        return []
-
     return [
-        tuple(backbone[(start + i) % n_atoms] for i in range(WINDOW_SIZE))
-        for start in range(n_atoms)
+        tuple(ring_atoms[(start + i) % n] for i in range(WINDOW_SIZE))
+        for start in range(n)
     ]
 
 
 def _ordered_backbone_residues(mol: Chem.Mol) -> list[tuple[int, int, int]]:
     """
-    Return (N, Cα, C) atom indices per residue, in cyclic order around
-    the macrocycle.
+    Return (linker, Cα, C) atom indices per residue, in cyclic order
+    around the macrocycle.
 
-    Order is established by walking C → N peptide bonds starting from an
-    arbitrary residue (the first one returned by get_backbone_dihedrals).
-    The starting residue depends on RDKit's substructure-match order, so
-    the cyclic shift is not stable across different mols, but a given
-    call returns the same cyclic order for the same mol.
+    The "linker" atom is the backbone N (peptide bond) or O (ester /
+    depsipeptide bond) — see `_MCMM_BACKBONE_SMARTS`. The C → next-linker
+    bond graph over all SMARTS-matched residues is walked starting from
+    each residue in turn; the longest closed cycle is returned.
+
+    Most peptides yield exactly one closed cycle covering every detected
+    residue. Two cases need special handling:
+      1. Macrocycles with side-chain-to-backbone bridges (e.g.
+         head-to-side-chain lactams) trigger spurious extra residue
+         matches off the main ring. The longest-cycle rule discards
+         them.
+      2. Depsipeptides with ester linkers: the relaxed
+         `_MCMM_BACKBONE_SMARTS` matches ester positions in addition to
+         amide ones, so all backbone residues appear in the residue list
+         regardless of linker type.
 
     Params:
         mol: Chem.Mol : input molecule
     Returns:
-        list of (N_idx, Cα_idx, C_idx) tuples, ordered cyclically. Empty
-        if no backbone is found.
+        list of (linker_idx, Cα_idx, C_idx) tuples, ordered cyclically.
+        `linker_idx` is N for amide residues, O for ester residues.
+        Empty if no backbone is found.
     Raises:
-        ValueError: if the C → N walk fails to visit every detected
-            residue (input is not a closed head-to-tail cyclic peptide).
+        ValueError: if no closed cycle exists among the SMARTS-matched
+            residues (input is not a head-to-tail cyclic peptide or
+            depsipeptide).
     """
-    residues = [(phi[1], phi[2], phi[3]) for phi, _ in get_backbone_dihedrals(mol)]
+    # Match backbone with the relaxed SMARTS (amide + ester linkers).
+    # Each match is one residue, dedup'd by linker atom index. The match
+    # tuple shape is (C_prev, =O, linker, Cα, C, =O, linker_next).
+    residues: list = []
+    seen_linker: set = set()
+    for match in mol.GetSubstructMatches(_MCMM_BACKBONE_SMARTS):
+        _, _, linker, ca, c, _, _ = match
+        if linker in seen_linker:
+            continue
+        seen_linker.add(linker)
+        residues.append((linker, ca, c))
+
     if not residues:
         return []
 
-    n_to_res = {n: (n, ca, c) for n, ca, c in residues}
+    linker_to_res = {linker: (linker, ca, c) for linker, ca, c in residues}
 
-    # For each residue's amide C, find the next residue's N (the one
-    # bonded to this C via the peptide bond). The C atom has three
-    # neighbours: the amide O (double bond), this residue's Cα, and the
-    # next residue's N — we pick the N that's also a backbone N.
-    next_n_for: dict[int, int] = {}
-    for n_idx, _, c_idx in residues:
+    # For each residue's C(=O), find the next residue's linker (the N or
+    # O bonded to this C via the peptide / ester bond). The C atom has
+    # three neighbours: its own =O, its own Cα, and the next residue's
+    # linker. The linker is uniquely identified by being a key in
+    # `linker_to_res`; the carbonyl O and own-residue Cα are not.
+    next_linker_for: dict[int, int] = {}
+    for linker_idx, _, c_idx in residues:
         c_atom = mol.GetAtomWithIdx(c_idx)
         for nb in c_atom.GetNeighbors():
-            if nb.GetAtomicNum() == 7 and nb.GetIdx() in n_to_res:
-                next_n_for[n_idx] = nb.GetIdx()
+            if nb.GetIdx() in linker_to_res:
+                next_linker_for[linker_idx] = nb.GetIdx()
                 break
 
-    ordered: list[tuple[int, int, int]] = []
-    visited: set[int] = set()
-    start_n = residues[0][0]
-    current_n: int | None = start_n
-    ring_closed = False
-    while current_n is not None and current_n not in visited:
-        visited.add(current_n)
-        ordered.append(n_to_res[current_n])
-        next_n = next_n_for.get(current_n)
-        if next_n == start_n:
-            ring_closed = True
-            break
-        current_n = next_n
+    # Try every residue as a starting point; return the longest closed
+    # cycle.
+    best_cycle: list | None = None
+    for start_residue in residues:
+        start_linker = start_residue[0]
+        cycle: list = []
+        visited: set = set()
+        current_linker: int | None = start_linker
+        ring_closed = False
+        while current_linker is not None and current_linker not in visited:
+            visited.add(current_linker)
+            cycle.append(linker_to_res[current_linker])
+            next_linker = next_linker_for.get(current_linker)
+            if next_linker == start_linker:
+                ring_closed = True
+                break
+            current_linker = next_linker
+        if ring_closed and (best_cycle is None or len(cycle) > len(best_cycle)):
+            best_cycle = cycle
 
-    # The walk "completes" under three conditions: (a) ring closure (next
-    # is start_n), (b) dead end (next is None — no peptide bond out of
-    # this residue), (c) revisit of an already-walked residue. Only (a)
-    # is a valid head-to-tail cycle. (b) is a linear peptide; (c) would
-    # indicate a branching backbone (not currently produced by the SMARTS
-    # but possible in principle).
-    if not ring_closed:
+    if best_cycle is None:
+        smi = Chem.MolToSmiles(mol)
+        missing_next = [
+            linker_idx
+            for linker_idx, _, _ in residues
+            if next_linker_for.get(linker_idx) is None
+        ]
         raise ValueError(
-            f"Backbone ring did not close: walked {len(ordered)} of "
-            f"{len(residues)} residues without returning to the start. "
-            "Input must be a head-to-tail cyclic peptide."
+            f"Backbone ring did not close: no closed cycle found among "
+            f"{len(residues)} residue matches. Input must be a head-to-tail "
+            f"cyclic peptide or depsipeptide. SMILES: {smi}. Residue linker "
+            f"atoms with no peptide-bond successor (next_linker_for missing): "
+            f"{missing_next or 'none'}."
         )
 
-    return ordered
+    return best_cycle
 
 
 # ---------------------------------------------------------------------------
@@ -158,19 +238,18 @@ def _backbone_atom_set(mol: Chem.Mol) -> set:
     """
     Return the set of atom indices that lie on the macrocycle backbone.
 
-    Backbone atoms are the (N, Cα, C) triples returned by
-    `_ordered_backbone_residues`, flattened. Used as the "stop set" for
-    the side-chain BFS in `_side_chain_group` — atoms outside this set
-    are side-chain candidates; atoms inside are part of the ring and
-    must not be crossed during the BFS.
+    Backbone atoms are the atoms on the largest ring as identified by
+    RDKit ring perception (see `_ordered_macrocycle_atoms`). Used as
+    the "stop set" for the side-chain BFS in `_side_chain_group` —
+    atoms outside this set are side-chain candidates; atoms inside
+    are part of the ring and must not be crossed during the BFS.
 
     Params:
-        mol: Chem.Mol : a head-to-tail cyclic peptide
+        mol: Chem.Mol : a cyclic molecule with a macrocycle ring
     Returns:
-        set[int] : 3K atom indices for a K-residue cyclic peptide
+        set[int] : ring atom indices; empty if no qualifying ring exists
     """
-    residues = _ordered_backbone_residues(mol)
-    return {atom_idx for residue in residues for atom_idx in residue}
+    return set(_ordered_macrocycle_atoms(mol))
 
 
 def _side_chain_group(mol: Chem.Mol, atom_idx: int, backbone_atom_set: set) -> set:
@@ -1187,6 +1266,17 @@ def make_mcmm_proposer(
 
     rng = np.random.default_rng(seed)
 
+    # Per-call cumulative diagnostic counters. Attached to the returned
+    # proposer function as `.stats` so callers (`get_mol_PE_mcmm`, tests)
+    # can read them after the run to diagnose acceptance regressions —
+    # especially the "1 basin" pathology on small peptides where DBT
+    # closure fails on most moves.
+    stats = {
+        "n_proposed": 0,
+        "n_closure_failures": 0,
+        "n_closure_successes": 0,
+    }
+
     def batch_propose_fn(coords_list):
         # Lazy import: confsweeper imports from mcmm at module load time;
         # importing _mace_batch_energies here defers resolution until the
@@ -1194,6 +1284,7 @@ def make_mcmm_proposer(
         from confsweeper import _mace_batch_energies
 
         n_walkers = len(coords_list)
+        stats["n_proposed"] += n_walkers
 
         # Stage 1: per-walker DBT closure on the backbone window.
         # Successful walkers contribute a (new_full_coords, det_j) entry.
@@ -1222,6 +1313,9 @@ def make_mcmm_proposer(
                 {"new_full": new_full, "det_j": float(result.det_jacobian)}
             )
             success_walker_indices.append(w_idx)
+
+        stats["n_closure_successes"] += len(successful_meta)
+        stats["n_closure_failures"] += n_walkers - len(successful_meta)
 
         # Stage 2: short-circuit if every walker failed.
         if not successful_meta:
@@ -1282,4 +1376,7 @@ def make_mcmm_proposer(
 
         return proposals
 
+    # Expose cumulative stats so the orchestrator (get_mol_PE_mcmm) can
+    # read closure-failure rates and diagnose "1 basin" regressions.
+    batch_propose_fn.stats = stats
     return batch_propose_fn
