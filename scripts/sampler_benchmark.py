@@ -98,6 +98,7 @@ OUTPUT_COLUMNS = [
     "n_heavy",
     "smiles",
     "sampler",
+    "dedup_mode",
     "n_seeds",
     "n_basins",
     "max_bw",
@@ -177,6 +178,7 @@ def _run_exhaustive_etkdg(
     calc,
     grids: dict | None,
     dump_sdf_dir=None,
+    dedup_mode: str = "kabsch",
 ) -> list[float]:
     """
     Adapter: run get_mol_PE_exhaustive at saturation-validated defaults.
@@ -191,6 +193,9 @@ def _run_exhaustive_etkdg(
         hardware_opts : nvmolkit hardware options
         calc : MACE calculator
         grids: dict | None : ignored
+        dump_sdf_dir: Path | None : if set, dump basin centroids
+        dedup_mode: str : 'kabsch' (default) or 'crest' for the
+            three-criteria AND-test (Step 17 of docs/mcmm_plan.md)
     Returns:
         list[float] : MACE energies in eV for the basin-representative conformers
     """
@@ -202,6 +207,7 @@ def _run_exhaustive_etkdg(
         hardware_opts,
         calc,
         n_seeds=n_seeds,
+        dedup_mode=dedup_mode,
     )
     _maybe_dump_sdf(
         mol,
@@ -221,6 +227,7 @@ def _run_pool_b(
     calc,
     grids: dict | None,
     dump_sdf_dir=None,
+    dedup_mode: str = "kabsch",
 ) -> list[float]:
     """
     Adapter: run get_mol_PE_pool_b with strategy='inverse' and n_attempts=1.
@@ -236,6 +243,8 @@ def _run_pool_b(
         hardware_opts : nvmolkit hardware options
         calc : MACE calculator
         grids: dict | None : CREMP Ramachandran grids; required by this adapter
+        dump_sdf_dir: Path | None : if set, dump basin centroids
+        dedup_mode: str : 'kabsch' (default) or 'crest'
     Returns:
         list[float] : MACE energies in eV for the basin-representative conformers
     """
@@ -249,6 +258,7 @@ def _run_pool_b(
         hardware_opts,
         calc,
         n_samples=n_seeds,
+        dedup_mode=dedup_mode,
     )
     _maybe_dump_sdf(
         mol,
@@ -268,6 +278,10 @@ def _run_mcmm(
     calc,
     grids: dict | None,
     dump_sdf_dir=None,
+    dedup_mode: str = "kabsch",
+    cartesian_weight: float = 0.0,
+    e_window_kT: float = 5.0,
+    saunders_exponent: float = 0.5,
 ) -> list[float]:
     """
     Adapter: run get_mol_PE_mcmm with the issue-#11 default temperature
@@ -291,9 +305,11 @@ def _run_mcmm(
         bigger perturbations push past the seed's MMFF gradient.
       * `closure_tol=0.05`     : pairs with the larger drive; stays
         within MMFF's basin-recovery range per the module docstring.
-      * `kt_high=4 × kT_298K`  : ~1200 K hot end of the ladder, four
-        times the cold end; widens the swap_accept regime toward
-        ~40 %.
+      * `kt_high=8 × kT_298K`  : ~2400 K hot end of the ladder, eight
+        times the cold end. Bumped from 4× after the multi-seed run
+        showed structurally-distinct basin pairs at 1.4 Å / 3 kT
+        on cremp_typical without bridging. Tests whether wider
+        replica spread improves discovery on truly-distinct basins.
       * `n_init_confs=8`       : multi-seed initialisation (lever C9 in
         docs/mcmm_plan.md). Embeds 8 distinct ETKDG seed conformers
         instead of 1; walkers distribute round-robin across them so
@@ -334,8 +350,12 @@ def _run_mcmm(
         n_steps=n_steps,
         drive_sigma_rad=0.3,
         closure_tol=0.05,
-        kt_high=4.0 * _KT_EV_298K,
+        kt_high=8.0 * _KT_EV_298K,
         n_init_confs=8,
+        dedup_mode=dedup_mode,
+        cartesian_weight=cartesian_weight,
+        e_window_kT=e_window_kT,
+        saunders_exponent=saunders_exponent,
     )
     _maybe_dump_sdf(
         mol,
@@ -355,25 +375,118 @@ SAMPLERS: dict[str, callable] = {
 }
 
 
+def select_peptide_list_csv(peptide_list_csv: Path) -> list[dict]:
+    """
+    Build a peptide list from a CSV (e.g. the output of
+    `sample_cremp_peptides.py`). Required columns: `sequence`, `smiles`.
+    Optional columns are passed through as-is when present:
+    `num_heavy_atoms`, `poplowestpct` (CREMP max-Boltzmann-weight
+    equivalent), `uniqueconfs` (CREMP basin-count ground truth).
+
+    Each row becomes one peptide dict matching the contract
+    `select_cremp_peptides` / `select_pampa_peptides` produce.
+
+    Params:
+        peptide_list_csv: Path : input CSV
+    Returns:
+        list[dict] : peptide rows with peptide_id, source, smiles,
+            n_heavy, ground_truth_max_bw, ground_truth_n_confs
+    """
+    df = pd.read_csv(peptide_list_csv)
+    required = {"sequence", "smiles"}
+    missing = required - set(df.columns)
+    if missing:
+        raise click.BadParameter(
+            f"{peptide_list_csv} missing required columns {sorted(missing)}"
+        )
+    out: list[dict] = []
+    for row in df.itertuples(index=False):
+        out.append(
+            {
+                "peptide_id": f"cremp:{row.sequence}",
+                "source": "cremp_sample",
+                "smiles": row.smiles,
+                "n_heavy": (
+                    int(row.num_heavy_atoms)
+                    if hasattr(row, "num_heavy_atoms")
+                    and not np.isnan(row.num_heavy_atoms)
+                    else 0
+                ),
+                "ground_truth_max_bw": (
+                    float(row.poplowestpct) / 100.0
+                    if hasattr(row, "poplowestpct") and not np.isnan(row.poplowestpct)
+                    else float("nan")
+                ),
+                "ground_truth_n_confs": (
+                    int(row.uniqueconfs)
+                    if hasattr(row, "uniqueconfs") and not np.isnan(row.uniqueconfs)
+                    else 0
+                ),
+            }
+        )
+    return out
+
+
 def _read_done_set(out_csv: Path) -> set[tuple]:
     """
-    Return the set of (peptide_id, sampler, n_seeds) tuples already written.
+    Return the set of (peptide_id, sampler, n_seeds, dedup_mode) tuples
+    already written. CSVs from before Step 17 lacked the `dedup_mode`
+    column — those rows are treated as `'kabsch'` for resume purposes.
 
     Params:
         out_csv: Path : output CSV path
     Returns:
-        set[tuple[str, str, int]] : completed (peptide_id, sampler, n_seeds)
+        set[tuple[str, str, int, str]] : completed
+            (peptide_id, sampler, n_seeds, dedup_mode)
     """
     if not out_csv.exists():
         return set()
     df = pd.read_csv(out_csv)
+    if "dedup_mode" in df.columns:
+        modes = df["dedup_mode"].astype(str)
+    else:
+        modes = pd.Series(["kabsch"] * len(df))
     return set(
         zip(
             df["peptide_id"].astype(str),
             df["sampler"].astype(str),
             df["n_seeds"].astype(int),
+            modes,
         )
     )
+
+
+def _check_header_matches(out_csv: Path) -> None:
+    """
+    Verify the existing CSV's header matches `OUTPUT_COLUMNS`.
+
+    Schema-evolution guard: if a column was added between runs (e.g.
+    `dedup_mode` introduced in Step 17), appending new rows under the
+    new schema to a file with the old header silently misaligns
+    columns — the extra value lands in a neighbour's slot. This check
+    catches that at the start of `main` so the user can migrate
+    explicitly rather than discovering it in pandas later.
+
+    Params:
+        out_csv: Path : path to an existing CSV (caller checks existence)
+    Returns:
+        None
+    Raises:
+        click.ClickException: if the header does not match OUTPUT_COLUMNS
+    """
+    with out_csv.open() as f:
+        header = next(csv.reader(f), None)
+    if header is None:
+        return
+    if header != OUTPUT_COLUMNS:
+        raise click.ClickException(
+            f"Existing CSV {out_csv} has header columns that do not match the "
+            f"current OUTPUT_COLUMNS schema. Either delete it, write to a new "
+            f"path, or migrate it (insert new columns with appropriate "
+            f"backfill values).\n"
+            f"  current header: {header}\n"
+            f"  expected:       {OUTPUT_COLUMNS}"
+        )
 
 
 def _append_row(out_csv: Path, row: dict) -> None:
@@ -403,6 +516,10 @@ def run_one(
     calc,
     grids: dict | None,
     dump_sdf_dir=None,
+    dedup_mode: str = "kabsch",
+    cartesian_weight: float = 0.0,
+    e_window_kT: float = 5.0,
+    saunders_exponent: float = 0.5,
 ) -> dict:
     """
     Run one sampler on one peptide, compute basin metrics, return a row dict.
@@ -417,13 +534,29 @@ def run_one(
         dump_sdf_dir: Path | None : if set, the adapter writes an SDF of
             the basin centroids to this directory; one file per
             (peptide, sampler) pair.
+        dedup_mode: str : 'kabsch' (default) or 'crest'. Recorded in
+            the output row so multi-mode runs can be joined cleanly.
+        cartesian_weight: float : routing weight for the GOAT-style
+            Cartesian-kick proposer in MCMM. 0 = pure DBT (legacy);
+            0.5 = 50/50 mix per walker per step. Ignored by non-MCMM
+            samplers. Step 12 of docs/mcmm_plan.md.
     Returns:
         dict with all OUTPUT_COLUMNS populated for this run
     """
     runner = SAMPLERS[sampler]
     t0 = time.perf_counter()
+    runner_kwargs = {"dump_sdf_dir": dump_sdf_dir, "dedup_mode": dedup_mode}
+    if sampler == "mcmm":
+        runner_kwargs["cartesian_weight"] = cartesian_weight
+        runner_kwargs["e_window_kT"] = e_window_kT
+        runner_kwargs["saunders_exponent"] = saunders_exponent
     energies_eV = runner(
-        peptide, n_seeds, hardware_opts, calc, grids, dump_sdf_dir=dump_sdf_dir
+        peptide,
+        n_seeds,
+        hardware_opts,
+        calc,
+        grids,
+        **runner_kwargs,
     )
     t_total = time.perf_counter() - t0
 
@@ -434,6 +567,7 @@ def run_one(
         "n_heavy": peptide["n_heavy"],
         "smiles": peptide["smiles"],
         "sampler": sampler,
+        "dedup_mode": dedup_mode,
         "n_seeds": n_seeds,
         **metrics,
         "time_total_s": t_total,
@@ -445,15 +579,27 @@ def run_one(
 @click.command()
 @click.option(
     "--cremp_csv",
-    required=True,
     type=Path,
-    help="CREMP validation subset CSV (sequence,smiles,...,poplowestpct,uniqueconfs)",
+    default=None,
+    help="CREMP validation subset CSV (sequence,smiles,...,poplowestpct,uniqueconfs). "
+    "Required unless --peptide_list_csv is given.",
 )
 @click.option(
     "--pampa_csv",
-    required=True,
     type=Path,
-    help="CycPeptMPDB-deduped PAMPA CSV with a SMILES column",
+    default=None,
+    help="CycPeptMPDB-deduped PAMPA CSV with a SMILES column. "
+    "Required unless --peptide_list_csv is given.",
+)
+@click.option(
+    "--peptide_list_csv",
+    type=Path,
+    default=None,
+    help="Alternative peptide source: any CSV with `sequence` and `smiles` columns "
+    "(e.g. the output of `sample_cremp_peptides.py`). When provided, "
+    "--cremp_csv / --pampa_csv are ignored and the entire CSV becomes the "
+    "peptide list. Optional `num_heavy_atoms`, `poplowestpct`, `uniqueconfs` "
+    "columns are passed through to the output rows.",
 )
 @click.option(
     "--out_csv",
@@ -493,19 +639,67 @@ def run_one(
     "in eV. Diagnostic; PyMOL / RDKit conformer viewer can load these to "
     "inspect basin geometry, ring topology, and side-chain rotamers.",
 )
+@click.option(
+    "--dedup_mode",
+    type=click.Choice(["kabsch", "crest", "both"]),
+    default="kabsch",
+    show_default=True,
+    help="Basin-dedup criterion. 'kabsch' (default, chemical-basin scale), "
+    "'crest' (CREMP-comparable three-criteria AND-test), or 'both' "
+    "(run each peptide × sampler in both modes and emit two rows for "
+    "side-by-side reporting). See Step 17 of docs/mcmm_plan.md.",
+)
+@click.option(
+    "--cartesian_weight",
+    type=float,
+    default=0.0,
+    show_default=True,
+    help="MCMM proposer mix: routing weight for the GOAT-style "
+    "Cartesian-kick proposer alongside DBT. 0 = pure DBT (legacy); "
+    "0.5 = 50/50 mix per walker per step. Ignored by non-MCMM "
+    "samplers. Step 12 of docs/mcmm_plan.md.",
+)
+@click.option(
+    "--e_window_kT",
+    "e_window_kT",
+    type=float,
+    default=5.0,
+    show_default=True,
+    help="Post-MCMM energy filter window in units of kT_298K. Bump "
+    "to 10 when Cartesian kicks find minima 0.4+ eV deeper than "
+    "DBT alone — the relative window then keeps a stratum of "
+    "basins that 5 kT excludes.",
+)
+@click.option(
+    "--saunders_exponent",
+    type=float,
+    default=0.5,
+    show_default=True,
+    help="Exponent in the Saunders 1/usage^p bias. 0.5 = original "
+    "Saunders 1990; 1.0 = stronger decay, lever C15 of "
+    "docs/mcmm_plan.md (pushes walkers out of deep wells faster, "
+    "useful when Cartesian-kick discovers traps that 1/√usage "
+    "doesn't escape).",
+)
 def main(
-    cremp_csv: Path,
-    pampa_csv: Path,
+    cremp_csv: Path | None,
+    pampa_csv: Path | None,
+    peptide_list_csv: Path | None,
     out_csv: Path,
     samplers: str,
     n_seeds: int,
     ramachandran_grids: Path,
     smiles_col: str,
     dump_sdf_dir: Path | None,
+    dedup_mode: str,
+    cartesian_weight: float,
+    e_window_kT: float,
+    saunders_exponent: float,
 ) -> None:
     """
     Benchmark each requested sampler against the same five peptides at a
-    matched compute budget, writing one CSV row per (peptide, sampler) cell.
+    matched compute budget, writing one CSV row per (peptide, sampler,
+    dedup_mode) cell.
 
     Params:
         cremp_csv: Path : CREMP validation subset CSV
@@ -515,6 +709,7 @@ def main(
         n_seeds: int : sampler budget passed to every adapter
         ramachandran_grids: Path : CREMP Ramachandran grids file
         smiles_col: str : SMILES column name in PAMPA CSV
+        dedup_mode: str : 'kabsch', 'crest', or 'both'
     Returns:
         None
     """
@@ -524,10 +719,25 @@ def main(
         raise click.BadParameter(
             f"unknown sampler(s) {unknown!r}; available: {list(SAMPLERS)}"
         )
+    mode_list = ["kabsch", "crest"] if dedup_mode == "both" else [dedup_mode]
 
-    peptides = select_cremp_peptides(cremp_csv, n=2) + select_pampa_peptides(
-        pampa_csv, smiles_col=smiles_col
-    )
+    # Two peptide-source modes:
+    #   - default (5-peptide test set): --cremp_csv + --pampa_csv with the
+    #     hardcoded select_cremp_peptides / select_pampa_peptides selectors.
+    #   - at-scale (any N): --peptide_list_csv pointing at a CSV with
+    #     `sequence` and `smiles` columns (e.g. the output of
+    #     sample_cremp_peptides.py). Bypasses the selectors entirely.
+    if peptide_list_csv is not None:
+        peptides = select_peptide_list_csv(peptide_list_csv)
+    else:
+        if cremp_csv is None or pampa_csv is None:
+            raise click.BadParameter(
+                "must provide either --peptide_list_csv, or both "
+                "--cremp_csv and --pampa_csv"
+            )
+        peptides = select_cremp_peptides(cremp_csv, n=2) + select_pampa_peptides(
+            pampa_csv, smiles_col=smiles_col
+        )
     logger.info("Selected %d peptides:", len(peptides))
     for p in peptides:
         logger.info(
@@ -539,12 +749,24 @@ def main(
             if not np.isnan(p["ground_truth_max_bw"])
             else "n/a",
         )
-    logger.info("samplers=%s  n_seeds=%d", sampler_list, n_seeds)
+    logger.info(
+        "samplers=%s  n_seeds=%d  dedup_modes=%s  cartesian_weight=%.2f  "
+        "e_window_kT=%.2f  saunders_exponent=%.2f",
+        sampler_list,
+        n_seeds,
+        mode_list,
+        cartesian_weight,
+        e_window_kT,
+        saunders_exponent,
+    )
 
+    if out_csv.exists():
+        _check_header_matches(out_csv)
     done = _read_done_set(out_csv)
     if done:
         logger.info(
-            "Resuming: %d (peptide, sampler, n_seeds) tuples already done", len(done)
+            "Resuming: %d (peptide, sampler, n_seeds, dedup_mode) tuples already done",
+            len(done),
         )
 
     # Shared GPU resources: build once, reuse across runs.
@@ -558,51 +780,60 @@ def main(
 
     for peptide in peptides:
         for sampler in sampler_list:
-            key = (peptide["peptide_id"], sampler, n_seeds)
-            if key in done:
+            for mode in mode_list:
+                key = (peptide["peptide_id"], sampler, n_seeds, mode)
+                if key in done:
+                    logger.info(
+                        "skip %s sampler=%s n=%d dedup=%s (already done)",
+                        peptide["peptide_id"],
+                        sampler,
+                        n_seeds,
+                        mode,
+                    )
+                    continue
+
                 logger.info(
-                    "skip %s sampler=%s n=%d (already done)",
+                    "run  %s sampler=%s n=%d dedup=%s",
                     peptide["peptide_id"],
                     sampler,
                     n_seeds,
+                    mode,
                 )
-                continue
+                try:
+                    row = run_one(
+                        peptide,
+                        sampler,
+                        n_seeds,
+                        hw,
+                        calc,
+                        grids,
+                        dump_sdf_dir=dump_sdf_dir,
+                        dedup_mode=mode,
+                        cartesian_weight=cartesian_weight,
+                        e_window_kT=e_window_kT,
+                        saunders_exponent=saunders_exponent,
+                    )
+                except Exception as exc:
+                    logger.exception(
+                        "Failed %s sampler=%s n=%d dedup=%s: %s",
+                        peptide["peptide_id"],
+                        sampler,
+                        n_seeds,
+                        mode,
+                        exc,
+                    )
+                    continue
 
-            logger.info(
-                "run  %s sampler=%s n=%d",
-                peptide["peptide_id"],
-                sampler,
-                n_seeds,
-            )
-            try:
-                row = run_one(
-                    peptide,
-                    sampler,
-                    n_seeds,
-                    hw,
-                    calc,
-                    grids,
-                    dump_sdf_dir=dump_sdf_dir,
+                _append_row(out_csv, row)
+                logger.info(
+                    "    -> dedup=%s  n_basins=%d  max_bw=%.3f  n_within_3kT=%d  total=%.1fs",
+                    mode,
+                    row["n_basins"],
+                    row["max_bw"],
+                    row["n_within_3kT"],
+                    row["time_total_s"],
                 )
-            except Exception as exc:
-                logger.exception(
-                    "Failed %s sampler=%s n=%d: %s",
-                    peptide["peptide_id"],
-                    sampler,
-                    n_seeds,
-                    exc,
-                )
-                continue
-
-            _append_row(out_csv, row)
-            logger.info(
-                "    -> n_basins=%d  max_bw=%.3f  n_within_3kT=%d  total=%.1fs",
-                row["n_basins"],
-                row["max_bw"],
-                row["n_within_3kT"],
-                row["time_total_s"],
-            )
-            torch.cuda.empty_cache()
+                torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":

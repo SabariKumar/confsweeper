@@ -26,6 +26,8 @@ from mcmm import (
     _side_chain_group,
     _swap_walker_configs,
     enumerate_backbone_windows,
+    make_cartesian_kick_proposer,
+    make_composite_proposer,
     make_mcmm_proposer,
 )
 
@@ -177,20 +179,46 @@ def test_ordered_residues_within_residue_bonds():
 # BasinMemory — fixtures and helpers
 # ---------------------------------------------------------------------------
 
-# Synthetic 4-atom conformer fixture: a rigid line along the x-axis, shifted
-# uniformly. This mirrors the _line_coords pattern used in
-# tests/test_exhaustive_etkdg.py so basin distances are easy to reason about
-# (translation by Δx → normalised L1 distance = |Δx|).
+# Synthetic 4-atom conformer fixture for Kabsch-RMSD basin tests. Atoms 1..3
+# stay anchored on the x-axis; atom 0 is displaced in z by `x_offset`. Two
+# such conformers with offsets o1 ≠ o2 have non-zero Kabsch RMSD because the
+# distortion is not a rigid-body motion (only one atom moves). The constant
+# `_KABSCH_PER_OFFSET` below is the numerically-evaluated Kabsch RMSD per
+# unit of offset difference; tests that need exact distance values multiply
+# offset differences by this factor.
 _TEST_N_ATOMS = 4
 
 
 def _line_conformer(x_offset: float) -> torch.Tensor:
-    """4-atom line shifted by `x_offset` along x. Pairwise distance between
-    two such conformers (offsets x1, x2) is |x1 - x2|."""
+    """4-atom test conformer: atoms on the x-axis with atom 0 lifted in z by
+    `x_offset`. Kabsch RMSD between two conformers at offsets o1 and o2 is
+    `|o1 - o2| * _KABSCH_PER_OFFSET` (translation- and rotation-invariant)."""
     base = torch.zeros(_TEST_N_ATOMS, 3, dtype=torch.float64)
     base[:, 0] = torch.arange(_TEST_N_ATOMS, dtype=torch.float64)
-    base[:, 0] += x_offset
+    base[0, 2] = x_offset
     return base
+
+
+def _reference_kabsch_rmsd(a: torch.Tensor, b: torch.Tensor) -> float:
+    """Independent numpy oracle for Kabsch RMSD; used to verify the torch
+    implementation in BasinMemory without circular dependence on the
+    function under test."""
+    A = a.numpy().astype(np.float64)
+    B = b.numpy().astype(np.float64)
+    A = A - A.mean(axis=0)
+    B = B - B.mean(axis=0)
+    H = B.T @ A
+    U, _, Vt = np.linalg.svd(H)
+    d = np.sign(np.linalg.det(Vt.T @ U.T))
+    R = Vt.T @ np.diag([1.0, 1.0, d]) @ U.T
+    aligned = B @ R.T
+    return float(np.sqrt(((A - aligned) ** 2).sum() / A.shape[0]))
+
+
+# Numerical Kabsch RMSD per unit offset difference for `_line_conformer`. Used
+# to translate offset differences into the threshold semantics expected by
+# tests; computed once below from the independent numpy reference.
+_KABSCH_PER_OFFSET = _reference_kabsch_rmsd(_line_conformer(0.0), _line_conformer(1.0))
 
 
 # ---------------------------------------------------------------------------
@@ -217,7 +245,7 @@ def test_basin_memory_default_threshold_matches_dedup():
     """Default threshold matches _energy_ranked_dedup's default rmsd_threshold
     so basin definitions are interchangeable across the get_mol_PE_* family."""
     mem = BasinMemory(n_atoms=_TEST_N_ATOMS)
-    assert mem.rmsd_threshold == DEFAULT_RMSD_THRESHOLD == 0.1
+    assert mem.rmsd_threshold == DEFAULT_RMSD_THRESHOLD == 0.125
 
 
 # ---------------------------------------------------------------------------
@@ -268,31 +296,316 @@ def test_query_novelty_far_returns_none_with_finite_distance():
     mem.add_basin(_line_conformer(0.0), energy=0.0)
     idx, dist = mem.query_novelty(_line_conformer(5.0))
     assert idx is None
-    # Pairwise normalised L1 between line conformers at offsets 0 and 5:
-    # 4 atoms × 5 / (3 × 4) = 5/3 ≈ 1.667
-    assert dist == pytest.approx(5.0 / 3.0, abs=1e-12)
+    # Kabsch RMSD between offsets 0 and 5 ≈ 5 * _KABSCH_PER_OFFSET; cross-check
+    # against the independent numpy reference.
+    expected = _reference_kabsch_rmsd(_line_conformer(0.0), _line_conformer(5.0))
+    assert dist == pytest.approx(expected, rel=1e-9)
 
 
 def test_query_novelty_threshold_boundary_strictly_less_than():
     """Strict `<` matches `_energy_ranked_dedup`: distance EQUAL to the
     threshold is treated as a different basin."""
-    mem = BasinMemory(n_atoms=_TEST_N_ATOMS, rmsd_threshold=0.5)
+    # Pick a perturbation magnitude whose Kabsch RMSD we can compute via the
+    # numpy reference, then set threshold == that distance. The probe must be
+    # classified as novel (dist == threshold fails strict `<`).
+    boundary_offset = 1.5
+    expected_rmsd = _reference_kabsch_rmsd(
+        _line_conformer(0.0), _line_conformer(boundary_offset)
+    )
+    mem = BasinMemory(n_atoms=_TEST_N_ATOMS, rmsd_threshold=expected_rmsd)
     mem.add_basin(_line_conformer(0.0), energy=0.0)
-    # Offset 1.5 → normalised L1 = 4×1.5 / (3×4) = 0.5 — exactly the threshold.
-    idx, dist = mem.query_novelty(_line_conformer(1.5))
-    assert idx is None  # strictly < threshold required for same basin
-    assert dist == pytest.approx(0.5, abs=1e-12)
+    idx, dist = mem.query_novelty(_line_conformer(boundary_offset))
+    assert idx is None
+    assert dist == pytest.approx(expected_rmsd, rel=1e-9)
 
 
 def test_query_novelty_picks_closest_when_multiple_match():
     mem = BasinMemory(n_atoms=_TEST_N_ATOMS, rmsd_threshold=1.0)
     mem.add_basin(_line_conformer(0.0), energy=0.0)
     mem.add_basin(_line_conformer(0.5), energy=0.0)
-    # Query at 0.4: distances are 0.4/3 ≈ 0.133 and 0.1/3 ≈ 0.033.
-    # Both within threshold; closest is basin 1.
+    # Query at 0.4: closer to basin 1 (offset 0.5) than to basin 0 (offset 0).
+    # Both should be inside threshold 1.0 because Kabsch RMSD scales like
+    # |Δoffset| * _KABSCH_PER_OFFSET ≈ 0.4 * 0.43 ≈ 0.17 and 0.1 * 0.43 ≈ 0.04.
     idx, dist = mem.query_novelty(_line_conformer(0.4))
     assert idx == 1
-    assert dist == pytest.approx(0.1 / 3.0, abs=1e-12)
+    expected = _reference_kabsch_rmsd(_line_conformer(0.5), _line_conformer(0.4))
+    assert dist == pytest.approx(expected, rel=1e-9)
+
+
+def test_query_novelty_translation_invariant():
+    """Kabsch alignment removes rigid translations: a basin queried with a
+    translated copy of its own coords should match exactly (distance ≈ 0).
+    Locks in the headline behaviour change vs. the prior normalised-L1
+    metric, which would have flagged any translation as a new basin."""
+    mem = BasinMemory(n_atoms=_TEST_N_ATOMS, rmsd_threshold=0.05)
+    base = _line_conformer(0.7)
+    mem.add_basin(base, energy=0.0)
+    translated = base + torch.tensor([100.0, -50.0, 25.0], dtype=torch.float64)
+    idx, dist = mem.query_novelty(translated)
+    assert idx == 0
+    assert dist == pytest.approx(0.0, abs=1e-9)
+
+
+def test_query_novelty_rotation_invariant():
+    """Same idea as translation invariance, but for arbitrary rotations."""
+    mem = BasinMemory(n_atoms=_TEST_N_ATOMS, rmsd_threshold=0.05)
+    base = _line_conformer(0.7)
+    mem.add_basin(base, energy=0.0)
+    # 30° rotation around z (any rotation works; this one is enough to break
+    # axis-aligned coincidences).
+    cos, sin = math.cos(math.pi / 6), math.sin(math.pi / 6)
+    R = torch.tensor(
+        [[cos, -sin, 0.0], [sin, cos, 0.0], [0.0, 0.0, 1.0]], dtype=torch.float64
+    )
+    rotated = base @ R.T
+    idx, dist = mem.query_novelty(rotated)
+    assert idx == 0
+    assert dist == pytest.approx(0.0, abs=1e-9)
+
+
+def test_basin_memory_heavy_atom_indices_slices_distance_only():
+    """When `heavy_atom_indices` is provided, distance comparisons use only
+    that subset; full coords are still stored. Mimics the production caller
+    which slices to heavy atoms (no H) for the basin distinguisher while
+    keeping the full atom set available to the proposer."""
+    # Atoms 0 and 2 are "heavy"; atoms 1 and 3 are "noise".
+    heavy = [0, 2]
+    mem = BasinMemory(
+        n_atoms=_TEST_N_ATOMS, rmsd_threshold=0.05, heavy_atom_indices=heavy
+    )
+    base = _line_conformer(0.0)
+    mem.add_basin(base, energy=0.0)
+    # Probe perturbs atom 1 only. The heavy subset (atoms 0, 2) is unchanged →
+    # Kabsch RMSD over the heavy subset must be ~0; the basin matches.
+    probe = base.clone()
+    probe[1, 2] = 5.0
+    idx, dist = mem.query_novelty(probe)
+    assert idx == 0
+    assert dist == pytest.approx(0.0, abs=1e-9)
+    # Stored coords are still the full original (not sliced).
+    assert mem.coords.shape == (1, _TEST_N_ATOMS, 3)
+
+
+def test_basin_memory_heavy_atom_indices_validation():
+    with pytest.raises(ValueError, match="heavy_atom_indices must be non-empty"):
+        BasinMemory(n_atoms=_TEST_N_ATOMS, heavy_atom_indices=[])
+    with pytest.raises(ValueError, match="at least 2 atoms for Kabsch"):
+        BasinMemory(n_atoms=_TEST_N_ATOMS, heavy_atom_indices=[0])
+    with pytest.raises(ValueError, match="out of range"):
+        BasinMemory(n_atoms=_TEST_N_ATOMS, heavy_atom_indices=[0, 99])
+
+
+# ---------------------------------------------------------------------------
+# Step 17 — CREST-style three-criteria dedup (`dedup_mode='crest'`)
+# ---------------------------------------------------------------------------
+
+
+# Realistic atomic numbers for the 4-atom synthetic fixture: a tiny C-N-O-H
+# stand-in that gives non-degenerate masses for the inertia tensor. Picked so
+# that COM is well-defined and inertia eigvals are distinct (avoids the
+# degenerate-axis case where small numerical noise flips eigenvector ordering).
+_TEST_ATOMIC_NUMBERS = [6, 7, 8, 1]  # C, N, O, H
+
+
+def test_inertia_eigvals_translation_invariant():
+    """Translating coords by an arbitrary vector should leave inertia
+    eigenvalues unchanged — they're computed in the COM frame."""
+    from mcmm import _inertia_eigvals
+
+    masses = torch.tensor([12.0, 14.0, 16.0, 1.0], dtype=torch.float64)
+    coords = _line_conformer(0.7)
+    eig_a = _inertia_eigvals(coords, masses)
+    coords_translated = coords + torch.tensor([10.0, -3.5, 7.2], dtype=torch.float64)
+    eig_b = _inertia_eigvals(coords_translated, masses)
+    assert torch.allclose(eig_a, eig_b, atol=1e-9)
+
+
+def test_inertia_eigvals_rotation_invariant():
+    """Rotating coords by any orthogonal matrix should leave inertia
+    eigenvalues unchanged (the inertia tensor's eigenvalues are the
+    principal moments — basis-independent)."""
+    from mcmm import _inertia_eigvals
+
+    masses = torch.tensor([12.0, 14.0, 16.0, 1.0], dtype=torch.float64)
+    coords = _line_conformer(0.7)
+    cos, sin = math.cos(math.pi / 5), math.sin(math.pi / 5)
+    R = torch.tensor(
+        [[cos, -sin, 0.0], [sin, cos, 0.0], [0.0, 0.0, 1.0]], dtype=torch.float64
+    )
+    eig_a = _inertia_eigvals(coords, masses)
+    eig_b = _inertia_eigvals(coords @ R.T, masses)
+    assert torch.allclose(eig_a, eig_b, atol=1e-9)
+
+
+def test_inertia_eigvals_distinct_geometries_differ():
+    """Two genuinely different geometries should produce different
+    inertia eigenvalues. Smoke check that the function isn't returning
+    identical values regardless of input."""
+    from mcmm import _inertia_eigvals
+
+    masses = torch.tensor([12.0, 14.0, 16.0, 1.0], dtype=torch.float64)
+    eig_a = _inertia_eigvals(_line_conformer(0.0), masses)
+    eig_b = _inertia_eigvals(_line_conformer(2.0), masses)
+    assert not torch.allclose(eig_a, eig_b, atol=1e-3)
+
+
+def test_basin_memory_crest_mode_construction_validation():
+    """`dedup_mode='crest'` requires `atomic_numbers`; pure-kabsch
+    construction is unaffected (atomic_numbers ignored)."""
+    with pytest.raises(ValueError, match="atomic_numbers is required"):
+        BasinMemory(n_atoms=_TEST_N_ATOMS, dedup_mode="crest")
+    # Length mismatch is caught.
+    with pytest.raises(ValueError, match="atomic_numbers length"):
+        BasinMemory(n_atoms=_TEST_N_ATOMS, dedup_mode="crest", atomic_numbers=[6, 7])
+    # Unknown mode rejected.
+    with pytest.raises(ValueError, match="dedup_mode must be"):
+        BasinMemory(n_atoms=_TEST_N_ATOMS, dedup_mode="bogus")
+    # Negative thresholds rejected.
+    with pytest.raises(ValueError, match="energy_threshold_eV"):
+        BasinMemory(
+            n_atoms=_TEST_N_ATOMS,
+            dedup_mode="crest",
+            atomic_numbers=_TEST_ATOMIC_NUMBERS,
+            energy_threshold_eV=-1.0,
+        )
+    with pytest.raises(ValueError, match="rotconst_anisotropy_threshold"):
+        BasinMemory(
+            n_atoms=_TEST_N_ATOMS,
+            dedup_mode="crest",
+            atomic_numbers=_TEST_ATOMIC_NUMBERS,
+            rotconst_anisotropy_threshold=-0.1,
+        )
+
+
+def test_basin_memory_crest_query_requires_energy():
+    """In crest mode, `query_novelty` and `query_novelty_batch` must be
+    given energies — that's the whole point of the energy criterion."""
+    mem = BasinMemory(
+        n_atoms=_TEST_N_ATOMS,
+        dedup_mode="crest",
+        atomic_numbers=_TEST_ATOMIC_NUMBERS,
+    )
+    mem.add_basin(_line_conformer(0.0), energy=-1.0)
+    with pytest.raises(ValueError, match="energy is required"):
+        mem.query_novelty(_line_conformer(0.0))
+    batch = torch.stack([_line_conformer(0.0)])
+    with pytest.raises(ValueError, match="energies is required"):
+        mem.query_novelty_batch(batch)
+
+
+def test_basin_memory_crest_rmsd_close_but_energy_distinct_is_novel():
+    """Two geometries within Kabsch threshold but with energies further
+    apart than `energy_threshold_eV` should be classified as different
+    basins under crest mode. Pure-kabsch mode would merge them."""
+    # Same geometry, different energies → only the energy criterion can
+    # distinguish them. Make energies 0.1 eV apart, threshold 0.05 eV.
+    mem_crest = BasinMemory(
+        n_atoms=_TEST_N_ATOMS,
+        rmsd_threshold=0.5,
+        dedup_mode="crest",
+        atomic_numbers=_TEST_ATOMIC_NUMBERS,
+        energy_threshold_eV=0.05,
+        rotconst_anisotropy_threshold=10.0,  # disable rotation check
+    )
+    mem_crest.add_basin(_line_conformer(0.0), energy=-1.00)
+    idx, _ = mem_crest.query_novelty(_line_conformer(0.0), energy=-0.85)
+    assert idx is None  # Energy gap (0.15 eV) > threshold (0.05) → distinct.
+    # Same query close in energy → matches.
+    idx, _ = mem_crest.query_novelty(_line_conformer(0.0), energy=-0.99)
+    assert idx == 0
+
+
+def test_basin_memory_crest_rmsd_distinct_overrides_energy_match():
+    """If RMSD criterion fails, the basin is novel regardless of how
+    close energy and rotation are. Locks the AND-semantics — any one
+    failure keeps them separate."""
+    mem = BasinMemory(
+        n_atoms=_TEST_N_ATOMS,
+        rmsd_threshold=0.05,  # tight Kabsch threshold
+        dedup_mode="crest",
+        atomic_numbers=_TEST_ATOMIC_NUMBERS,
+        energy_threshold_eV=10.0,  # disable energy check
+        rotconst_anisotropy_threshold=10.0,  # disable rotation check
+    )
+    mem.add_basin(_line_conformer(0.0), energy=0.0)
+    # Big RMSD perturbation; identical energy.
+    idx, _ = mem.query_novelty(_line_conformer(2.0), energy=0.0)
+    assert idx is None
+
+
+def test_basin_memory_crest_kabsch_mode_matches_legacy():
+    """`dedup_mode='kabsch'` (the default) must produce the same
+    accept/reject decisions as the pre-Step-17 BasinMemory — even when
+    the new constructor kwargs are passed (they should be ignored)."""
+    mem_legacy = BasinMemory(n_atoms=_TEST_N_ATOMS, rmsd_threshold=0.1)
+    mem_new = BasinMemory(
+        n_atoms=_TEST_N_ATOMS,
+        rmsd_threshold=0.1,
+        dedup_mode="kabsch",
+        # New thresholds present but inert in kabsch mode:
+        energy_threshold_eV=1e-9,
+        rotconst_anisotropy_threshold=1e-9,
+    )
+    for x in [0.0, 0.3, 1.5]:
+        mem_legacy.add_basin(_line_conformer(x), energy=float(x))
+        mem_new.add_basin(_line_conformer(x), energy=float(x))
+    for x in [0.0, 0.05, 0.7, 5.0]:
+        a_idx, a_d = mem_legacy.query_novelty(_line_conformer(x))
+        # Legacy doesn't take energy; new also accepts None in kabsch mode.
+        b_idx, b_d = mem_new.query_novelty(_line_conformer(x))
+        assert a_idx == b_idx
+        assert a_d == pytest.approx(b_d, rel=1e-12)
+
+
+def test_basin_memory_crest_query_batch_matches_individual():
+    """Batched crest query produces the same per-row answers as B
+    individual calls. Locks the broadcast geometry of the AND-test."""
+    mem = BasinMemory(
+        n_atoms=_TEST_N_ATOMS,
+        rmsd_threshold=0.5,
+        dedup_mode="crest",
+        atomic_numbers=_TEST_ATOMIC_NUMBERS,
+        energy_threshold_eV=0.05,
+        rotconst_anisotropy_threshold=0.5,  # generous so RMSD/E drive the test
+    )
+    mem.add_basin(_line_conformer(0.0), energy=-1.0)
+    mem.add_basin(_line_conformer(1.5), energy=-0.5)
+
+    queries = [(0.0, -1.0), (0.0, -0.85), (1.5, -0.49), (3.0, -1.0)]
+    coords_batch = torch.stack([_line_conformer(x) for x, _ in queries])
+    energies = torch.tensor([e for _, e in queries], dtype=torch.float64)
+
+    batch_idx, batch_dist = mem.query_novelty_batch(coords_batch, energies=energies)
+    for k, (x, e) in enumerate(queries):
+        ref_idx, ref_dist = mem.query_novelty(_line_conformer(x), energy=e)
+        expected = ref_idx if ref_idx is not None else BasinMemory.NOVEL
+        assert (
+            int(batch_idx[k].item()) == expected
+        ), f"row {k}: got {batch_idx[k]}, expected {expected}"
+        assert float(batch_dist[k].item()) == pytest.approx(ref_dist, rel=1e-12)
+
+
+def test_basin_memory_crest_stores_rotconsts_per_basin():
+    """Each `add_basin` in crest mode should append one row of
+    rotational constants. Pure-kabsch mode stays the empty (0, 3)
+    sentinel — no extra storage cost."""
+    mem_kabsch = BasinMemory(n_atoms=_TEST_N_ATOMS)
+    mem_kabsch.add_basin(_line_conformer(0.0), energy=0.0)
+    mem_kabsch.add_basin(_line_conformer(1.0), energy=0.0)
+    assert mem_kabsch._rotconsts.shape == (0, 3)
+
+    mem_crest = BasinMemory(
+        n_atoms=_TEST_N_ATOMS,
+        dedup_mode="crest",
+        atomic_numbers=_TEST_ATOMIC_NUMBERS,
+    )
+    mem_crest.add_basin(_line_conformer(0.0), energy=0.0)
+    mem_crest.add_basin(_line_conformer(1.0), energy=0.0)
+    assert mem_crest._rotconsts.shape == (2, 3)
+    # Distinct geometries → distinct rotational constants.
+    assert not torch.allclose(
+        mem_crest._rotconsts[0], mem_crest._rotconsts[1], atol=1e-3
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -387,6 +700,26 @@ def test_acceptance_bias_invalid_index_raises():
     mem.add_basin(_line_conformer(0.0), energy=0.0)
     with pytest.raises(IndexError, match="out of range"):
         mem.acceptance_bias(5)
+
+
+def test_acceptance_bias_with_saunders_exponent_one():
+    """`saunders_exponent=1.0` (lever C15) gives 1/usage instead of
+    1/√usage — a stronger re-visit penalty for pushing walkers out of
+    deep wells found by Cartesian-kicks."""
+    mem = BasinMemory(n_atoms=_TEST_N_ATOMS, saunders_exponent=1.0)
+    idx = mem.add_basin(_line_conformer(0.0), energy=0.0)
+    assert mem.acceptance_bias(idx) == pytest.approx(1.0)
+    mem.record_visit(idx)  # usage=2
+    assert mem.acceptance_bias(idx) == pytest.approx(0.5)  # 1/2 not 1/√2
+    mem.record_visit(idx)  # usage=3
+    assert mem.acceptance_bias(idx) == pytest.approx(1.0 / 3.0)
+
+
+def test_basin_memory_saunders_exponent_validation():
+    with pytest.raises(ValueError, match="saunders_exponent must be positive"):
+        BasinMemory(n_atoms=_TEST_N_ATOMS, saunders_exponent=0.0)
+    with pytest.raises(ValueError, match="saunders_exponent must be positive"):
+        BasinMemory(n_atoms=_TEST_N_ATOMS, saunders_exponent=-0.5)
 
 
 # ---------------------------------------------------------------------------
@@ -1708,3 +2041,243 @@ def test_enumerate_windows_handles_macrocycle_with_ester_linker():
         "expected at least one O atom in the macrocycle ring "
         f"(ester linker); got element atomic numbers {ring_atomic_nums}"
     )
+
+
+# ---------------------------------------------------------------------------
+# make_cartesian_kick_proposer
+# ---------------------------------------------------------------------------
+
+
+def _make_cart_kick_with_mocks(mol, sigma_kick_a: float = 0.1, seed: int = 0):
+    """Build a real `make_cartesian_kick_proposer` callable while patching
+    the GPU stages — same pattern as `_make_real_proposer_with_mocks`
+    for the DBT proposer."""
+    from contextlib import contextmanager
+    from unittest.mock import patch as _patch
+
+    proposer = make_cartesian_kick_proposer(
+        mol,
+        hardware_opts=None,
+        calc=None,
+        sigma_kick_a=sigma_kick_a,
+        seed=seed,
+    )
+
+    counter = [0]
+
+    def _mock_mace(_calc, ase_mols):
+        out = [(counter[0] + i) * 0.01 for i in range(len(ase_mols))]
+        counter[0] += len(ase_mols)
+        return out
+
+    @contextmanager
+    def patched():
+        with (
+            _patch("confsweeper._mace_batch_energies", side_effect=_mock_mace),
+            _patch(
+                "nvmolkit.mmffOptimization.MMFFOptimizeMoleculesConfs",
+                return_value=[[]],
+            ),
+        ):
+            yield
+
+    return proposer, patched
+
+
+def test_cartesian_kick_proposer_invalid_mmff_backend_raises():
+    mol = _cycloala_mol(4)
+    with pytest.raises(ValueError, match="unknown mmff_backend"):
+        make_cartesian_kick_proposer(
+            mol, hardware_opts=None, calc=None, mmff_backend="bogus"
+        )
+
+
+def test_cartesian_kick_proposer_returns_proposal_per_walker():
+    mol = _cycloala_mol(4)
+    proposer, patched = _make_cart_kick_with_mocks(mol, seed=42)
+    seed_coords = _seed_full_mol_coords(mol)
+    for n in [1, 3, 8]:
+        coords_list = [seed_coords.clone() for _ in range(n)]
+        with patched():
+            proposals = proposer(coords_list)
+        assert len(proposals) == n
+        for p in proposals:
+            assert len(p) == 4
+            new_coords, new_energy, det_j, success = p
+            assert isinstance(new_coords, torch.Tensor)
+            assert new_coords.shape == seed_coords.shape
+
+
+def test_cartesian_kick_proposer_empty_input():
+    """Empty coords list returns empty proposal list — locks the
+    short-circuit so no MMFF/MACE work runs on zero walkers."""
+    mol = _cycloala_mol(4)
+    proposer, _ = _make_cart_kick_with_mocks(mol, seed=0)
+    assert proposer([]) == []
+
+
+def test_cartesian_kick_proposer_det_j_is_one_for_success():
+    """Gaussian kick is symmetric in coordinate space → no Wu-Deem
+    correction needed → all successful proposals carry det_j = 1.0.
+    Locks the contract that distinguishes Cartesian kicks from DBT."""
+    mol = _cycloala_mol(4)
+    proposer, patched = _make_cart_kick_with_mocks(mol, seed=0)
+    seed_coords = _seed_full_mol_coords(mol)
+    coords_list = [seed_coords.clone() for _ in range(8)]
+    with patched():
+        proposals = proposer(coords_list)
+    successful = [p for p in proposals if p[3]]
+    assert successful, "no successful proposals — mock pipeline is broken"
+    for new_coords, new_energy, det_j, success in successful:
+        assert det_j == 1.0
+
+
+def test_cartesian_kick_proposer_stats_increment_per_call():
+    """Per-call cumulative stats: n_proposed grows by walker count and
+    n_relax_successes + n_relax_failures equals n_proposed."""
+    mol = _cycloala_mol(4)
+    proposer, patched = _make_cart_kick_with_mocks(mol, seed=7)
+    seed_coords = _seed_full_mol_coords(mol)
+    assert proposer.stats == {
+        "n_proposed": 0,
+        "n_relax_failures": 0,
+        "n_relax_successes": 0,
+    }
+    with patched():
+        proposer([seed_coords.clone() for _ in range(5)])
+        proposer([seed_coords.clone() for _ in range(3)])
+    assert proposer.stats["n_proposed"] == 8
+    assert (
+        proposer.stats["n_relax_successes"] + proposer.stats["n_relax_failures"]
+        == proposer.stats["n_proposed"]
+    )
+
+
+def test_cartesian_kick_proposer_perturbs_coords():
+    """The kick should actually move atoms — successful proposals must
+    return coords that differ from the input by something close to
+    `sigma_kick_a` per coordinate (roughly; MMFF will pull some back)."""
+    mol = _cycloala_mol(4)
+    sigma = 0.5
+    proposer, patched = _make_cart_kick_with_mocks(mol, sigma_kick_a=sigma, seed=2)
+    seed_coords = _seed_full_mol_coords(mol)
+    coords_list = [seed_coords.clone() for _ in range(8)]
+    with patched():
+        proposals = proposer(coords_list)
+    # Mocked MMFF is a no-op (returns the kicked coords unchanged), so the
+    # output equals seed + Gaussian noise. Standard deviation across the
+    # ~Nx3 coord array should be on the order of sigma_kick_a.
+    for new_coords, _, _, success in proposals:
+        if not success:
+            continue
+        delta = (new_coords - seed_coords).numpy()
+        assert delta.std() == pytest.approx(
+            sigma, rel=0.4
+        ), f"expected std ≈ {sigma}; got {delta.std():.3f}"
+
+
+# ---------------------------------------------------------------------------
+# make_composite_proposer
+# ---------------------------------------------------------------------------
+
+
+def _stub_proposer(tag: str, n_atoms: int = _TEST_N_ATOMS):
+    """Build a mock proposer that returns a tagged sentinel coords tensor
+    so we can verify which sub-proposer routed each walker."""
+    stats = {"n_calls": 0, "n_walkers": 0}
+
+    def fn(coords_list):
+        stats["n_calls"] += 1
+        stats["n_walkers"] += len(coords_list)
+        sentinel = float({"a": 1.0, "b": 2.0, "c": 3.0}.get(tag, 9.0))
+        return [
+            (torch.full((n_atoms, 3), sentinel, dtype=torch.float64), 0.0, 1.0, True)
+            for _ in coords_list
+        ]
+
+    fn.stats = stats
+    return fn
+
+
+def test_composite_proposer_constructor_validation():
+    with pytest.raises(ValueError, match="proposers must be non-empty"):
+        make_composite_proposer([])
+    with pytest.raises(ValueError, match="weights .* must match proposers"):
+        make_composite_proposer(
+            [_stub_proposer("a"), _stub_proposer("b")], weights=[1.0]
+        )
+    with pytest.raises(ValueError, match="weights must be positive"):
+        make_composite_proposer(
+            [_stub_proposer("a"), _stub_proposer("b")], weights=[1.0, 0.0]
+        )
+
+
+def test_composite_proposer_routes_all_to_single_when_only_one():
+    proposer_a = _stub_proposer("a")
+    composite = make_composite_proposer([proposer_a])
+    coords = [torch.zeros(_TEST_N_ATOMS, 3, dtype=torch.float64) for _ in range(5)]
+    out = composite(coords)
+    assert len(out) == 5
+    assert proposer_a.stats["n_walkers"] == 5
+    for c, _, _, _ in out:
+        assert torch.all(c == 1.0)
+
+
+def test_composite_proposer_zero_weight_routes_to_dominant():
+    """A heavily-imbalanced weight (e.g. 1.0 vs 1e-9) should route nearly
+    every walker to the dominant proposer. Use a small N so the
+    statistical chance of even one rare-proposer pick is negligible."""
+    proposer_a = _stub_proposer("a")
+    proposer_b = _stub_proposer("b")
+    composite = make_composite_proposer(
+        [proposer_a, proposer_b], weights=[1.0, 1e-9], seed=0
+    )
+    coords = [torch.zeros(_TEST_N_ATOMS, 3, dtype=torch.float64) for _ in range(20)]
+    out = composite(coords)
+    assert len(out) == 20
+    # All 20 walkers should have routed to proposer A → tagged 1.0.
+    assert proposer_a.stats["n_walkers"] == 20
+    assert proposer_b.stats["n_walkers"] == 0
+
+
+def test_composite_proposer_distributes_at_uniform_weights():
+    """Two proposers, equal weights, 1000 walkers → roughly half/half."""
+    proposer_a = _stub_proposer("a")
+    proposer_b = _stub_proposer("b")
+    composite = make_composite_proposer([proposer_a, proposer_b], seed=42)
+    coords = [torch.zeros(_TEST_N_ATOMS, 3, dtype=torch.float64) for _ in range(1000)]
+    out = composite(coords)
+    assert len(out) == 1000
+    n_a = proposer_a.stats["n_walkers"]
+    n_b = proposer_b.stats["n_walkers"]
+    assert n_a + n_b == 1000
+    assert 400 < n_a < 600  # 50/50 ± 10% slack at N=1000
+
+
+def test_composite_proposer_preserves_walker_order():
+    """Output[i] must come from whichever sub-proposer handled walker i,
+    irrespective of partitioning order. Check by reading the tag back from
+    the sentinel coords."""
+    proposer_a = _stub_proposer("a")  # tag value 1.0
+    proposer_b = _stub_proposer("b")  # tag value 2.0
+    composite = make_composite_proposer([proposer_a, proposer_b], seed=1)
+    coords = [torch.zeros(_TEST_N_ATOMS, 3, dtype=torch.float64) for _ in range(8)]
+    out = composite(coords)
+    for c, _, _, _ in out:
+        sentinel = float(c[0, 0])
+        assert sentinel in (1.0, 2.0)
+
+
+def test_composite_proposer_empty_input():
+    composite = make_composite_proposer(
+        [_stub_proposer("a"), _stub_proposer("b")], seed=0
+    )
+    assert composite([]) == []
+
+
+def test_composite_proposer_exposes_substats():
+    """`composite.stats[i]` is the stats dict of sub-proposer i."""
+    a = _stub_proposer("a")
+    b = _stub_proposer("b")
+    composite = make_composite_proposer([a, b])
+    assert composite.stats == [a.stats, b.stats]

@@ -337,15 +337,166 @@ def _compute_window_downstream_sets(
 
 
 # ---------------------------------------------------------------------------
+# Kabsch heavy-atom RMSD — shared dedup primitive
+# ---------------------------------------------------------------------------
+
+
+def _kabsch_rmsd_pairwise(
+    queries: torch.Tensor,
+    refs: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Pairwise Kabsch-aligned RMSDs between every query and every reference.
+
+    Both inputs should already be sliced to whatever atom subset defines
+    a basin (typically heavy atoms only). The function applies the
+    standard Kabsch algorithm: centre per-conformer, build the
+    cross-covariance H = r.T @ q for each (query, ref) pair, take the
+    SVD, correct for reflections via the determinant sign of U @ Vh,
+    rotate the references onto each query, and report the per-pair
+    RMSD. Translation- and rotation-invariant; no atom-permutation
+    symmetry handling.
+
+    Params:
+        queries: torch.Tensor : query coordinates, shape (..., n, 3).
+            Leading dims are broadcast as a "batch of queries"; passing
+            a single (n, 3) query gives an output of shape (K,).
+        refs: torch.Tensor : reference coordinates, shape (K, n, 3).
+    Returns:
+        torch.Tensor : RMSD per (query, ref) pair, shape (..., K), in
+            the input length units (typically Ångström).
+    """
+    if refs.dim() != 3:
+        raise ValueError(f"refs must be (K, n, 3), got {tuple(refs.shape)}")
+    if queries.dim() < 2 or queries.shape[-2:] != refs.shape[-2:]:
+        raise ValueError(
+            f"queries shape {tuple(queries.shape)} incompatible with "
+            f"refs shape {tuple(refs.shape)}"
+        )
+    n = refs.shape[-2]
+    if n < 2:
+        raise ValueError(f"need at least 2 atoms for Kabsch, got {n}")
+
+    q = (queries - queries.mean(dim=-2, keepdim=True)).to(torch.float64)
+    r = (refs - refs.mean(dim=-2, keepdim=True)).to(torch.float64)
+
+    # H[..., k, i, j] = sum_a r[k, a, i] * q[..., a, j] = (r[k]^T @ q[...])_{ij}
+    H = torch.einsum("kai,...aj->...kij", r, q)
+
+    U, _, Vh = torch.linalg.svd(H)
+    d = torch.sign(torch.linalg.det(torch.matmul(U, Vh)))  # (..., K)
+    diag = torch.ones(d.shape + (3,), dtype=torch.float64, device=q.device)
+    diag[..., 2] = d
+    D = torch.diag_embed(diag)
+    # Standard Kabsch with row-vec coords: R_align = V @ D @ U.T = Vh.T @ D @ U.T.
+    # aligned_r = r @ R_align.T → einsum below contracts r's atom-coordinate
+    # axis 'i' against R_align's axis 'i' (the last axis after .T on the matrix).
+    R = Vh.transpose(-2, -1) @ D @ U.transpose(-2, -1)
+    aligned_r = torch.einsum("kni,...kji->...knj", r, R)
+
+    err = aligned_r - q.unsqueeze(-3)
+    rmsd = torch.sqrt((err**2).sum(dim=(-2, -1)) / n)
+    return rmsd
+
+
+# ---------------------------------------------------------------------------
+# Inertia-tensor eigenvalues — CREST-style rotational dedup criterion
+# ---------------------------------------------------------------------------
+
+
+def _inertia_eigvals(
+    coords: torch.Tensor,
+    masses: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Sorted eigenvalues of the inertia tensor for one or more conformers.
+
+    Used by the CREST-style three-criteria dedup (Step 17 of
+    docs/mcmm_plan.md): two conformers are distinguishable by overall
+    shape — independent of translation, rotation, and atom-permutation
+    symmetry — when their inertia eigenvalues differ by more than the
+    rotational-constant anisotropy threshold.
+
+    The inertia tensor is:
+        I_{ab} = Σ_a m_a (||r_a||² δ_{ab} - r_{a,a} r_{a,b})
+    computed in the centre-of-mass frame. Eigenvalues are real and
+    non-negative; sorting ascending makes pairwise comparison
+    well-defined.
+
+    Params:
+        coords: torch.Tensor : (..., n_atoms, 3) atomic coordinates
+        masses: torch.Tensor : (n_atoms,) atomic masses (units cancel
+            in relative-difference comparisons; Da is conventional)
+    Returns:
+        torch.Tensor : (..., 3) ascending eigenvalues of the inertia
+            tensor
+    """
+    if coords.shape[-1] != 3:
+        raise ValueError(f"coords last dim must be 3, got {tuple(coords.shape)}")
+    if masses.dim() != 1 or masses.shape[0] != coords.shape[-2]:
+        raise ValueError(
+            f"masses shape {tuple(masses.shape)} must be ({coords.shape[-2]},)"
+        )
+    coords64 = coords.to(torch.float64)
+    masses64 = masses.to(torch.float64)
+
+    # Centre of mass.
+    M_total = masses64.sum()
+    com = (masses64.unsqueeze(-1) * coords64).sum(dim=-2, keepdim=True) / M_total
+    r = coords64 - com  # (..., n, 3)
+
+    # Trace term: Σ_a m_a |r_a|^2
+    r_sq = (r**2).sum(dim=-1)  # (..., n)
+    trace_term = (masses64 * r_sq).sum(dim=-1)  # (...,)
+
+    # Outer-product term: Σ_a m_a r_a r_aᵀ → (..., 3, 3)
+    weighted_r = masses64.unsqueeze(-1) * r
+    outer = torch.matmul(weighted_r.transpose(-2, -1), r)
+
+    eye = torch.eye(3, dtype=torch.float64, device=coords.device)
+    inertia = trace_term.unsqueeze(-1).unsqueeze(-1) * eye - outer
+    return torch.linalg.eigvalsh(inertia)  # (..., 3) ascending
+
+
+def _max_relative_eig_diff(
+    query: torch.Tensor,
+    stored: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Per-row max relative difference between a single query eigenvalue
+    triple and a stored batch.
+
+    For each row k of `stored`, returns the largest of
+    `|stored[k, i] - query[i]| / max(|stored[k, i]|, |query[i]|)` over
+    i ∈ {0, 1, 2}. This is the natural CREST-style "rotational
+    constant anisotropy" comparison: invariant to the absolute scale
+    of the inertia eigenvalues, captures distortion in any of the
+    three principal axes.
+
+    Params:
+        query: torch.Tensor : (3,) eigenvalues of the query conformer
+        stored: torch.Tensor : (K, 3) eigenvalues of K stored basins
+    Returns:
+        torch.Tensor : (K,) max relative differences in [0, 1)
+    """
+    diff = (stored - query.unsqueeze(0)).abs()  # (K, 3)
+    denom = torch.maximum(stored.abs(), query.unsqueeze(0).abs()).clamp(min=1e-12)
+    return (diff / denom).max(dim=-1).values  # (K,)
+
+
+# ---------------------------------------------------------------------------
 # Basin memory — shared across MCMM walkers
 # ---------------------------------------------------------------------------
 
 
-# Default normalised-L1 distance below which two conformers are considered
-# the same basin. Matches the default rmsd_threshold of
-# get_mol_PE_exhaustive's _energy_ranked_dedup so basin definitions are
-# consistent across the get_mol_PE_* family.
-DEFAULT_RMSD_THRESHOLD = 0.1
+# Default Kabsch heavy-atom RMSD (Å) below which two conformers are
+# considered the same basin. 0.125 Å matches CREMP / CREST / GOAT's
+# conformer-uniqueness contract, which is what `n_basins` should be
+# directly comparable to in the issue-#10 benchmark. Override to
+# 0.5 Å (the chemical "basin" scale) when looking for coarser
+# clustering; raise toward 1.0 Å to merge near-degenerate sub-basins
+# aggressively.
+DEFAULT_RMSD_THRESHOLD = 0.125
 
 
 class BasinMemory:
@@ -354,11 +505,12 @@ class BasinMemory:
 
     Stores one representative conformer (coordinates + MMFF energy) per
     discovered basin and tracks a per-basin visit counter for the
-    Saunders 1/√usage acceptance bias. Basins are distinguished by the
-    same normalised-L1 metric used by `_energy_ranked_dedup`:
-    `d = Σ|Δr| / (3 * n_atoms)`. Two conformers are in the same basin
-    if `d < rmsd_threshold` (strict `<`, matching the dedup primitive
-    so that thresholds are interchangeable).
+    Saunders 1/√usage acceptance bias. Basins are distinguished by
+    Kabsch-aligned RMSD over an optional atom subset (typically the
+    molecule's heavy atoms). Two conformers are in the same basin if
+    `kabsch_rmsd < rmsd_threshold` (strict `<`, matching
+    `_energy_ranked_dedup`'s dedup convention so thresholds are
+    interchangeable).
 
     Driver flow per accepted move:
 
@@ -383,13 +535,64 @@ class BasinMemory:
     Tensors live on `device` (CPU by default). Move to GPU only if
     profiling shows the per-step novelty query becomes hot — for
     typical macrocyclic peptides K stays in the low hundreds and the
-    CPU query is microseconds.
+    CPU query is microseconds. The Kabsch SVD dominates per-query cost
+    but is still O(K) 3x3 SVDs, ~tens of microseconds for K=200.
+
+    Two dedup modes are available:
+
+    - `dedup_mode='kabsch'` (default): two conformers are the same
+      basin iff their Kabsch heavy-atom RMSD is below `rmsd_threshold`.
+      Translation- and rotation-invariant; no atom-permutation
+      symmetry. Backward-compatible with all pre-Step-17 callers.
+    - `dedup_mode='crest'`: CREST/CREMP-style three-criteria dedup.
+      Two conformers are the same basin only when **all three** hold:
+      Kabsch RMSD < `rmsd_threshold` AND |ΔE| <
+      `energy_threshold_eV` AND inertia-eigenvalue max relative
+      diff < `rotconst_anisotropy_threshold`. Any one criterion
+      saying "different" keeps them as separate basins. Used for
+      paper-comparable basin counts vs CREMP `uniqueconfs`. Requires
+      `atomic_numbers` to compute inertia tensors. Energy criterion
+      uses MACE-on-MMFF-relaxed energies (already in `_energies`),
+      no extra compute.
 
     Params:
         n_atoms: int : number of atoms per conformer (must match every
-            coords tensor passed to add_basin / query_novelty)
-        rmsd_threshold: float : basin-distinguishing distance, normalised
-            L1 units (default 0.1, matching _energy_ranked_dedup)
+            coords tensor passed to add_basin / query_novelty). Stored
+            coords always include all atoms so the proposer can apply
+            moves to the full molecule.
+        rmsd_threshold: float : basin-distinguishing distance in Å
+            (Kabsch-RMSD units); default 0.125 Å, matching CREMP /
+            CREST / GOAT's `uniqueconfs` contract for direct
+            benchmark comparability. Override to 0.5 Å for coarser
+            "chemical basin" clustering.
+        heavy_atom_indices: list[int] | None : optional atom subset
+            used for distance comparisons; full coords are still
+            stored. Default None means all atoms (H included), which is
+            mostly useful for synthetic test fixtures — production
+            callers should pass the heavy-atom subset extracted from
+            the mol so the metric matches CREST's heavy-atom convention.
+        dedup_mode: str : 'kabsch' (default) or 'crest'.
+        energy_threshold_eV: float : energy criterion threshold in eV
+            for `dedup_mode='crest'`. Default 0.05 eV (≈ 1.2 kcal/mol)
+            is loose relative to CREST's xtb-based 0.05 kcal/mol — the
+            MACE float32 noise floor (~0.01–0.05 eV per the model's
+            ~1e-6 relative precision on 10⁴–10⁵ eV totals) sets a
+            practical floor below which the criterion would just see
+            noise. Still 2× tighter than thermal kT_298 (0.026 eV) so
+            it has discriminatory power.
+        rotconst_anisotropy_threshold: float : rotational-constant
+            criterion for `dedup_mode='crest'`. Default 0.01 (1%) is
+            CREST's middle of the documented 1–2.5% range. Compared
+            via max relative difference of the three inertia-tensor
+            eigenvalues.
+        atomic_numbers: list[int] | None : per-atom Z used to derive
+            masses for the inertia tensor. Required when
+            `dedup_mode='crest'`; ignored otherwise. Masses come from
+            RDKit's PeriodicTable.
+        saunders_exponent: float : exponent `p` in the Saunders bias
+            `1 / usage^p`. Default 0.5 matches Saunders 1990 (slow
+            decay, gentle re-visit penalty); 1.0 implements lever C15
+            (faster decay, pushes walkers out of deep wells harder).
         device: torch.device | str : device for stored tensors (default 'cpu')
     """
 
@@ -399,6 +602,13 @@ class BasinMemory:
         self,
         n_atoms: int,
         rmsd_threshold: float = DEFAULT_RMSD_THRESHOLD,
+        heavy_atom_indices=None,
+        *,
+        dedup_mode: str = "kabsch",
+        energy_threshold_eV: float = 0.05,
+        rotconst_anisotropy_threshold: float = 0.01,
+        atomic_numbers=None,
+        saunders_exponent: float = 0.5,
         device="cpu",
     ):
         if n_atoms <= 0:
@@ -407,14 +617,94 @@ class BasinMemory:
             raise ValueError(
                 f"rmsd_threshold must be non-negative, got {rmsd_threshold}"
             )
+        if dedup_mode not in ("kabsch", "crest"):
+            raise ValueError(
+                f"dedup_mode must be 'kabsch' or 'crest', got {dedup_mode!r}"
+            )
+        if energy_threshold_eV < 0:
+            raise ValueError(
+                f"energy_threshold_eV must be non-negative, got {energy_threshold_eV}"
+            )
+        if rotconst_anisotropy_threshold < 0:
+            raise ValueError(
+                f"rotconst_anisotropy_threshold must be non-negative, got "
+                f"{rotconst_anisotropy_threshold}"
+            )
+        if dedup_mode == "crest" and atomic_numbers is None:
+            raise ValueError(
+                "atomic_numbers is required when dedup_mode='crest' "
+                "(masses are needed to build the inertia tensor)"
+            )
+        if saunders_exponent <= 0:
+            raise ValueError(
+                f"saunders_exponent must be positive, got {saunders_exponent}"
+            )
         self.n_atoms = n_atoms
         self.rmsd_threshold = float(rmsd_threshold)
+        self.dedup_mode = dedup_mode
+        self.energy_threshold_eV = float(energy_threshold_eV)
+        self.rotconst_anisotropy_threshold = float(rotconst_anisotropy_threshold)
+        self.saunders_exponent = float(saunders_exponent)
         self.device = torch.device(device)
+        if heavy_atom_indices is None:
+            self._heavy_atom_indices = None
+        else:
+            heavy = list(heavy_atom_indices)
+            if not heavy:
+                raise ValueError("heavy_atom_indices must be non-empty when provided")
+            if len(heavy) < 2:
+                raise ValueError(
+                    "heavy_atom_indices must contain at least 2 atoms for Kabsch RMSD"
+                )
+            if any(i < 0 or i >= n_atoms for i in heavy):
+                raise ValueError(
+                    f"heavy_atom_indices out of range [0, {n_atoms}): {heavy}"
+                )
+            self._heavy_atom_indices = torch.tensor(
+                heavy, dtype=torch.int64, device=self.device
+            )
+        # Atomic-number-derived masses for the inertia tensor. Stored
+        # only when dedup_mode='crest'; otherwise None to keep the
+        # default-mode footprint identical to pre-Step-17 behaviour.
+        if atomic_numbers is None:
+            self._masses = None
+        else:
+            atomic_numbers = list(atomic_numbers)
+            if len(atomic_numbers) != n_atoms:
+                raise ValueError(
+                    f"atomic_numbers length ({len(atomic_numbers)}) must match "
+                    f"n_atoms ({n_atoms})"
+                )
+            from rdkit.Chem import GetPeriodicTable
+
+            pt = GetPeriodicTable()
+            self._masses = torch.tensor(
+                [pt.GetAtomicWeight(int(z)) for z in atomic_numbers],
+                dtype=torch.float64,
+                device=self.device,
+            )
         self._coords = torch.zeros(
             (0, n_atoms, 3), dtype=torch.float64, device=self.device
         )
         self._energies = torch.zeros((0,), dtype=torch.float64, device=self.device)
         self._usages = torch.zeros((0,), dtype=torch.int64, device=self.device)
+        # Per-basin inertia eigenvalues for crest mode. Empty in kabsch mode.
+        self._rotconsts = torch.zeros((0, 3), dtype=torch.float64, device=self.device)
+
+    def _select(self, coords: torch.Tensor) -> torch.Tensor:
+        """
+        Slice coords to the basin-distinguishing atom subset.
+
+        Params:
+            coords: torch.Tensor : (..., n_atoms, 3) — full-coord tensor
+                or batch thereof
+        Returns:
+            torch.Tensor : (..., n_select, 3) where n_select == len(
+                heavy_atom_indices) when configured, else n_atoms.
+        """
+        if self._heavy_atom_indices is None:
+            return coords
+        return coords.index_select(dim=-2, index=self._heavy_atom_indices)
 
     @property
     def n_basins(self) -> int:
@@ -467,35 +757,70 @@ class BasinMemory:
                 torch.tensor([1], dtype=torch.int64, device=self.device),
             ]
         )
+        if self.dedup_mode == "crest":
+            rot = _inertia_eigvals(coords_dev[0], self._masses).unsqueeze(0)  # (1, 3)
+            self._rotconsts = torch.cat([self._rotconsts, rot], dim=0)
         return self.n_basins - 1
 
-    def query_novelty(self, coords: torch.Tensor) -> tuple:
+    def query_novelty(self, coords: torch.Tensor, energy=None) -> tuple:
         """
         Find the closest stored basin and report whether it is within
         the basin-distinguishing threshold.
 
+        In `dedup_mode='kabsch'`, two conformers are the same basin iff
+        their Kabsch RMSD is below `rmsd_threshold`. In
+        `dedup_mode='crest'`, three concurrent criteria must all hold;
+        the closest stored basin (by RMSD) among the same-basin
+        candidates is returned, or None if no candidate satisfies all
+        three.
+
         Params:
             coords: torch.Tensor (n_atoms, 3) : conformer coordinates
+            energy: float | None : conformer energy (eV) — required
+                when `dedup_mode='crest'`, ignored when 'kabsch'.
         Returns:
             tuple[int | None, float] : (idx, distance). `idx` is None
-                when no stored basin is closer than `rmsd_threshold`;
-                otherwise it is the index of the closest basin.
-                `distance` is the closest distance regardless of
-                threshold; `inf` when memory is empty.
+                when no stored basin satisfies the active dedup
+                criteria; otherwise it is the index of the closest
+                basin (by RMSD) among the matches. `distance` is the
+                closest Kabsch RMSD regardless of threshold; `inf`
+                when memory is empty.
         """
+        if self.dedup_mode == "crest" and energy is None:
+            raise ValueError(
+                "energy is required for query_novelty when dedup_mode='crest'"
+            )
         coords = self._validate_coords(coords)
         if self.n_basins == 0:
             return None, math.inf
-        coords_dev = coords.to(self.device, dtype=torch.float64).unsqueeze(0)
-        diffs = (self._coords - coords_dev).abs()  # (K, n_atoms, 3)
-        distances = diffs.sum(dim=(1, 2)) / (3 * self.n_atoms)  # (K,)
-        min_dist, min_idx = distances.min(dim=0)
-        min_dist_f = float(min_dist.item())
-        if min_dist_f < self.rmsd_threshold:
-            return int(min_idx.item()), min_dist_f
-        return None, min_dist_f
+        coords_dev = coords.to(self.device, dtype=torch.float64)
+        distances = _kabsch_rmsd_pairwise(
+            self._select(coords_dev),
+            self._select(self._coords),
+        )  # (K,)
+        rmsd_close = distances < self.rmsd_threshold
 
-    def query_novelty_batch(self, coords_batch: torch.Tensor) -> tuple:
+        if self.dedup_mode == "crest":
+            de_close = (self._energies - float(energy)).abs() < self.energy_threshold_eV
+            query_rot = _inertia_eigvals(coords_dev, self._masses)
+            rot_diff = _max_relative_eig_diff(query_rot, self._rotconsts)
+            rot_close = rot_diff < self.rotconst_anisotropy_threshold
+            same_basin = rmsd_close & de_close & rot_close
+        else:
+            same_basin = rmsd_close
+
+        if same_basin.any():
+            # Among the matches, return the closest by RMSD.
+            masked = torch.where(
+                same_basin,
+                distances,
+                torch.full_like(distances, float("inf")),
+            )
+            min_dist, min_idx = masked.min(dim=0)
+            return int(min_idx.item()), float(min_dist.item())
+        return None, float(distances.min().item())
+
+    def query_novelty_batch(self, coords_batch: torch.Tensor, energies=None) -> tuple:
         """
         Batched novelty query for many candidate conformers in one pass.
 
@@ -506,17 +831,24 @@ class BasinMemory:
 
         Params:
             coords_batch: torch.Tensor (B, n_atoms, 3) : candidate coords
+            energies: torch.Tensor | array-like | None : (B,) per-candidate
+                energies in eV. Required when `dedup_mode='crest'`,
+                ignored when 'kabsch'.
         Returns:
             tuple[torch.Tensor, torch.Tensor] : (indices, distances).
                 `indices` is an int64 tensor of shape (B,) where -1
-                marks candidates outside `rmsd_threshold` of every
-                stored basin. `distances` is a float64 tensor of shape
-                (B,) with the closest distance per candidate; `inf` for
-                every entry when memory is empty.
+                marks candidates that fail the active dedup criteria
+                against every stored basin. `distances` is a float64
+                tensor of shape (B,) with the closest Kabsch RMSD per
+                candidate; `inf` for every entry when memory is empty.
         """
         if coords_batch.dim() != 3 or coords_batch.shape[1:] != (self.n_atoms, 3):
             raise ValueError(
                 f"coords_batch must be (B, {self.n_atoms}, 3), got {tuple(coords_batch.shape)}"
+            )
+        if self.dedup_mode == "crest" and energies is None:
+            raise ValueError(
+                "energies is required for query_novelty_batch when dedup_mode='crest'"
             )
         b = int(coords_batch.shape[0])
         if self.n_basins == 0:
@@ -525,15 +857,46 @@ class BasinMemory:
                 torch.full((b,), math.inf, dtype=torch.float64, device=self.device),
             )
         coords_dev = coords_batch.to(self.device, dtype=torch.float64)
-        # (B, 1, n_atoms, 3) - (1, K, n_atoms, 3) → (B, K, n_atoms, 3)
-        diffs = (coords_dev.unsqueeze(1) - self._coords.unsqueeze(0)).abs()
-        distances = diffs.sum(dim=(2, 3)) / (3 * self.n_atoms)  # (B, K)
-        min_dist, min_idx = distances.min(dim=1)  # (B,), (B,)
-        novel = min_dist >= self.rmsd_threshold
+        distances = _kabsch_rmsd_pairwise(
+            self._select(coords_dev),  # (B, n_select, 3)
+            self._select(self._coords),  # (K, n_select, 3)
+        )  # (B, K)
+        rmsd_close = distances < self.rmsd_threshold
+
+        if self.dedup_mode == "crest":
+            e_t = torch.as_tensor(energies, dtype=torch.float64, device=self.device)
+            if e_t.shape != (b,):
+                raise ValueError(
+                    f"energies must have shape ({b},), got {tuple(e_t.shape)}"
+                )
+            de = (self._energies.unsqueeze(0) - e_t.unsqueeze(1)).abs()  # (B, K)
+            de_close = de < self.energy_threshold_eV
+            query_rot = _inertia_eigvals(coords_dev, self._masses)  # (B, 3)
+            # Per (b, k): max-rel-diff between query_rot[b] and self._rotconsts[k].
+            diff = (
+                self._rotconsts.unsqueeze(0) - query_rot.unsqueeze(1)
+            ).abs()  # (B, K, 3)
+            denom = torch.maximum(
+                self._rotconsts.unsqueeze(0).abs(), query_rot.unsqueeze(1).abs()
+            ).clamp(min=1e-12)
+            rot_diff = (diff / denom).max(dim=-1).values  # (B, K)
+            rot_close = rot_diff < self.rotconst_anisotropy_threshold
+            same_basin = rmsd_close & de_close & rot_close
+        else:
+            same_basin = rmsd_close
+
+        masked = torch.where(
+            same_basin,
+            distances,
+            torch.full_like(distances, float("inf")),
+        )
+        min_masked, min_match_idx = masked.min(dim=1)
+        any_match = ~torch.isinf(min_masked)
+        min_dist = distances.min(dim=1).values
         indices = torch.where(
-            novel,
+            any_match,
+            min_match_idx,
             torch.tensor(self.NOVEL, dtype=torch.int64, device=self.device),
-            min_idx,
         )
         return indices, min_dist
 
@@ -554,13 +917,17 @@ class BasinMemory:
 
     def acceptance_bias(self, idx) -> float:
         """
-        Saunders 1/√usage acceptance-bias factor for a proposed basin.
+        Saunders 1/usage^p acceptance-bias factor for a proposed basin.
 
         Returns 1.0 (no bias) when `idx` is None — a novel basin is
         always at "first visit" relative to memory, so we don't suppress
-        its acceptance. For known basins, returns 1/√usage[idx], which
-        decays slowly enough that re-discovered basins remain reachable
-        but progressively penalised.
+        its acceptance. For known basins, returns
+        `1 / usage[idx]^saunders_exponent`. Saunders 1990 used p=0.5
+        (the default here, decays slowly so re-discovered basins
+        remain reachable). Lever C15 of docs/mcmm_plan.md raises p
+        toward 1 to push walkers out of deep wells faster — useful
+        when Cartesian-kicks (Step 12) keep finding deep traps that
+        the default 1/√usage doesn't escape.
 
         Params:
             idx: int | None : basin index from `query_novelty`, or None
@@ -572,7 +939,8 @@ class BasinMemory:
             return 1.0
         if not (0 <= idx < self.n_basins):
             raise IndexError(f"basin index {idx} out of range [0, {self.n_basins})")
-        return 1.0 / math.sqrt(int(self._usages[idx].item()))
+        usage = int(self._usages[idx].item())
+        return 1.0 / (usage**self.saunders_exponent)
 
     def _validate_coords(self, coords: torch.Tensor) -> torch.Tensor:
         """Shape-check single-conformer coordinates."""
@@ -664,7 +1032,9 @@ class MCMMWalker:
         self.n_accepted = 0
         # Latch onto the initial basin in memory. Add only if it is novel —
         # avoids double-counting when a shared memory already contains it.
-        idx, _ = memory.query_novelty(self.coords)
+        # `energy` is forwarded so crest-mode memory can apply its energy
+        # criterion; kabsch-mode ignores it.
+        idx, _ = memory.query_novelty(self.coords, energy=self.energy)
         if idx is None:
             self.current_basin_idx = memory.add_basin(self.coords, self.energy)
         else:
@@ -731,7 +1101,9 @@ class MCMMWalker:
         if not success:
             return False
 
-        proposed_idx, _ = self.memory.query_novelty(new_coords)
+        proposed_idx, _ = self.memory.query_novelty(
+            new_coords, energy=float(new_energy)
+        )
         bias = self.memory.acceptance_bias(proposed_idx)
         delta_e = float(new_energy) - self.energy
         p_accept = self._acceptance_prob(delta_e, bias, float(det_j))
@@ -1379,4 +1751,239 @@ def make_mcmm_proposer(
     # Expose cumulative stats so the orchestrator (get_mol_PE_mcmm) can
     # read closure-failure rates and diagnose "1 basin" regressions.
     batch_propose_fn.stats = stats
+    return batch_propose_fn
+
+
+# ---------------------------------------------------------------------------
+# Cartesian-kick proposer — GOAT-style topology-preserving move
+# ---------------------------------------------------------------------------
+
+
+def make_cartesian_kick_proposer(
+    mol: Chem.Mol,
+    hardware_opts,
+    calc,
+    sigma_kick_a: float = 0.1,
+    score_chunk_size: int = 500,
+    mmff_backend: str = "gpu",
+    seed: int = 0,
+):
+    """
+    Build a `batch_propose_fn` that applies an isotropic Gaussian kick
+    to all atom positions, MMFF-relaxes, and MACE-scores. The
+    GOAT-flavour move type: complements DBT's dihedral-space
+    parameterisation by reaching geometries that small dihedral
+    perturbations can't (side-chain rotamer flips, depsipeptide ester
+    rearrangements, etc.).
+
+    Per-call pipeline:
+
+      1. **Per-walker kick** (CPU, vectorised): add `N(0, sigma_kick_a²)`
+         noise independently to every atom-coordinate of every walker.
+         No closure step or backbone parameterisation; rely on MMFF to
+         pull bond lengths and ring sp² angles back to equilibrium.
+      2. **Batched MMFF** (GPU, one call): stage every kicked candidate
+         as a conformer on a shared throwaway mol and run
+         `nvmolkit.mmffOptimization.MMFFOptimizeMoleculesConfs`.
+      3. **Batched MACE** (GPU, chunked) via `_mace_batch_energies`.
+      4. **Return** `(coords_tensor, energy_float, det_j=1.0,
+         success=True)` per walker. The Gaussian kick is symmetric in
+         coordinate space so detailed balance needs no Jacobian
+         correction; the post-MMFF state is treated as the proposal
+         outcome regardless of the relaxation trajectory (the same
+         convention `make_mcmm_proposer` uses).
+
+    Topology preservation is approximate, not strict: GOAT freezes
+    bonds and ring sp² angles via constraints during the uphill push,
+    while we let MMFF relax them. For peptide cyclisations and N-Me
+    bonds this is fine — MMFF's bond-stretch term has a steep gradient
+    that pulls covalent bonds back to equilibrium even from large
+    kicks. For sigma_kick_a beyond ~0.3 Å, expect occasional MMFF
+    non-convergence or bond-breaking; tune accordingly.
+
+    Params:
+        mol: Chem.Mol : reference molecule with explicit Hs. Topology
+            captured at factory build time; do not mutate structurally.
+        hardware_opts : nvmolkit hardware options for batched MMFF
+            (only used when `mmff_backend='gpu'`).
+        calc : MACECalculator from `get_mace_calc()`.
+        sigma_kick_a: float : Gaussian standard deviation in Å applied
+            independently to every atom-coordinate (default 0.1 Å).
+            Treat as the move-magnitude analogue of DBT's
+            `drive_sigma_rad`.
+        score_chunk_size: int : MACE per-batch forward pass cap
+            (default 500).
+        mmff_backend: str : 'gpu' (nvmolkit batched CUDA) or 'cpu'
+            (RDKit serial).
+        seed: int : RNG seed for the per-step kicks.
+    Returns:
+        callable : `batch_propose_fn(coords_list) -> list[tuple]`
+            matching the `ParallelMCMMDriver` /
+            `ReplicaExchangeMCMMDriver` proposer contract.
+    Raises:
+        ValueError: on unknown `mmff_backend`.
+    """
+    if mmff_backend not in ("gpu", "cpu"):
+        raise ValueError(
+            f"unknown mmff_backend {mmff_backend!r}; expected 'gpu' or 'cpu'"
+        )
+
+    n_atoms = mol.GetNumAtoms()
+    atomic_nums = [a.GetAtomicNum() for a in mol.GetAtoms()]
+    template_mol = Chem.Mol(mol)
+    template_mol.RemoveAllConformers()
+
+    rng = np.random.default_rng(seed)
+    stats = {"n_proposed": 0, "n_relax_failures": 0, "n_relax_successes": 0}
+
+    def batch_propose_fn(coords_list):
+        from confsweeper import _mace_batch_energies
+
+        n_walkers = len(coords_list)
+        if n_walkers == 0:
+            return []
+        stats["n_proposed"] += n_walkers
+
+        # Stage 1: per-walker isotropic Gaussian kick.
+        kicked_coords: list = []
+        for coords in coords_list:
+            coords_np = coords.detach().cpu().numpy().astype(np.float64)
+            kick = rng.normal(0.0, sigma_kick_a, size=coords_np.shape)
+            kicked_coords.append(coords_np + kick)
+
+        # Stage 2: batched MMFF on a fresh throwaway mol.
+        throwaway = Chem.Mol(template_mol)
+        for kc in kicked_coords:
+            conf = Chem.Conformer(n_atoms)
+            for a_idx in range(n_atoms):
+                x, y, z = kc[a_idx]
+                conf.SetAtomPosition(a_idx, (float(x), float(y), float(z)))
+            throwaway.AddConformer(conf, assignId=True)
+
+        if mmff_backend == "gpu":
+            from nvmolkit.mmffOptimization import MMFFOptimizeMoleculesConfs
+
+            MMFFOptimizeMoleculesConfs([throwaway], hardwareOptions=hardware_opts)
+        else:
+            from rdkit.Chem import AllChem as _AllChem
+
+            for cid in [c.GetId() for c in throwaway.GetConformers()]:
+                _AllChem.MMFFOptimizeMolecule(throwaway, confId=cid)
+
+        # Stage 3: batched MACE scoring, chunked.
+        post_mmff_conf_ids = [c.GetId() for c in throwaway.GetConformers()]
+        energies: list = []
+        for start in range(0, len(post_mmff_conf_ids), score_chunk_size):
+            chunk_ids = post_mmff_conf_ids[start : start + score_chunk_size]
+            ase_mols = [
+                ase.Atoms(
+                    positions=throwaway.GetConformer(cid).GetPositions(),
+                    numbers=atomic_nums,
+                )
+                for cid in chunk_ids
+            ]
+            energies.extend(_mace_batch_energies(calc, ase_mols))
+
+        # Stage 4: assemble per-walker proposals. det_j=1.0 for the
+        # symmetric Gaussian kick. Walkers whose post-MMFF energy is
+        # non-finite (MMFF blow-up — rare but possible at large
+        # sigma_kick_a) get success=False so the driver rejects.
+        proposals: list = []
+        for slot, cid in enumerate(post_mmff_conf_ids):
+            new_coords = torch.tensor(
+                throwaway.GetConformer(cid).GetPositions(), dtype=torch.float64
+            )
+            e = float(energies[slot])
+            if not np.isfinite(e):
+                stats["n_relax_failures"] += 1
+                proposals.append((coords_list[slot], 0.0, 0.0, False))
+            else:
+                stats["n_relax_successes"] += 1
+                proposals.append((new_coords, e, 1.0, True))
+        return proposals
+
+    batch_propose_fn.stats = stats
+    return batch_propose_fn
+
+
+# ---------------------------------------------------------------------------
+# Composite proposer — randomly route walkers to one of several sub-proposers
+# ---------------------------------------------------------------------------
+
+
+def make_composite_proposer(
+    proposers,
+    weights=None,
+    seed: int = 0,
+):
+    """
+    Build a `batch_propose_fn` that routes each walker to one of N
+    sub-proposers per step, sampled by `weights`. Lets DBT and
+    Cartesian-kick (or future move types) coexist in one MCMM run.
+
+    Routing happens at the walker level, not the step level — so a
+    single REMD step can have some walkers proposing DBT moves and
+    others proposing Cartesian kicks. Walkers are partitioned by
+    chosen proposer, each sub-proposer is invoked on its subset
+    (preserving its internal batching), and results are reassembled
+    in walker order.
+
+    Each sub-proposer's `.stats` dict is preserved on the composite
+    return value as `.stats[i]` so callers can inspect per-proposer
+    diagnostics. The composite itself does not aggregate counters.
+
+    Params:
+        proposers: list[callable] : sub-proposers, each matching the
+            `batch_propose_fn(coords_list) -> list[tuple]` contract.
+        weights: list[float] | None : sampling weight per proposer.
+            Default None means uniform. Normalised internally.
+        seed: int : routing RNG seed; deterministic across replicate
+            runs.
+    Returns:
+        callable : `batch_propose_fn(coords_list) -> list[tuple]`.
+            Carries `.stats = [p.stats for p in proposers]` (list,
+            indexed by proposer position).
+    Raises:
+        ValueError: empty `proposers`, weight/proposer count mismatch,
+            or any non-positive weight.
+    """
+    if not proposers:
+        raise ValueError("proposers must be non-empty")
+    if weights is None:
+        weights_arr = np.full(len(proposers), 1.0 / len(proposers))
+    else:
+        if len(weights) != len(proposers):
+            raise ValueError(
+                f"weights ({len(weights)}) must match proposers ({len(proposers)})"
+            )
+        if any(w <= 0 for w in weights):
+            raise ValueError(f"weights must be positive, got {weights}")
+        w_arr = np.asarray(weights, dtype=np.float64)
+        weights_arr = w_arr / w_arr.sum()
+
+    rng = np.random.default_rng(seed)
+
+    def batch_propose_fn(coords_list):
+        n = len(coords_list)
+        if n == 0:
+            return []
+        choices = rng.choice(len(proposers), size=n, p=weights_arr)
+
+        results: list = [None] * n
+        for p_idx, propose_fn in enumerate(proposers):
+            walker_idx = [w for w in range(n) if choices[w] == p_idx]
+            if not walker_idx:
+                continue
+            sub_coords = [coords_list[w] for w in walker_idx]
+            sub_results = propose_fn(sub_coords)
+            if len(sub_results) != len(sub_coords):
+                raise RuntimeError(
+                    f"proposer {p_idx} returned {len(sub_results)} results for "
+                    f"{len(sub_coords)} walkers"
+                )
+            for w, r in zip(walker_idx, sub_results):
+                results[w] = r
+        return results
+
+    batch_propose_fn.stats = [p.stats for p in proposers if hasattr(p, "stats")]
     return batch_propose_fn

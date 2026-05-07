@@ -65,7 +65,14 @@ from rdkit.Chem.rdDistGeom import ETKDGv3
 from rdkit.ML.Cluster.Butina import ClusterData
 from tqdm import tqdm
 
-from mcmm import BasinMemory, MCMMWalker, ReplicaExchangeMCMMDriver, make_mcmm_proposer
+from mcmm import (
+    BasinMemory,
+    MCMMWalker,
+    ReplicaExchangeMCMMDriver,
+    _inertia_eigvals,
+    _kabsch_rmsd_pairwise,
+    make_mcmm_proposer,
+)
 from torsional_sampling import load_ramachandran_grids, sample_constrained_confs
 
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -446,6 +453,12 @@ def _energy_ranked_dedup(
     coords: torch.Tensor,
     energies: np.ndarray,
     rmsd_threshold: float,
+    heavy_atom_indices=None,
+    *,
+    dedup_mode: str = "kabsch",
+    energy_threshold_eV: float = 0.05,
+    rotconst_anisotropy_threshold: float = 0.01,
+    atomic_numbers=None,
 ) -> list[int]:
     """
     Pick basin representatives by energy rank with a geometric exclusion radius.
@@ -455,35 +468,92 @@ def _energy_ranked_dedup(
     iterates lowest energy first, so each basin's representative is its
     energy minimum.
 
-    Distances use the same normalised L1 metric as get_mol_PE_batched so the
-    rmsd_threshold parameter is comparable to its cutoff_dist (default 0.1).
+    Two dedup modes are available — same contract as `BasinMemory`:
+
+    - `dedup_mode='kabsch'` (default): two conformers are merged when
+      their Kabsch heavy-atom RMSD is below `rmsd_threshold`.
+    - `dedup_mode='crest'`: CREST/CREMP three-criteria — merge only
+      when Kabsch RMSD < threshold AND |ΔE| <
+      `energy_threshold_eV` AND inertia-eigenvalue max relative
+      diff < `rotconst_anisotropy_threshold`. Requires
+      `atomic_numbers` for inertia-tensor masses. Step 17 of
+      docs/mcmm_plan.md.
 
     Params:
         coords: torch.Tensor : conformer coordinates [N, A, 3]
         energies: ndarray [N] : potential energies in eV (any shift; only differences matter)
-        rmsd_threshold: float : exclusion radius in normalised L1 units (sum |Δ| / 3·A)
+        rmsd_threshold: float : exclusion radius as Kabsch RMSD in Å
+            (default 0.125 across the get_mol_PE_* family, matching
+            CREMP / CREST / GOAT)
+        heavy_atom_indices: list[int] | None : atoms used for distance
+            comparisons. None means all atoms (synthetic-test convention);
+            production callers extract heavy atoms from the mol so the
+            metric matches CREST's heavy-atom convention.
+        dedup_mode: str : 'kabsch' (default) or 'crest'.
+        energy_threshold_eV: float : energy criterion in eV; default
+            0.05 (≈ 1.2 kcal/mol; loose to absorb MACE float32 noise
+            but still 2× tighter than thermal kT_298).
+        rotconst_anisotropy_threshold: float : rotational-constant
+            criterion; default 0.01 (1%).
+        atomic_numbers: list[int] | None : per-atom Z used to derive
+            masses for the inertia tensor in `dedup_mode='crest'`.
     Returns:
         list[int] : indices into the input arrays of the chosen centroids,
                     ordered by ascending energy
     """
+    if dedup_mode not in ("kabsch", "crest"):
+        raise ValueError(f"dedup_mode must be 'kabsch' or 'crest', got {dedup_mode!r}")
     n = coords.shape[0]
     if n == 0:
         return []
     if n == 1:
         return [0]
 
-    n_atoms = coords.shape[1]
-    flat = coords.reshape(n, -1)
+    if heavy_atom_indices is None:
+        compare_coords = coords
+    else:
+        idx_tensor = torch.tensor(
+            list(heavy_atom_indices), dtype=torch.int64, device=coords.device
+        )
+        compare_coords = coords.index_select(dim=1, index=idx_tensor)
+
+    if dedup_mode == "crest":
+        if atomic_numbers is None:
+            raise ValueError("atomic_numbers is required when dedup_mode='crest'")
+        from rdkit.Chem import GetPeriodicTable
+
+        pt = GetPeriodicTable()
+        masses = torch.tensor(
+            [pt.GetAtomicWeight(int(z)) for z in atomic_numbers],
+            dtype=torch.float64,
+            device=coords.device,
+        )
+        rotconsts = _inertia_eigvals(coords.to(torch.float64), masses)  # (N, 3)
+        e_t = torch.as_tensor(
+            np.asarray(energies), dtype=torch.float64, device=coords.device
+        )
+
     order = np.argsort(np.asarray(energies), kind="stable")
 
-    excluded = torch.zeros(n, dtype=torch.bool, device=flat.device)
+    excluded = torch.zeros(n, dtype=torch.bool, device=compare_coords.device)
     centroids: list[int] = []
     for idx in order.tolist():
         if bool(excluded[idx]):
             continue
         centroids.append(idx)
-        d = (flat - flat[idx].unsqueeze(0)).abs().sum(dim=1) / (3 * n_atoms)
-        excluded |= d < rmsd_threshold
+        d = _kabsch_rmsd_pairwise(compare_coords[idx], compare_coords)  # (N,)
+        rmsd_close = d < rmsd_threshold
+        if dedup_mode == "crest":
+            de_close = (e_t - e_t[idx]).abs() < energy_threshold_eV
+            diff = (rotconsts - rotconsts[idx].unsqueeze(0)).abs()
+            denom = torch.maximum(
+                rotconsts.abs(), rotconsts[idx].unsqueeze(0).abs()
+            ).clamp(min=1e-12)
+            rot_diff = (diff / denom).max(dim=-1).values  # (N,)
+            rot_close = rot_diff < rotconst_anisotropy_threshold
+            excluded |= rmsd_close & de_close & rot_close
+        else:
+            excluded |= rmsd_close
     return centroids
 
 
@@ -582,6 +652,10 @@ def _minimize_score_filter_dedup(
     rmsd_threshold: float,
     minimize: bool,
     mmff_backend: str,
+    *,
+    dedup_mode: str = "kabsch",
+    energy_threshold_eV: float = 0.05,
+    rotconst_anisotropy_threshold: float = 0.01,
 ) -> Tuple[Chem.Mol, List[int], List[float]]:
     """
     Shared post-sampling pipeline tail used by every get_mol_PE_* family
@@ -600,7 +674,8 @@ def _minimize_score_filter_dedup(
          argmin-energy conformer is force-kept in that case.
       4. Energy-ranked geometric dedup via _energy_ranked_dedup, keeping the
          lowest-energy member of each geometric basin defined by
-         rmsd_threshold (normalised L1 units). Singleton survivors skip
+         rmsd_threshold (Kabsch heavy-atom RMSD in Å). Heavy-atom
+         indices are derived from `mol` here. Singleton survivors skip
          dedup entirely.
       5. Drop non-centroid conformers from the mol so the returned object
          matches the (mol, conf_ids, energies) contract used across the
@@ -617,7 +692,8 @@ def _minimize_score_filter_dedup(
         calc : MACECalculator from get_mace_calc()
         score_chunk_size: int : per-batch MACE forward pass cap
         e_window_kT: float : energy filter window in units of kT_298K
-        rmsd_threshold: float : geometric dedup exclusion radius (normalised L1)
+        rmsd_threshold: float : geometric dedup exclusion radius
+            (Kabsch heavy-atom RMSD, Å; default 0.125 matches CREMP)
         minimize: bool : MMFF94-minimize each conformer before scoring
         mmff_backend: str : 'gpu' (nvmolkit batched CUDA) or 'cpu' (RDKit serial).
             Only consulted when minimize=True.
@@ -687,8 +763,18 @@ def _minimize_score_filter_dedup(
         coords = torch.tensor(
             np.array([mol.GetConformer(cid).GetPositions() for cid in kept_conf_ids])
         )
+        heavy_atom_indices = [
+            i for i, a in enumerate(mol.GetAtoms()) if a.GetAtomicNum() != 1
+        ]
         centroid_pool_idx = _energy_ranked_dedup(
-            coords, kept_energies, rmsd_threshold=rmsd_threshold
+            coords,
+            kept_energies,
+            rmsd_threshold=rmsd_threshold,
+            heavy_atom_indices=heavy_atom_indices,
+            dedup_mode=dedup_mode,
+            energy_threshold_eV=energy_threshold_eV,
+            rotconst_anisotropy_threshold=rotconst_anisotropy_threshold,
+            atomic_numbers=atomic_nums if dedup_mode == "crest" else None,
         )
         centroid_ids = [kept_conf_ids[i] for i in centroid_pool_idx]
         centroid_energies = [float(kept_energies[i]) for i in centroid_pool_idx]
@@ -713,10 +799,13 @@ def get_mol_PE_exhaustive(
     embed_chunk_size: int = 1000,
     score_chunk_size: int = 500,
     e_window_kT: float = 5.0,
-    rmsd_threshold: float = 0.1,
+    rmsd_threshold: float = 0.125,
     minimize: bool = True,
     mmff_backend: str = "gpu",
     dihedral_jitter_deg: float = 0.0,
+    dedup_mode: str = "kabsch",
+    energy_threshold_eV: float = 0.05,
+    rotconst_anisotropy_threshold: float = 0.01,
     seed: int = 0,
 ) -> Tuple[Chem.Mol, List[int], List[float]]:
     """
@@ -798,7 +887,8 @@ def get_mol_PE_exhaustive(
         embed_chunk_size: int : per-call cap before chunking; tune to GPU memory
         score_chunk_size: int : per-batch MACE forward pass cap
         e_window_kT: float : energy filter window in units of kT_298K
-        rmsd_threshold: float : geometric dedup exclusion radius (normalised L1)
+        rmsd_threshold: float : geometric dedup exclusion radius
+            (Kabsch heavy-atom RMSD, Å; default 0.125 matches CREMP)
         minimize: bool : MMFF94-minimize each conformer before scoring
         mmff_backend: str : 'gpu' (default; nvmolkit batched CUDA) or 'cpu'
             (RDKit serial). Only consulted when minimize=True. See pipeline
@@ -871,6 +961,9 @@ def get_mol_PE_exhaustive(
         rmsd_threshold=rmsd_threshold,
         minimize=minimize,
         mmff_backend=mmff_backend,
+        dedup_mode=dedup_mode,
+        energy_threshold_eV=energy_threshold_eV,
+        rotconst_anisotropy_threshold=rotconst_anisotropy_threshold,
     )
 
 
@@ -885,9 +978,12 @@ def get_mol_PE_pool_b(
     strategy: str = "inverse",
     score_chunk_size: int = 500,
     e_window_kT: float = 5.0,
-    rmsd_threshold: float = 0.1,
+    rmsd_threshold: float = 0.125,
     minimize: bool = True,
     mmff_backend: str = "gpu",
+    dedup_mode: str = "kabsch",
+    energy_threshold_eV: float = 0.05,
+    rotconst_anisotropy_threshold: float = 0.01,
     seed: int = 0,
 ) -> Tuple[Chem.Mol, List[int], List[float]]:
     """
@@ -934,7 +1030,8 @@ def get_mol_PE_pool_b(
         strategy: str : 'inverse' (default; oversample rare cells) or 'uniform'
         score_chunk_size: int : per-batch MACE forward pass cap
         e_window_kT: float : energy filter window in units of kT_298K
-        rmsd_threshold: float : geometric dedup exclusion radius (normalised L1)
+        rmsd_threshold: float : geometric dedup exclusion radius
+            (Kabsch heavy-atom RMSD, Å; default 0.125 matches CREMP)
         minimize: bool : MMFF94-minimize each conformer before scoring
         mmff_backend: str : 'gpu' (nvmolkit batched CUDA) or 'cpu' (RDKit serial)
         seed: int : random seed for the (phi, psi) RNG and CPU embed attempts
@@ -969,6 +1066,9 @@ def get_mol_PE_pool_b(
         rmsd_threshold=rmsd_threshold,
         minimize=minimize,
         mmff_backend=mmff_backend,
+        dedup_mode=dedup_mode,
+        energy_threshold_eV=energy_threshold_eV,
+        rotconst_anisotropy_threshold=rotconst_anisotropy_threshold,
     )
 
 
@@ -1013,12 +1113,18 @@ def get_mol_PE_mcmm(
     swap_interval: int = 20,
     drive_sigma_rad: float = 0.1,
     closure_tol: float = 0.01,
+    sigma_kick_a: float = 0.1,
+    cartesian_weight: float = 0.0,
     score_chunk_size: int = 500,
     e_window_kT: float = 5.0,
-    rmsd_threshold: float = 0.1,
+    rmsd_threshold: float = 0.125,
     minimize: bool = True,
     mmff_backend: str = "gpu",
     n_init_confs: int = 1,
+    dedup_mode: str = "kabsch",
+    energy_threshold_eV: float = 0.05,
+    rotconst_anisotropy_threshold: float = 0.01,
+    saunders_exponent: float = 0.5,
     seed: int = 0,
 ) -> Tuple[Chem.Mol, List[int], List[float]]:
     """
@@ -1079,10 +1185,20 @@ def get_mol_PE_mcmm(
         drive_sigma_rad: float : Gaussian σ for drive-angle perturbation
             in radians (default 0.1 ≈ 5.7°)
         closure_tol: float : DBT closure tolerance in Å (default 0.01)
+        sigma_kick_a: float : Gaussian σ for the GOAT-style Cartesian
+            kick proposer in Å (default 0.1). Only consulted when
+            cartesian_weight > 0.
+        cartesian_weight: float : routing weight for the Cartesian kick
+            proposer relative to DBT. Default 0.0 means pure-DBT
+            (legacy behaviour). Set to 0.5 for a 50/50 mix per walker
+            per step — DBT for backbone-topology moves, Cartesian
+            kicks for side-chain rotamer / non-dihedral motions.
+            Step 12 in docs/mcmm_plan.md.
         score_chunk_size: int : MACE per-batch forward pass cap
         e_window_kT: float : energy filter window in kT_298K units
-        rmsd_threshold: float : geometric dedup exclusion radius in
-            normalised L1 units (matches `_energy_ranked_dedup`)
+        rmsd_threshold: float : geometric dedup exclusion radius
+            (Kabsch heavy-atom RMSD, Å; default 0.125 matches CREMP /
+            `_energy_ranked_dedup` / `BasinMemory`)
         minimize: bool : MMFF94-minimise the seed and final basins
         mmff_backend: str : 'gpu' (nvmolkit) or 'cpu' (RDKit serial)
         n_init_confs: int : number of distinct ETKDG seed conformers
@@ -1161,8 +1277,25 @@ def get_mol_PE_mcmm(
         for cid in seed_conf_ids
     ]
 
-    # 2. Build the shared basin memory.
-    memory = BasinMemory(n_atoms=n_atoms, rmsd_threshold=rmsd_threshold)
+    # 2. Build the shared basin memory. Heavy-atom indices are derived
+    # from the mol so the Kabsch RMSD comparison ignores hydrogens —
+    # matches CREST/CREMP's heavy-atom convention and removes the
+    # noisier H-position contribution from the basin distinguisher.
+    # `dedup_mode='crest'` activates the three-criteria AND-test (Step
+    # 17 of docs/mcmm_plan.md) and aligns BasinMemory's in-run dedup
+    # with the post-MCMM filter — see the entry-point validation note
+    # below for why these have to match.
+    heavy_atom_indices = [i for i, num in enumerate(atomic_nums) if num != 1]
+    memory = BasinMemory(
+        n_atoms=n_atoms,
+        rmsd_threshold=rmsd_threshold,
+        heavy_atom_indices=heavy_atom_indices,
+        dedup_mode=dedup_mode,
+        energy_threshold_eV=energy_threshold_eV,
+        rotconst_anisotropy_threshold=rotconst_anisotropy_threshold,
+        atomic_numbers=atomic_nums if dedup_mode == "crest" else None,
+        saunders_exponent=saunders_exponent,
+    )
 
     # 3. Build the temperature ladder and walkers. Per-walker random_fns
     # use deterministic offsets from `seed` so replicate runs are
@@ -1189,16 +1322,42 @@ def get_mol_PE_mcmm(
             group.append(walker)
         walkers_by_temp.append(group)
 
-    # 4. Build the batch proposer. Step 8b's real implementation does the
-    # DBT + MMFF + MACE work here; the v0 stub rejects every proposal.
-    batch_propose_fn = make_mcmm_proposer(
+    # 4. Build the batch proposer. Pure DBT by default; if
+    # cartesian_weight > 0, compose with a GOAT-style Cartesian-kick
+    # proposer that adds isotropic Gaussian noise + MMFF relax (Step 12,
+    # docs/mcmm_plan.md). Routing happens per walker per step; each
+    # sub-proposer keeps its own batched MMFF/MACE call.
+    if cartesian_weight < 0:
+        raise ValueError(f"cartesian_weight must be >= 0, got {cartesian_weight}")
+    dbt_proposer = make_mcmm_proposer(
         mol,
         hardware_opts=hardware_opts,
         calc=calc,
         drive_sigma_rad=drive_sigma_rad,
         closure_tol=closure_tol,
+        score_chunk_size=score_chunk_size,
+        mmff_backend=mmff_backend,
         seed=seed + 7_777_777,
     )
+    if cartesian_weight == 0.0:
+        batch_propose_fn = dbt_proposer
+    else:
+        from mcmm import make_cartesian_kick_proposer, make_composite_proposer
+
+        cart_proposer = make_cartesian_kick_proposer(
+            mol,
+            hardware_opts=hardware_opts,
+            calc=calc,
+            sigma_kick_a=sigma_kick_a,
+            score_chunk_size=score_chunk_size,
+            mmff_backend=mmff_backend,
+            seed=seed + 8_888_888,
+        )
+        batch_propose_fn = make_composite_proposer(
+            [dbt_proposer, cart_proposer],
+            weights=[1.0 - cartesian_weight, cartesian_weight],
+            seed=seed + 6_666_666,
+        )
 
     # 5. Build the replica-exchange driver and run.
     swap_rng = np.random.default_rng(seed + 9_999_999)
@@ -1216,9 +1375,24 @@ def get_mol_PE_mcmm(
     # drive_sigma_rad); low Metropolis acceptance with healthy closure
     # means moves get rejected on energy alone (rare on small peptides);
     # low swap rate means the temperature ladder is too wide.
-    proposer_stats = getattr(batch_propose_fn, "stats", None) or {}
-    n_proposed = int(proposer_stats.get("n_proposed", 0))
-    n_closure_failures = int(proposer_stats.get("n_closure_failures", 0))
+    #
+    # `stats` shape depends on the proposer in use:
+    #   - DBT proposer (`make_mcmm_proposer`):       dict
+    #   - Cartesian-kick (`make_cartesian_kick_proposer`): dict
+    #   - Composite (`make_composite_proposer`):     list of those dicts
+    # Aggregate across sub-proposers when composite, so n_proposed
+    # always reflects "total proposals across all move types this run".
+    proposer_stats = getattr(batch_propose_fn, "stats", None)
+    if isinstance(proposer_stats, list):
+        sub_stats = proposer_stats
+    elif isinstance(proposer_stats, dict):
+        sub_stats = [proposer_stats]
+    else:
+        sub_stats = [{}]
+    n_proposed = sum(int(s.get("n_proposed", 0)) for s in sub_stats)
+    # Closure failures only apply to the DBT proposer; non-DBT sub-proposers
+    # (Cartesian kicks) won't have the key, so .get default is correct.
+    n_closure_failures = sum(int(s.get("n_closure_failures", 0)) for s in sub_stats)
     closure_failure_rate = (
         n_closure_failures / n_proposed if n_proposed > 0 else float("nan")
     )
@@ -1272,6 +1446,9 @@ def get_mol_PE_mcmm(
         rmsd_threshold=rmsd_threshold,
         minimize=minimize,
         mmff_backend=mmff_backend,
+        dedup_mode=dedup_mode,
+        energy_threshold_eV=energy_threshold_eV,
+        rotconst_anisotropy_threshold=rotconst_anisotropy_threshold,
     )
 
 

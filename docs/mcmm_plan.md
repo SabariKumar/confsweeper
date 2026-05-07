@@ -19,6 +19,15 @@ This document is the working design for the third sampler in the issue-#10 bench
 | 8b | Real `make_mcmm_proposer` (DBT + side-chain coupling + MMFF + MACE) | ✓ complete |
 | 9 | Sampler benchmark wiring (`scripts/sampler_benchmark.py`) | ✓ complete |
 | 10 | Documentation | pending |
+| 11 | Kabsch heavy-atom RMSD dedup (replaces normalised-L1) | ✓ complete |
+| 12 | Cartesian-kick proposer (alongside DBT) | ✓ complete |
+| 13 | REMD vs. independent-T workers ablation | pending |
+| 14 | Rotational-constant anisotropy as tertiary dedup gate | pending |
+| 15 | Adaptive termination ("no new basin in K sweeps → stop") | pending |
+| 16 | CREMP basin-collapse sanity check (diagnostic experiment) | ✓ complete |
+| 17 | CREST-style three-criteria dedup as opt-in `dedup_mode='crest'` | ✓ complete |
+| 18 | Post-hoc union of basin sets across proposers (`scripts/union_basin_count.py`) | ✓ complete |
+| 19 | CREMP overlap statistics at scale (validation_subset, ~1k peptides) | pending |
 
 ---
 
@@ -204,9 +213,446 @@ Add `"mcmm"` row to `SAMPLERS` dispatch in `scripts/sampler_benchmark.py`. Adapt
 
 **Outcome.** `_run_mcmm` adapter added to `scripts/sampler_benchmark.py` with the matched-budget mapping `n_steps = max(1, n_seeds // 64)` — at the issue-#11 default 8 × 8 = 64 walkers, this keeps total MMFF work proportional to `n_seeds` so MCMM and exhaustive ETKDG can be run at the same `--n_seeds` value for a fair comparison. Module docstring updated, CLI default `--samplers` is now `exhaustive_etkdg,pool_b,mcmm`. The `grids` argument is ignored by `_run_mcmm` (MCMM doesn't consume the Ramachandran prior). Verified: script imports cleanly, `SAMPLERS = ['exhaustive_etkdg', 'pool_b', 'mcmm']`, CLI help shows the updated default.
 
-### Step 10: Documentation — pending (next)
+### Step 10: Documentation — pending
 
 Update `src/README.md` and `scripts/README.md`: new module(s), function, sampler entry, plus a section explaining the move set, replica-exchange architecture, and basin-memory bookkeeping. Remove the shared-tail refactor flag.
+
+---
+
+## Phase 4 — Coverage and metric corrections (post-Step-9 findings)
+
+The Step-9 benchmark surfaced two distinct issues that change the lever-pull priority ordering. Both are documented under "Findings 2026-05-05" below; the steps in this phase fix them.
+
+### Step 11: Kabsch heavy-atom RMSD dedup — ✓ complete
+
+Replaces the normalised-L1 distance metric (`Σ|Δr|/(3·n_atoms)`) used by `BasinMemory.query_novelty*` and `_energy_ranked_dedup` with Kabsch-aligned heavy-atom RMSD in Å. This is GOAT's primary dedup primitive (and CREST/CREMP's), and the Step-9 SDF analysis showed our current metric admits sub-Å duplicate basins on `cremp_sharp` (4 "basins" all within 0.21 Å of each other) and `pampa_small` (16 "basins" with median pairwise RMSD 0.25 Å). Every `n_basins` figure in the Step-9 results is partly noise until this lands.
+
+**Implementation:**
+
+- New helpers `_heavy_atom_kabsch_rmsd(a, b)` and `_heavy_atom_kabsch_rmsd_batch(query, refs)` in `src/mcmm.py`. Pure torch SVD; row-vec convention; standard determinant correction to reject reflections. Both helpers operate on already-sliced heavy-atom coords — slicing is the caller's responsibility.
+- `BasinMemory.__init__` gains a `heavy_atom_indices: list[int] | None = None` kwarg. When provided, `query_novelty*` slice the candidate and stored coords to those indices before the Kabsch comparison. `add_basin` still stores full coords (the stored representative is what the proposer needs to apply moves to).
+- `_energy_ranked_dedup` gains the same kwarg and same slicing behaviour.
+- `_minimize_score_filter_dedup` derives heavy-atom indices from its `mol` argument and passes them through. `get_mol_PE_mcmm` does the same when constructing the shared `BasinMemory`.
+- Default `rmsd_threshold` bumps from `0.1` (L1 units) to `0.125` (Å), matching CREMP / CREST / GOAT's conformer-uniqueness contract so `n_basins` is directly comparable to CREMP `uniqueconfs` for the issue-#10 benchmark. The threshold remains a kwarg — pass `rmsd_threshold=0.5` for coarser "chemical basin" clustering when sub-Å wobble shouldn't count as separate basins.
+
+**Tests:**
+
+- New synthetic fixtures whose perturbations survive Kabsch alignment (one-atom out-of-plane displacement; the existing rigid-translation `_line_conformer` collapses to RMSD = 0 under Kabsch and is not useful for boundary tests). Threshold-boundary tests numerically compute the expected Kabsch RMSD as the oracle.
+- Heavy-atom slicing: tests pass `heavy_atom_indices=[0, 2]` on a 4-atom fixture and verify that the metric ignores atoms 1 and 3.
+- All existing `BasinMemory` invariants (monotonic visit counter, threshold = 0 disables matching, batched-vs-individual equivalence) carry forward.
+
+**Known semantic differences vs. the prior metric:**
+
+- Translation invariance — rigid translations between proposals no longer register as new basins. This is mostly a no-op since MMFF doesn't translate, but removes a class of false positives.
+- Heavy-atom only — H positions are noisier than the heavy framework on per-step MMFF runs, so removing them tightens the metric. Combined with the Kabsch alignment, this is closer to CREST's intent.
+- No atom-permutation symmetry — methyl flips remain over-counted relative to CREST. Skipping per the deferred plan; the architectural cost (storing mols not just coords) isn't justified by the ~5% refinement.
+
+**Outcome.** `_kabsch_rmsd_pairwise(queries, refs)` lives in `src/mcmm.py`; `BasinMemory` stores full coords but applies the metric over the configured heavy-atom subset; `_energy_ranked_dedup` accepts the same subset and shares the implementation. Defaults updated to 0.125 Å across `get_mol_PE_exhaustive`, `get_mol_PE_pool_b`, and `get_mol_PE_mcmm` (matches CREMP / CREST / GOAT for direct `n_basins` ↔ `uniqueconfs` comparability). Test fixtures replaced (rigid-translate fixtures collapse to RMSD = 0 under Kabsch, so the synthetic `_line_conformer` / `_line_coords` helpers in `tests/test_mcmm.py` and `tests/test_exhaustive_etkdg.py` were swapped for an atom-0-z-displacement pattern; an independent numpy Kabsch reference function serves as the test oracle). 4 new tests in `tests/test_mcmm.py` cover translation invariance, rotation invariance, heavy-atom slicing, and `heavy_atom_indices` validation. **All 173 tests pass** (was 169; +4 new).
+
+**Retro-scoring of the multi-seed SDFs (2026-05-05).** Re-running the new dedup over the existing dumped basin centroids confirms the metric gap was the dominant noise source on the tightly-clustered peptides:
+
+| peptide | old reported (L1, 0.1) | Kabsch 0.125 Å | Kabsch 0.5 Å | Kabsch 1.0 Å |
+|---|---|---|---|---|
+| cremp_typical | 2 | 2 | 2 | 2 |
+| cremp_sharp | 4 | 2 | 1 | 1 |
+| pampa_small | 16 | 6 | 2 | 2 |
+| pampa_medium | 9 | 5 | 4 | 3 |
+| pampa_large | 9 | 9 | 5 | 4 |
+
+`cremp_typical` and `pampa_large` were genuinely diverse in basin space; `cremp_sharp` and `pampa_small` were almost entirely sub-Å wobble counted as distinct basins. At the new 0.5 Å default the basin counts collapse meaningfully on 3/5 peptides — those numbers are now interpretable, the prior ones were noise.
+
+### Step 12: Cartesian-kick proposer alongside DBT — ✓ complete
+
+Adds a second move type that complements DBT's dihedral parameterisation. GOAT's "topology-preserving uphill push" applies random Cartesian forces to atoms, holds bonds and ring sp² angles via constraints, then re-minimises. The v0 implementation here approximates the constraint preservation: an isotropic Gaussian kick (`sigma_kick_a`) applied independently to every atom-coordinate, then MMFF-relaxed. MMFF's bond-stretch and angle-bend terms have steep gradients, so for `sigma_kick_a ≤ 0.3 Å` the relaxation pulls covalent bonds and ring sp² angles back to equilibrium without needing explicit SHAKE-style constraints. Beyond ~0.3 Å, expect occasional MMFF non-convergence — that's the trigger to revisit explicit constraint projection.
+
+Composition with DBT happens via `make_composite_proposer`: a routing layer that picks DBT vs. Cartesian-kick **per walker per step** by sampling against configurable weights. Each sub-proposer is invoked on its subset (preserving its internal batching), and results are reassembled in walker order. `make_cartesian_kick_proposer.stats` exposes `n_proposed`, `n_relax_failures`, `n_relax_successes` analogous to the DBT proposer's stats.
+
+Wired into `get_mol_PE_mcmm` via two new kwargs: `sigma_kick_a` (default 0.1 Å) and `cartesian_weight` (default 0.0 = pure DBT). Set `cartesian_weight=0.5` for a 50/50 mix.
+
+**Outcome.** `make_cartesian_kick_proposer` and `make_composite_proposer` in `src/mcmm.py`. Conditional construction in `get_mol_PE_mcmm`: pure DBT when `cartesian_weight=0.0` (legacy path); composite when > 0. 13 new proposer-level tests in `tests/test_mcmm.py` (factory validation, proposal-count, det_j=1 contract, stats, kick-actually-perturbs-coords, composite routing, weight extremes, walker-order preservation, sub-stats exposure) plus 3 integration tests in `tests/test_get_mol_PE_mcmm.py` (zero-weight skips factory, positive-weight constructs composite, negative-weight raises). **All 189 tests pass** (was 173; +16 new).
+
+Open question (deferred): whether the v0 "kick + relax, no constraint" approach is sufficient for chemically-meaningful exploration on real cyclic peptides, or whether explicit SHAKE-style bond/angle constraints are needed. Trigger for the upgrade: Cartesian-weighted runs underperform pure-DBT on the issue-#10 benchmark, or MMFF non-convergence rate exceeds ~5% per step.
+
+### Step 13: REMD vs. independent-T workers ablation — pending
+
+GOAT runs independent temperature workers; we run replica exchange with swaps. For *minimum-finding* (vs. equilibrium sampling), independent workers may be more efficient — REMD's swap-rejection can prevent the cold replica from adopting newly-found hot geometries. Cheap experiment: same total walker-budget, configurable `enable_swaps: bool = True` on `ReplicaExchangeMCMMDriver` (or a new `IndependentTDriver` that omits swaps entirely). Run on the same 5-peptide benchmark and compare basin counts, time-to-first-novel-basin, and final coverage. If independent wins decisively, drop the REMD layer; if comparable, keep REMD for the marginal mixing benefit.
+
+### Step 14: Rotational-constant anisotropy as a tertiary dedup gate — pending
+
+GOAT uses three independent dedup criteria (RMSD AND energy difference AND rotational-constant anisotropy 1.00–2.50%). Rotational constants are the eigenvalues of the inertia tensor, cheap to compute, and catch "two structures with similar Kabsch RMSD but distinguishable overall shape" — useful when the heavy-atom framework is similar but mass distribution differs (relevant for peptides with bulky vs. compact side chains in different basins). Implementation: `_inertia_eigvals(coords, masses)` helper; basins are considered the same iff Kabsch RMSD < threshold AND any pairwise relative anisotropy difference < 1%. Low priority — only worth adding if Step-11 still over-counts after the metric switch.
+
+### Step 15: Adaptive termination — pending
+
+GOAT's "stop when no new global minimum found in two iterations" trick. For us: track the basin discovery curve in the `ReplicaExchangeMCMMDriver` run loop; if K consecutive sweeps add zero new basins to memory, terminate early. Saves compute on small peptides where the basin set saturates well before the matched-budget step count. ~30 lines plus a `min_progress: int = 0` kwarg that disables the check by default.
+
+### Step 16: CREMP basin-collapse sanity check (diagnostic) — ✓ complete
+
+The `n_basins ≪ uniqueconfs` gap (e.g. cremp_typical: 2 vs 471) has two incompatible interpretations and they need different actions:
+
+1. **Our sampling is deficient** — MCMM never visits the basins CREMP found. Action: improve the proposer (already partly addressed by Step 12).
+2. **CREMP overcounts** — CREST + GFN2-xTB classifies sub-Å wobble as distinct conformers; once relaxed via MMFF and deduped at 0.125 Å Kabsch, most "unique" CREMP confs collapse onto the same basin. **In this case `uniqueconfs` is not a meaningful comparison target, the small `n_basins` numbers are honest, and the action is *not* to change MCMM** but to post-process CREMP and retrain the downstream consumers that treat the inflated counts as ground truth.
+
+The experiment that discriminates between them: feed CREMP's own conformers through our `MMFF + MACE + Kabsch-dedup` pipeline and count survivors at each stage.
+
+**Implementation.** Standalone `scripts/cremp_collapse_test.py` (~100 lines). Per peptide:
+
+1. Load the CREMP pickle's full conformer set via the existing `iter_validation_mols(subset_csv, pickle_dir)` in `src/validation/cremp.py` (`rd_mol` with all `uniqueconfs` confs attached, GFN2-xTB-relaxed, plus per-conformer xtb energies in `data["conformers"]`).
+2. **Pre-MMFF Kabsch dedup at 0.125 Å** over the raw CREMP geometries via `_energy_ranked_dedup` with xtb energies for the energy-rank step and heavy-atom indices from the mol. Repeat at 0.5 Å.
+3. **MMFF + MACE + 5 kT energy filter + Kabsch dedup at 0.125 Å** via `_minimize_score_filter_dedup`. Repeat the dedup at 0.5 Å.
+
+Reports a row per peptide with: `uniqueconfs`, pre-MMFF survivors at 0.125 Å and 0.5 Å, post-MMFF survivors at 0.125 Å and 0.5 Å, e_min (MACE, eV). Test peptides: `cremp_typical (t.I.G.N, 471 uniqueconfs)` and `cremp_sharp (S.S.N.MeW.MeA.MeN, 190 uniqueconfs)`.
+
+**Decision tree.**
+
+| Pre-MMFF @ 0.125 | Post-MMFF @ 0.125 | Verdict & action |
+|---|---|---|
+| 471 → ~few | ~few | **CREMP overcounts.** No MCMM change. Post-process CREMP and retrain downstream — see "Downstream consequence" below. The benchmark target `n_basins` ↔ `uniqueconfs` is replaced with `n_basins` ↔ `n_basins_CREMP_pipeline`. |
+| 471 → 471 | ~few | **MMFF disagrees with GFN2-xTB on basin structure.** CREMP's diverse geometries are real but collapse on MMFF relaxation. Either swap MMFF for MACE-relaxation in the inner loop (compute-expensive) or accept the disagreement and define our basins under MMFF (no MCMM change, but downstream retrain still required for consistency). |
+| 471 → 471 | ~hundreds | **Sampling deficient.** Our pipeline preserves CREMP's diversity; our MCMM just never visits those geometries. Action: continue Steps 12+. |
+| 471 → ~50 | ~30 | **Mixed.** Partial metric collapse, partial sampling gap. Both fixes apply. |
+
+**Downstream consequence (CREMP-overcounts case).** If the experiment lands here, the work is localised to the validation harness and the downstream pretraining — *not* the MCMM sampler:
+
+1. Re-run `_minimize_score_filter_dedup` on every CREMP pickle to produce a deduped conformer set per peptide. Save as a parallel pickle directory (e.g. `data/raw/cremp/pickle_kabsch_0125/`).
+2. Update the validation subset CSV so `uniqueconfs` reflects the post-relaxation Kabsch-deduped count, and so `ground_truth_n_confs` in `sampler_benchmark.py`'s output is the corrected number.
+3. Update the peptide-electrostatics pretraining pipeline at `/home/sabari/peptide_electrostatics` to load from the corrected directory. The autoencoder's training set, the Boltzmann-weight Janossy pooling, and the fine-tuning property heads all consume CREMP-style conformer sets — they'd train on inflated targets if the over-counting isn't fixed at the source.
+4. Document the threshold choice (0.125 Å Kabsch heavy-atom RMSD) in the project READMEs so future consumers don't reintroduce the inflation.
+
+The expected magnitude: medians may drop by 5–50× if the post-MMFF picture matches what we saw on our own benchmark SDFs (cremp_sharp: 4 → 1 at 0.5 Å; pampa_small: 16 → 2). That changes the data balance for the AE pretraining materially — peptides with ~10× the conformer count would otherwise dominate the training-set Janossy pooling.
+
+This step is a diagnostic experiment, not an MCMM feature. Mark complete when the script has been run on both peptides and the verdict + action plan are documented in the Findings section.
+
+**Outcome (2026-05-05).** `scripts/cremp_collapse_test.py` (~280 lines) loads each CREMP pickle directly, computes counts at five pipeline stages plus pre/post-MMFF MACE e_min. Headline numbers from `results/cremp_collapse_test.csv`:
+
+| stage | cremp_typical (`t.I.G.N`) | cremp_sharp (`S.S.N.MeW.MeA.MeN`) |
+|---|---|---|
+| CREMP `uniqueconfs` | 471 | 190 |
+| Pre-MMFF Kabsch @ 0.125 Å | **237** | **114** |
+| Pre-MMFF Kabsch @ 0.5 Å | 84 | 45 |
+| Post-MMFF, within 5 kT | 31 | 36 |
+| Post-MMFF Kabsch @ 0.125 Å (after 5 kT filter) | **19** | **10** |
+| Post-MMFF Kabsch @ 0.5 Å (after 5 kT filter) | 7 | 8 |
+| ΔE_min(MACE) post − pre | +0.18 eV | +0.47 eV |
+| Our MCMM `n_basins` (Kabsch-aware run) | 2 | 4 |
+
+**Verdict.** Mixed across all three branches of the decision tree, with the dominant signal being **CREMP overcounts**:
+
+1. **Pre-MMFF, same threshold: 471 → 237 (50%) and 190 → 114 (40%).** Half of CREMP's "unique" conformers are within 0.125 Å Kabsch RMSD of another conformer in the same set. They survive CREST's dedup because CREST applies *three concurrent* criteria — RMSD AND energy AND rotational-constant — where any one distinguishing the pair counts them as different. Our pure-Kabsch metric is more aggressive by definition, so a ~2× reduction at the same threshold is *expected*, not a bug. **Action: stop reporting CREMP raw `uniqueconfs` as the benchmark ground truth — define the ground truth as CREMP-conformers-through-our-pipeline.**
+2. **MMFF basin-of-attraction collapse: 237 → 19 (12×) and 114 → 10 (11×).** Most CREMP-distinct geometries minimize to the same MMFF basin. This is GFN2-xTB-vs-MMFF disagreement at the relaxer level — chemically real (xtb's sub-basin structure on a peptide isn't a hallucination), but for our MCMM that uses MMFF as the inner-loop minimizer, those sub-basins aren't reachable. **Action: defer; switching to MACE-relaxation in-loop is compute-prohibitive at scale, and the ~10× MMFF collapse is structural to our pipeline.**
+3. **Sampling deficiency, but bounded: 19 → 2 (cremp_typical) and 10 → 4 (cremp_sharp).** Our MCMM finds 11–40% of the basins it could find given perfect coverage of MMFF-relaxed CREMP geometries. Real but much smaller than the apparent 471 → 2 / 190 → 4 gap. **Action: continue with Step 12 (Cartesian kicks) and the other ★ levers; the headroom is meaningful but not catastrophic.**
+
+**Pre-MMFF MACE e_min < post-MMFF MACE e_min (by 0.18–0.47 eV) on both peptides.** GFN2-xTB-relaxed geometries are *closer* to MACE's preferred minimum than MMFF-relaxed ones. Confirms the MMFF-vs-MACE relaxer mismatch flagged in the Risks section. Doesn't block this experiment but is worth carrying forward as a v2 consideration: the post-MCMM `_minimize_score_filter_dedup` re-runs MMFF on the basin centroids before MACE-scoring, which slightly degrades the e_min relative to a MACE-relax + MACE-score pipeline.
+
+### Downstream action plan from Step 16 findings
+
+The CREMP-overcounts signal triggers the downstream-retrain branch outlined above:
+
+1. **Update `sampler_benchmark.py`'s ground-truth column.** Add `ground_truth_n_basins_pipeline` (the post-MMFF-+-Kabsch-0.125 Å number) alongside the existing `ground_truth_n_confs` (raw CREMP `uniqueconfs`). The new column is the apples-to-apples target for our `n_basins`. Compute it offline by running `cremp_collapse_test.py` over the validation subset and joining the results into `data/processed/cremp/validation_subset.csv`.
+2. **Post-process the CREMP pickle directory** for any downstream consumer that's sensitive to per-peptide conformer counts. Concretely: re-run `_minimize_score_filter_dedup` on every CREMP pickle, save the deduped conformer set as a parallel pickle directory `data/raw/cremp/pickle_kabsch_0125/`. Prep work for the peptide-electrostatics retrain.
+3. **Notify the peptide-electrostatics pretraining at `/home/sabari/peptide_electrostatics`.** The autoencoder's training set, the Boltzmann-weight Janossy pooling, and the fine-tune property heads consume CREMP-style sets — they currently train on inflated counts. Without the post-process, peptides with heavily-clustered conformer sets dominate the training-set Janossy pooling 2–10× more than they should. Update the project memory entry for the AE plan to flag the dependency.
+
+These three are localised to the validation harness and the pretraining repo, not the core MCMM sampler.
+
+### Step 17: CREST-style three-criteria dedup as opt-in `dedup_mode='crest'` — ✓ complete
+
+Step 16 showed that CREST/CREMP's `uniqueconfs` is computed under three concurrent criteria — RMSD AND energy AND rotational-constant — where two conformers are merged only when *all three* agree, and any one distinguishing them keeps them separate. Pure Kabsch (our default) is more aggressive and produces ~50% fewer basins on the same geometries (471 → 237 on cremp_typical at the same 0.125 Å threshold).
+
+**Why we want it as opt-in.** For day-to-day work, pure Kabsch remains the right default — the AE pretraining wants the deflated count, our internal definition of "basin" is chemically cleaner, and the in-run BasinMemory dynamics are tuned to it. But for the issue-#10 paper, we'll need to publish a **CREMP-comparable basin count** so reviewers don't read 2 vs 471 as a sampling failure. An opt-in flag keeps the default pipeline intact and gives us the comparable number on demand.
+
+**Locked design decision: MACE energies, not MMFF, drive the energy criterion.** The energy used in the AND-test is the MACE-on-MMFF-relaxed-coord energy that the proposer already computes in stage 4 of `make_mcmm_proposer` and hands to the walker — it's sitting in `BasinMemory._energies` today, unused for the dedup decision. Same for the `energies` arg of `_energy_ranked_dedup` in the post-MCMM filter. **Cost: zero additional compute.** No new MACE calls, no new MMFF calls. MMFF energies are explicitly *not* used here — they'd be noisier (0.1–1 kcal/mol numerical jitter at MMFF convergence, vs MACE's float32 ~0.01–0.05 eV noise floor) and storing them would require running an extra MMFF energy evaluation we currently skip.
+
+**Implementation surface (~80 lines net).**
+
+1. **`_inertia_eigvals(coords, masses)`** in `src/mcmm.py`: build inertia tensor `I_ab = Σ_a m_a (||r_a||² δ_ab - r_a r_b)` from centred coords, return sorted `torch.linalg.eigvalsh(I)`. Three numbers per conformer, translation- and rotation-invariant. ~10 lines.
+
+2. **`BasinMemory` constructor** gains `dedup_mode: Literal['kabsch', 'crest'] = 'kabsch'`, `energy_threshold_eV: float = 0.05`, `rotconst_anisotropy_threshold: float = 0.01`. When mode is `'crest'`, store per-basin rotational constants alongside coords/energies (`self._rotconsts: (K, 3)`); on `add_basin`, compute eigvals from atom masses (derived from atomic numbers via a small RDKit lookup at construction). ~15 lines.
+
+3. **`query_novelty` / `query_novelty_batch`** branch on `dedup_mode`:
+
+```python
+rmsd_close = rmsd < self.rmsd_threshold
+if self.dedup_mode == 'crest':
+    de_close   = (stored_e - query_e).abs() < self.energy_threshold_eV
+    rot_close  = max_relative_diff(query_rot, stored_rots) < self.rotconst_anisotropy_threshold
+    same_basin = rmsd_close & de_close & rot_close
+else:
+    same_basin = rmsd_close
+# closest among same-basin candidates
+```
+
+Pure Kabsch is recovered exactly by `dedup_mode='kabsch'` (the default) — backwards-compatible. ~25 lines change.
+
+4. **`_energy_ranked_dedup` in `src/confsweeper.py`** gains the same three kwargs and the same AND-branch. ~15 lines.
+
+5. **`get_mol_PE_*` entry points** thread `dedup_mode`, `energy_threshold_eV`, `rotconst_anisotropy_threshold` through to `_minimize_score_filter_dedup` and (for `get_mol_PE_mcmm`) `BasinMemory`. Defaults preserve current behaviour. ~10 lines × 3 sites.
+
+6. **Tests:** translation/rotation invariance of `_inertia_eigvals`, AND-criterion branch on a synthetic 3-basin fixture (one pair Kabsch-close-but-energy-distinct, one pair energy-close-but-rotation-distinct, one fully-equivalent), `dedup_mode='kabsch'` matches the existing behaviour bit-for-bit. ~10 new tests.
+
+**Caveats.**
+
+- **MACE float32 noise floor ≈ 0.01–0.05 eV** (≈ 1e-6 relative × the 10⁴–10⁵ eV total energy). CREST's xtb-based 0.05 kcal/mol ≈ 0.002 eV threshold is 25× below this. Default `energy_threshold_eV=0.05` accordingly — still 2× below thermal kT_298 (0.026 eV) so it has discriminatory power, but it doesn't replicate CREST's tightness. Promoting MACE inference to float64 would close the gap (~2× memory, ~2× time) — explicitly *not* worth the cost; document the float32 caveat in the BasinMemory docstring.
+
+- **Rotational-constant anisotropy default 0.01 (1%)** matches CREST's middle of the documented 1.0–2.5% range. Tunable via constructor.
+
+- **In-run BasinMemory dynamics shift under CREST mode.** AND-criterion → looser merging → more basins → each basin gets fewer revisits → Saunders 1/√usage bias is weaker per basin. For paper-comparison runs this is acceptable (the goal is the basin count, not the sampling efficiency); for production runs we keep `dedup_mode='kabsch'`.
+
+- **Need to align `BasinMemory` and `_energy_ranked_dedup` modes** within a single call to `get_mol_PE_mcmm` — running a CREST in-run dedup with a Kabsch post-filter (or vice-versa) would give incoherent counts. Validation in the entry point: if user passes `dedup_mode='crest'` to `get_mol_PE_mcmm`, propagate to both consumers.
+
+**Reporting plan.** When the AE benchmark reports `n_basins`, include both numbers: the default Kabsch (chemical-basin scale) and the CREST-mode (CREMP-comparable). One extra column in `sampler_benchmark.py`'s output, no code reorg. Step 16's `ground_truth_n_basins_pipeline` likewise gets a `_kabsch` and `_crest` variant from `cremp_collapse_test.py` for direct apples-to-apples comparison.
+
+**Trigger to start:** ready to land whenever — small change, well-scoped, low risk to defaults. Most natural after Step 12's Cartesian-kick benchmark settles, so we have one composite benchmark run that exercises both new features end-to-end before the paper draft.
+
+**Outcome.** All five implementation pieces shipped, defaults preserved bit-for-bit:
+
+1. `_inertia_eigvals(coords, masses)` and `_max_relative_eig_diff(query, stored)` in `src/mcmm.py`. Pure torch; translation- and rotation-invariant by construction.
+2. `BasinMemory.__init__` gains `dedup_mode`, `energy_threshold_eV` (default 0.05 eV — chosen for the MACE float32 noise floor; documented in the docstring), `rotconst_anisotropy_threshold` (default 0.01), `atomic_numbers` (required only when `dedup_mode='crest'`; masses derived via `RDKit.Chem.GetPeriodicTable().GetAtomicWeight`). `_rotconsts` per-basin tensor populated only in crest mode.
+3. `query_novelty` and `query_novelty_batch` now accept `energy=None` / `energies=None` (required in crest mode). AND-criterion under crest mode picks the closest-by-RMSD basin among same-basin matches; pure-kabsch path is unchanged.
+4. `_energy_ranked_dedup` in `src/confsweeper.py` gains the same kwargs and the same AND-branch.
+5. `_minimize_score_filter_dedup` and all three `get_mol_PE_*` entry points thread the dedup kwargs through. `get_mol_PE_mcmm` propagates the mode to both the in-run `BasinMemory` and the post-MCMM filter so they stay aligned within a single call.
+
+`MCMMWalker.__init__` and `apply_proposal` now pass `energy` to `memory.query_novelty` (harmless in kabsch mode, required in crest). 10 new tests in `tests/test_mcmm.py` cover inertia-eigval translation/rotation invariance, crest-mode constructor validation, energy-required-in-crest-query, the three same/different-basin scenarios under the AND-criterion, kabsch-mode bit-equivalence with the pre-Step-17 path, batched-vs-individual crest equivalence, and per-basin `_rotconsts` storage. **All 199 tests pass** (was 189; +10 new).
+
+Reporting-plan follow-up (dual `n_basins_kabsch` / `n_basins_crest` columns in `sampler_benchmark.py` and `cremp_collapse_test.py`) is a separate small task to take up alongside the next benchmark run.
+
+### Step 18: Post-hoc union of basin sets across proposers — ✓ complete
+
+The Cartesian-kick benchmark (Run B, 2026-05-05) showed that DBT-only and DBT+Cart explore qualitatively different regions of the landscape. On `pampa_large` specifically, DBT-only finds 11 basins on an upper plateau (mean RMSD 5 Å between them, distinctly different geometries) while DBT+Cart finds 1 deep well (3 conformers within 0.4 Å of each other). The post-MCMM 5 kT energy filter then prunes DBT's plateau because Cart's deeper e_min puts those basins 27–31 kT above the global minimum.
+
+This isn't a sampling failure — both proposers are doing useful work. It's a **reporting** problem: the run-relative-energy-window metric is structurally biased against discovery of deeper minima (the deeper the floor, the fewer basins survive the relative window).
+
+**Solution**: post-hoc union analysis. Take the dumped basin centroids from a DBT-only run and a DBT+Cart run, concatenate the conformers onto a single template mol, and report:
+
+- **Discovery diversity** (`n_union_all`): all union conformers deduped at 0.125 Å Kabsch, no energy filter. The pure "how many distinct basins did either method find?" number, independent of where the global e_min lands.
+- **Filtered union** (`n_union_filtered_5kT`): standard 5 kT filter relative to union's e_min, then dedup. Comparable to single-method `n_basins`.
+- **Per-method split**: `n_dbt_only`, `n_cart_only`, `n_overlap` — answers "what did each proposer contribute that the other missed?"
+- **Coverage % vs CREMP-rescored ceiling**: the union count divided by `post_mmff_kabsch_0125` (or `_crest_0125`) from `cremp_collapse_test.py`. The apples-to-apples comparison the paper needs.
+
+**Implementation.** `scripts/union_basin_count.py` (~330 lines). Inputs are two SDF directories (DBT-only and DBT+Cart from prior `sampler_benchmark.py` runs) plus an optional CREMP-collapse CSV for coverage. Energies come from each SDF's `MACE_ENERGY` per-conformer property — no GPU needed. Heavy-atom indices inferred from the loaded mol. The dedup uses the in-tree `_energy_ranked_dedup`, so the metric is identical to what `get_mol_PE_mcmm`'s post-filter applies.
+
+**Run output (existing SDFs, both runs in CREST mode):**
+
+| peptide | n_dbt | n_cart | union_all (discovery) | union_filtered_5kT | CREMP ceiling | coverage_union vs ceiling |
+|---|---|---|---|---|---|---|
+| cremp_typical | 3 | 5 | **8** | 5 | 30 (kabsch) / 30 (crest) | 17% / 17% |
+| cremp_sharp | 5 | 6 | **8** | 5 | 7 (kabsch) / 11 (crest) | 71% / 45% |
+| pampa_small | 6 | 3 | **7** | 3 | n/a | n/a |
+| pampa_medium | 11 | 17 | **21** | 9 | n/a | n/a |
+| pampa_large | 11 | 3 | **14** | 3 | n/a | n/a |
+
+**Interpretation.** Union-all (`n_union_all`) is the right "discovery" metric for the paper:
+
+- `pampa_medium` jumps to 21 basins when we count what each method found independently, vs the single-method maxima of 11 (DBT) or 17 (Cart). DBT finds 4 basins Cart doesn't, plus 17 they share or Cart-only finds.
+- `pampa_large` jumps to 14 (vs single-method 11 or 3). DBT's upper plateau (11 basins) and Cart's deep well (3 basins) are entirely disjoint in the discovery sense — they explore different chemical regions.
+- `cremp_sharp` reaches **71% of the post-MMFF Kabsch CREMP ceiling** under union — meaningful coverage of what's reachable through our pipeline. Under CREST mode the ceiling is higher (11) so coverage drops to 45%.
+- `cremp_typical` is still at 17% of either ceiling. The 8 union basins are all clustered in the same region; CREMP's 30 ceiling implies 22 more distinguishable basins our sampling never visits — clearest remaining headroom.
+
+**Open follow-ups:**
+
+- Per-method split is reported only against the *filtered* union (post-5 kT). Should also report against the discovery union (`union_all`) so we can see, e.g., that Cart contributes 3 unique deep-well basins on pampa_large *before* the filter erases them. Small script update.
+
+**In-pipeline ensemble sampling — deferred follow-up.** The post-hoc union approximates running two MCMM tracks at once with shared state, but isn't the same. Worth thinking through carefully because the deferral decision depends on what the ensemble would actually buy us.
+
+*Architecture sketch.* `EnsembleMCMMDriver(tracks)` where each track has its own `proposer`, `walkers_by_temp`, `kt` ladder, `swap_interval`, and `saunders_exponent`, but all tracks share one `BasinMemory`. Per ensemble step, every track's walkers propose and accept/reject independently; basin writes go to the shared memory, so the Saunders bias on basin K reflects total visits across all tracks. REMD swaps stay *within* tracks (different move spaces don't have a clean meaning for cross-track swap criteria). Total walker budget is the sum across tracks; for parity with a 64-walker single-track run we'd allocate e.g. 32 DBT + 32 Cart. ~250 lines of new driver + tests.
+
+*What it would buy us beyond the current composite proposer:*
+
+1. **Per-track hyperparameter tuning.** The composite proposer routes walkers to DBT or Cart per step but every walker shares the same `kt` ladder, `swap_interval`, and (post-Step-17) `saunders_exponent`. DBT and Cart have measurably different optimal regimes — DBT closure-fails 75% of the time at hot kt while Cart's 0% closure-failure means hot kt is "cheap" and bigger kicks are still useful. With per-track ladders we could push Cart's hot replica to 16× kT_298 while keeping DBT at 8× — currently a one-size-fits-all knob.
+2. **Per-proposer Saunders.** Cart's deep-well attraction needed `saunders_exponent=1.0` to escape (Step 17 / 2026-05-06 finding). DBT's moves are smaller and might benefit from gentler suppression (0.5). Different exponents per track let each move type's bias decay at the rate that fits its move size.
+3. **Per-track budget allocation.** If we want 2× more Cart walkers than DBT walkers (because Cart is the discovery driver and DBT is finishing the upper-plateau coverage), the current architecture can't express that.
+4. **Cleaner diagnostics.** `closure_failure_rate` is a DBT concept; `n_relax_failures` is a Cart concept. The aggregated stats post-fix-from-Run-B work but blur the per-track signal.
+
+*What it would NOT buy us (that I initially thought it would):*
+
+- **Shared Saunders bias across move types** — *already there*. The current composite proposer's walkers all share one BasinMemory; the bias works across DBT and Cart visits already. Run B's regression wasn't from disjoint memories; it was from `1/√usage` decaying too slowly. Step-17 fix.
+- **Diversity from cross-method repulsion** — empirically Cart and DBT have `overlap_all = 0` across all 5 peptides under both dedup modes (Run B and 2026-05-06 confirmed). They explore disjoint landscape regions independently. Shared memory has nothing to repel each other from.
+
+*Trigger condition to actually implement:*
+
+- Either: a peptide where the post-hoc union shows meaningful Cart-DBT overlap (so shared-memory sampling would have separated them in real time and increased diversity), OR
+- A peptide where DBT and Cart benefit from clearly different `kt_high` / `saunders_exponent` and the single-knob composite proposer can't simultaneously satisfy both.
+
+Currently neither condition is met. The 2026-05-06 results suggest the composite proposer at the recommended hyperparams is doing 95% of what an ensemble would do; the remaining 5% is the per-track tuning flexibility above. Defer until paper review or a peptide class where it matters surfaces.
+
+### Step 19: CREMP overlap statistics at scale — pending
+
+Step 16 confirmed on cremp_typical (471) and cremp_sharp (190) that CREMP's `uniqueconfs` collapses 2× at the same Kabsch threshold (CREST's three-criteria AND-test inflates) and another 10× under MMFF relaxation (xtb-vs-MMFF basin disagreement). The follow-up question is whether this is **a CREMP-wide phenomenon** or specific to those two peptides — important because the downstream peptide-electrostatics retrain (Step 16's "Downstream action plan") needs to know whether the inflation is uniform across topologies and amino-acid types.
+
+**Sample design — stratified by topology AND per-residue features.**
+
+Two structural axes drive cyclic-peptide conformational entropy and MMFF-vs-xtb disagreement:
+
+1. **Backbone topology** — 4 classes already in CREMP's pipeline (`all-L`, `D-only`, `NMe-only`, `D+NMe`). D-amino acids and N-methylation flip backbone preference patterns; both relaxers' force-field parameters for these are derived from different training data than canonical L peptides, so MMFF-xtb disagreement plausibly varies across topology.
+2. **Per-residue features** — specifically **proline** (locks φ to ~−60°, ring-pucker degree of freedom, cis/trans isomerization at the preceding amide) and **glycine** (no side chain, maximal backbone flexibility). Both are conformationally special: Pro restricts the φ-ψ space sharply while Gly opens it. We expect these to drive MMFF-vs-xtb disagreement disproportionately because (a) Pro's ring-pucker basins are sub-kT energy splits MMFF often misses, and (b) Gly's broad φ-ψ acceptance lets xtb find basins MMFF's harder constraints exclude.
+
+**Stratification grid: 16 cells = 4 topology × 2 (has-Pro) × 2 (has-Gly).** Sample target: **100 peptides per cell where the natural pool supports it, capped at the natural max otherwise; minimum floor of 30 per cell** (drop cells smaller than 30 from the analysis). Total expected: **~1500 peptides**, ~9 GPU-hours at the 20 s/peptide we measured. Overnight run.
+
+`num_monomers` (4/5/6) is treated as a *secondary* analysis axis — not stratified on (would push to 48 cells × 30 = 1440, comparable budget but thinner stats), but reported in the summary table so we can see length-dependence post-hoc.
+
+**Sequence parser.** CREMP sequence tokens follow `[A-Za-z]` or `Me[A-Za-z]`: case denotes L (uppercase) vs D (lowercase), `Me` prefix denotes N-methylation. Per-peptide features:
+
+- `has_proline`: any token whose residue letter (after stripping `Me`) is `P` or `p`
+- `has_glycine`: same for `G`/`g`
+- `topology`: derived as in `make_validation_sets_cremp.py` (`all-L` / `D-only` / `NMe-only` / `D+NMe`) — reused directly so the new sampler agrees with the existing validation_subset's labels
+
+**Implementation: three scripts.**
+
+**1. `scripts/sample_cremp_peptides.py`** (~80 lines, new):
+
+- Reads `data/raw/cremp/summary.csv` (36k peptides).
+- Parses each `sequence` to derive `topology`, `has_proline`, `has_glycine`, plus the existing `num_monomers`.
+- Joins on `summary.csv` for `smiles`, `uniqueconfs`, etc.
+- Stratifies: 16 cells, samples N per cell with deterministic seed, falls back to natural max for under-represented cells, drops cells below the min floor with a logged warning.
+- Outputs a CSV with the sampled rows + the derived feature columns, ready to be consumed by `cremp_collapse_test.py`.
+
+**2. `scripts/cremp_collapse_test.py`** (~80 lines net of changes):
+
+- **Peptide-list source** — replace `--peptides` (multiple-flag) with `--peptide_list_csv PATH` accepting any CSV with a `sequence` column. The new sampler's output works as-is; existing manual peptide lists can be CSV-formatted with one column.
+- **Resume logic** — at start of `main`, read existing `out_csv` and skip sequences already covered. Mirrors `sampler_benchmark.py`'s `_read_done_set` pattern.
+- **Per-peptide error handling** — wrap `_run_one_peptide` in try/except. Some CREMP pickles fail atom-count consistency checks; the at-scale run shouldn't abort on any single peptide.
+- **Per-row append + flush** — pairs with resume.
+- **`--summarize` subcommand** — read an existing collapse-test CSV (joining the sampler-emitted feature columns) and emit:
+  - Distribution histograms of `uniqueconfs / pre_mmff_kabsch_0125` and `pre_mmff_kabsch_0125 / post_mmff_kabsch_0125`.
+  - Stratified medians by `(topology, has_proline, has_glycine)`, plus marginals per axis.
+  - Stratified medians by `num_monomers` (post-hoc axis).
+  - Fraction of peptides where `post_mmff_kabsch_0125 < uniqueconfs / 10`.
+  - Plot-ready CSVs for the paper figure (one row per stratum with mean / median / quartiles of the collapse ratios).
+
+**3. `scripts/cremp_overlap_figure.py`** (~150 lines, new):
+
+- Reads the collapse-test CSV (which carries `topology`, `has_proline`, `has_glycine`, `num_monomers` from the sampler) plus the optional summary CSV.
+- Renders the 3-panel paper figure described above, saved to PDF + PNG. Uses matplotlib (already a dependency).
+- CLI: `--collapse_csv PATH --out_pdf PATH [--out_png PATH]`.
+- Encapsulates one function per panel so the layout can be tweaked later without re-deriving the data.
+- Computes panel-specific summary statistics and overlays them on the panels (median, IQR boxes, sample counts per cell).
+
+**Paper figure (3-panel):**
+
+- **Panel A**: Boxplot of pre-MMFF Kabsch collapse ratio (`uniqueconfs / pre_mmff_kabsch_0125`) across the 4 topology classes. Tests whether NMe-rich peptides have *more* CREST overcounting than canonical L (NMe creates extra energy/rotation distinctions, hence more AND-test inflation).
+- **Panel B**: Boxplot of post-MMFF Kabsch collapse ratio across the 4 Pro/Gly cells (`neither` / `Pro-only` / `Gly-only` / `both`). The Pro-rich and Gly-rich cells should show the largest MMFF-xtb disagreement if our hypothesis is right — the relaxer-mismatch signal concentrates where Pro's ring-pucker or Gly's permissive φ-ψ matters most.
+- **Panel C**: Heatmap of post-MMFF Kabsch median collapse ratio across the full 16-cell grid, with cell counts overlaid. Direct visual of whether the inflation is uniform across the (topology × Pro × Gly) grid or concentrated in specific cells.
+
+**Downstream consequence.** If the at-scale collapse pattern generalises, the Step-16 "downstream action plan" applies CREMP-wide. If it concentrates in specific topology / Pro / Gly cells (the more likely outcome given conformational chemistry), the retrain plan can target the affected slices and leave the rest of CREMP alone — saving compute on the post-process pass over the pickle directory.
+
+**Open extensions (deferred):**
+
+- **Per-residue features beyond Pro / Gly** — aromatic (F/W/Y/H), charged (D/E/K/R/H), cysteine-disulfide. Useful if Panel C surfaces a chemistry-class signal we missed. Add as `has_aromatic` / `has_charged` flags in the sampler script (~5 lines each) and re-run if needed.
+- **Sample size > 1500** — if any cell hits the 30-peptide floor uncomfortably (e.g., D+NMe with both Pro and Gly is rare), bump per-cell target to 200 (~3000 total, ~17 hours). Trigger: cell counts in the summarize output.
+
+---
+
+## Findings 2026-05-05
+
+Two benchmark runs in `results/`:
+
+- `sampler_benchmark_drive_sigma0.3_closure_tol0.05_kt_high_4.csv` — the tuned-drive single-seed run.
+- `sampler_benchmark_tuned_with_multiseed.csv` — same params plus `n_init_confs=8`.
+
+A third (`sampler_benchmark_kt_high_8.csv`) is in progress in the background to test whether the wider replica spread bridges genuinely-distinct basin pairs.
+
+### Tuned drive vs. baseline
+
+The tuned single-seed run resolved the basin-collapse pathology on `cremp_typical` (1 → 7 basins) and produced 2–7× more basins on every other peptide vs. the `drive_sigma=0.1, closure_tol=0.01, kt_high=2×kT_298K` baseline. `e_min_eV` dropped on 4/5 peptides, confirming the new basins are genuinely lower-energy minima rather than noise. Wall time grew ~30–40% because more proposals close successfully → more MMFF/MACE work per step.
+
+### Multi-seed run: deeper minima but apparent basin-count regression
+
+Multi-seed found lower minima on every peptide (Δe_min from −0.01 to −0.46 eV) but reported *fewer* basins on 4/5 peptides than single-seed. Initial hypothesis was a "deep-basin trap" (kt_high too cold to escape the new minimum). SDF analysis disproved this:
+
+| peptide | reported n_basins | median heavy-atom Kabsch RMSD between confs | true distinct basins |
+|---|---|---|---|
+| cremp_typical | 2 | 1.42 Å | 2 (real) |
+| cremp_sharp | 4 | **0.11 Å** | ~1 (all near-duplicates) |
+| pampa_large | 9 | 5.65 Å | ~9 (real) |
+| pampa_medium | 9 | 3.05 Å | mixed |
+| pampa_small | 16 | **0.25 Å** | ~3–5 (mostly duplicates) |
+
+Energy spreads on all 5 peptides were 3–5 kT — well within `kt_high=4×kT_298K` reach. There is no trap. The dedup metric is letting sub-Å wobble through as distinct basins, inflating `n_basins` on tightly-clustered runs and deflating the comparison on runs that genuinely diversified (because the post-MCMM filter collapses fewer when the spread is wide).
+
+**Conclusion**: every `n_basins` number reported to date is contaminated by metric noise. Step 11 (Kabsch heavy-atom RMSD) is no longer optional — it's the prerequisite for any further benchmark interpretation.
+
+### Cartesian-kick benchmark (Run B, 2026-05-05)
+
+Five peptides, 10000-seed budget, MCMM with `cartesian_weight=0.5` (composite proposer routing 50/50 per walker per step between DBT and the new GOAT-style Cartesian-kick), both `dedup_mode='kabsch'` and `dedup_mode='crest'` reported. Compared against the matched-budget DBT-only run from earlier. Headline:
+
+| peptide | DBT kabsch | DBT crest | DBT+Cart kabsch | DBT+Cart crest |
+|---|---|---|---|---|
+| cremp_typical | 2 | 3 | **4** | **5** |
+| cremp_sharp | 4 | 5 | **8** | 6 |
+| pampa_small | 7 | 6 | 4 | 3 |
+| pampa_medium | 3 | 11 | 2 | **17** |
+| pampa_large | 3 | 11 | **7** | 3 |
+
+**Cartesian kicks unambiguously work as a discovery mechanism:**
+
+- **Deeper MACE e_min on every peptide** (Δ −0.23 to −0.57 eV ≈ 9–22 kT_298): the new move type reaches geometries DBT doesn't.
+- **In-run `basins_in_memory` 2–5× larger** under DBT+Cart vs DBT-only (cremp_sharp 72 → 364, pampa_small 70 → 285, pampa_medium 194 → 543, pampa_large 273 → 532). The composite proposer is doing real exploratory work; the post-MCMM filter is what decides what we report.
+- **Wall time roughly doubled** (102→189s, ..., 277→512s). Composite makes two batched MMFF + MACE calls per step (one per sub-proposer) and Cart's 0% closure-failure rate means none of its walker-half short-circuits the pipeline.
+
+**Post-filter `n_basins` is muddied by the energy window.** When Cart finds a minimum 0.4–0.6 eV deeper, the 5 kT (≈ 0.13 eV) window now sits at a much lower floor and prunes basins that DBT-without-the-deeper-min would have kept. We see this most clearly on:
+
+- pampa_small kabsch (7 → 4) and pampa_medium kabsch (3 → 2): more in-run exploration, deeper minimum, fewer post-window survivors.
+- pampa_large CREST (11 → 3): the largest peptide regresses sharply under crest after Cart finds its deepest well; the basins around the new minimum are similar in energy but distinct enough geometrically to be worth keeping (concentrate at max_bw=0.81).
+
+**CREST mode partially compensates** because three-criteria dedup keeps more pre-filter basins distinct: `pampa_medium` DBT+Cart crest jumps to 17 (the headline number of the run), `cremp_typical` CREST goes 3 → 5.
+
+**Comparison to Step-16 ceiling:**
+
+| peptide | DBT+Cart CREST | CREMP `uniqueconfs` (raw) | Step 16 ceiling (CREMP→our pipeline @ crest) | coverage % |
+|---|---|---|---|---|
+| cremp_typical | 5 | 471 | 30 | 17% |
+| cremp_sharp | 6 | 190 | 11 | 55% |
+
+cremp_sharp closes to 55% of the apples-to-apples ceiling — meaningful headroom but the single-digit percentages we worried about earlier (5/471) reflect noise in the CREMP raw target, not sampling failure.
+
+**Decision points exposed:**
+
+1. **Energy window too tight.** `e_window_kT=5.0` was set when our minima were less deep. Now that Cart pushes minima 0.4 eV further down, the relative-window concept misses an entire stratum of basins above the deep well. Action: bump to 10.
+2. **Saunders bias too weak under deep-well attraction.** `1/√usage` decays slowly enough that the deep wells Cart finds keep getting re-visited, dragging max_bw up (cremp_sharp 0.41 → 0.74; pampa_small 0.29 → 0.94). Action: try `1/usage` (lever C15) so re-discovered basins get suppressed faster, restoring exploration pressure away from the new traps.
+3. **`pampa_large` CREST regression** (11 → 3) is the only meaningful outlier. Worth visualising the SDFs to see whether the 3 basins are structurally distinct or wobble around one deep well.
+
+### Wider window + stronger Saunders (2026-05-06)
+
+The Run-B post-mortem flagged two decisions: the 5 kT energy window was too tight once Cart pushed minima 0.4 eV deeper, and `1/√usage` Saunders bias decayed too slowly to escape Cart's deep wells. Re-ran the 5-peptide benchmark at `e_window_kT=10`, `saunders_exponent=1.0` (lever C15), `cartesian_weight=0.5`, `dedup_mode=both`. Results in `results/sampler_benchmark_wider_window_saunders1.csv`.
+
+**Sampler-level: Cart contributions doubled-to-9× across 4/5 peptides:**
+
+| peptide | n_cart Run B (5kT, √usage) | n_cart new (10kT, usage) | Δ |
+|---|---|---|---|
+| cremp_typical | 5 | **10** | 2× |
+| cremp_sharp | 6 | **16** | 2.7× |
+| pampa_small | 3 | 3 | 1× (no deep-well trap to escape) |
+| pampa_medium | 17 | **30** | 1.8× |
+| pampa_large | 3 | **26** | **8.7×** ← regression resolved |
+
+**`pampa_large` CREST regression fully resolved.** Run B's 11 → 3 collapse (DBT-only → DBT+Cart) becomes 11 → 26 under the new settings. Cart now finds basins both above and below DBT's plateau region; the deeper-minimum-pulls-window-down problem is gone because (a) the 10 kT window is wide enough to keep DBT's plateau visible, and (b) the stronger 1/usage Saunders bias pushes walkers out of Cart's deep wells before they monopolise sampling.
+
+**Union analysis (DBT-only baseline ∪ new Cart run, `union_basin_coverage_wider_window.csv`):**
+
+| peptide | union @ kabsch | union @ **crest** | CREMP kabsch ceiling | CREMP crest ceiling | coverage_crest |
+|---|---|---|---|---|---|
+| cremp_typical | 11 | **13** | 28 | 30 | **43%** (was 27%) |
+| cremp_sharp | 10 | **21** | 7 | 11 | **191%** (was 100%) |
+| pampa_small | 7 | 9 | n/a | n/a | n/a |
+| pampa_medium | 36 | **41** | n/a | n/a | n/a |
+| pampa_large | 35 | **37** | n/a | n/a | n/a |
+
+**Two paper-grade headlines:**
+
+1. **`cremp_sharp` exceeds the CREMP ceiling under CREST** (21 vs 11). At the same metric we use to project CREMP through our pipeline, our union of DBT-only and DBT+Cart finds ≥10 basins CREMP's exhaustive GFN2-xTB-MD didn't visit. Defensible claim that MCMM-with-composite-proposer is *not* strictly bounded by the CREST baseline.
+2. **`cremp_typical` coverage 27% → 43%** under the new tuning. Clearest evidence the deep-well-escape combo (wider window + stronger Saunders) generalises beyond the structural `pampa_large` case to the small-peptide CREMP comparison.
+
+**`overlap_all = 0` preserved across all 5 peptides under both dedup modes.** DBT and Cart continue exploring disjoint regions of the landscape even with the more aggressive Saunders bias — the union's complementarity isn't a Run B artefact.
+
+**Recommended production setting (2026-05-06):**
+
+`drive_sigma_rad=0.3, closure_tol=0.05, kt_high=8×kT_298, n_init_confs=8, cartesian_weight=0.5, e_window_kT=10, saunders_exponent=1.0`.
+
+The previous defaults (`e_window_kT=5, saunders_exponent=0.5`) remain accessible via the CLI for reproducing Run B. The new defaults are not auto-applied — the in-code defaults still match the original Saunders 1990 / 5 kT pipeline conventions; the benchmark `_run_mcmm` adapter is the right place to lock these values for production runs.
+
+### Reading on GOAT (ORCA's basin-hopping global optimiser)
+
+GOAT (https://www.faccts.de/docs/orca/6.0/manual/contents/typical/GOAT.html) is a basin-hopping algorithm with: (1) a topology-preserving Cartesian uphill kick (freeze bonds and ring sp² angles), (2) parallel temperature workers without swaps (363/726/1452/2904 K), (3) strict three-way dedup (0.125 Å Kabsch RMSD AND 0.1 kcal/mol AND rotational-constant anisotropy 1–2.5%), (4) adaptive termination on "no new global min in 2 iterations".
+
+Ours and GOAT's pipelines share the perturb-then-minimise loop and parallel temperatures, but diverge on three points worth importing: Kabsch dedup (Step 11, urgent), Cartesian topology-preserving kicks as a complementary move type to DBT (Step 12, medium priority), and the independent-T-worker design (Step 13, ablation). Steps 14–15 are GOAT details we can adopt incrementally.
 
 ---
 
@@ -222,24 +668,9 @@ Update `src/README.md` and `scripts/README.md`: new module(s), function, sampler
 
 ## Deferred follow-ups
 
-- **Replace the dedup metric with heavy-atom Kabsch RMSD.** `_energy_ranked_dedup` and `BasinMemory` currently use a normalised L1 distance over all atoms (`Σ|Δr| / (3 × n_atoms)`, threshold 0.1) with no alignment and no symmetry handling. CREST and CREMP's `uniqueconfs` are defined by Kabsch-aligned heavy-atom RMSD with a 0.125 Å threshold (and CREST adds atom-permutation symmetry on top). Three differences vs. our metric:
-  1. **No alignment in ours** — translations/rotations between walker proposals would falsely register as different basins. Rare in practice (MMFF doesn't translate) but possible.
-  2. **All atoms incl. H in ours** — H atoms move much more than the heavy framework during dihedral changes, making our metric *more sensitive* than CREST's for the same move.
-  3. **No symmetry correction in ours** — methyl flips / equivalent-atom permutations are different basins to us, same basin to CREST.
+- **Atom-permutation symmetry for dedup.** CREST treats methyl-flip / equivalent-atom permutations as the same basin via permutation matching during RMSD. We don't, and Step 11 (Kabsch heavy-atom RMSD) preserves this gap. The architectural cost is meaningful — would require storing `mol` objects (or at least permutation groups) alongside coords in `BasinMemory`, not just coord tensors. Estimated 5% impact on basin counts based on CREST literature; defer unless benchmark data shows methyl-flip-driven over-counting.
 
-  Differences 2 and 3 bias toward over-counting basins relative to CREST. Difference 1 also biases toward over-counting. So the metric mismatch is unlikely to be the cause of *under-counting* (e.g. cremp_typical's 1-basin pathology), but it does mean our `n_basins` numbers can't be directly compared to CREMP's `uniqueconfs` for benchmark purposes.
-
-  **Trigger condition for the actual fix**: if the tuned-drive experiment (`drive_sigma_rad=0.3, closure_tol=0.05, kt_high=4×kT_298K`) still produces 1 basin on cremp_typical, the metric likely matters and we should change it. If basins appear with the tuned drive, the metric is mostly cosmetic and we can defer.
-
-  **Implementation plan when triggered**:
-  1. Add `_heavy_atom_kabsch_rmsd(coords_a, coords_b, heavy_atom_indices)` in `confsweeper.py`. Pure torch (svd-based Kabsch). Skip atom-permutation symmetry (would require storing mols, not just coords; the 5% refinement isn't worth the architectural cost).
-  2. Replace the L1 distance computation in `_energy_ranked_dedup`.
-  3. Update `BasinMemory.query_novelty` / `query_novelty_batch` to use the same heavy-atom Kabsch RMSD.
-  4. Bump default `rmsd_threshold` from 0.1 (normalised-L1 units) to 0.125 Å (Kabsch-RMSD units).
-  5. Update the threshold-arithmetic tests in `test_exhaustive_etkdg.py`, `test_pool_b.py`, `test_mcmm.py` to use the new metric.
-  6. **Re-run baseline benchmark CSVs** — existing `n_basins` numbers were collected under the old metric and aren't directly comparable to new ones.
-
-  Affects all three samplers (`get_mol_PE_exhaustive`, `get_mol_PE_pool_b`, `get_mol_PE_mcmm`) for benchmark consistency.
+- **Re-run baseline benchmark CSVs after Step 11 lands.** Every `n_basins`/`max_bw`/`eff_n` number in `results/sampler_benchmark*.csv` was collected with the normalised-L1 metric. Once the Kabsch swap is in, those baselines need re-running before any further interpretation.
 
 ---
 
@@ -278,8 +709,8 @@ Items marked **★** are flagged as initial priorities for implementation if the
 
 ### E. Memory / dedup
 
-16. **Tighter `rmsd_threshold`.** Currently 0.1. Try 0.05 for finer basin resolution; reveals sub-basins that 0.1 collapses. ~1 line plus interpretation.
-17. **Heavy-atom Kabsch RMSD.** Already covered in Deferred follow-ups above. Trigger condition is the same (tuned-drive run still produces 1 basin).
+16. **Looser `rmsd_threshold`.** Currently 0.125 Å (Kabsch, CREMP-aligned). Raise toward 0.5–1.0 Å to merge sub-basins more aggressively when "chemically distinct minimum" matters more than direct CREMP comparison. ~1 line plus interpretation.
+17. ★ **Heavy-atom Kabsch RMSD.** ✓ promoted to Step 11 of the main plan after the multi-seed run's SDF analysis showed sub-Å duplicate basins on `cremp_sharp` and `pampa_small`. No longer a coverage lever — a metric correction.
 
 ### F. Bigger lifts
 

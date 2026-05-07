@@ -56,12 +56,22 @@ def _make_seq_mock_mace():
 def _stub_proposer_factory(mol, hardware_opts, calc, **kwargs):
     """Replacement for `make_mcmm_proposer` that always rejects every
     proposal. Identical to the v0 stub behaviour but isolated from the
-    real factory's import-time topology probe."""
+    real factory's import-time topology probe.
+
+    Carries a `.stats` dict matching the real DBT proposer's shape so
+    `get_mol_PE_mcmm`'s diagnostic logging code path is exercised — the
+    real proposer's stats are a dict, the composite proposer's are a
+    list of dicts, and the diagnostic aggregates across both shapes."""
     del mol, hardware_opts, calc, kwargs
 
+    stats = {"n_proposed": 0, "n_closure_failures": 0, "n_closure_successes": 0}
+
     def fn(coords_list):
+        stats["n_proposed"] += len(coords_list)
+        stats["n_closure_failures"] += len(coords_list)
         return [(c, 0.0, 0.0, False) for c in coords_list]
 
+    fn.stats = stats
     return fn
 
 
@@ -488,4 +498,107 @@ def test_mcmm_multi_seed_invalid_count_raises():
                 n_temperatures=2,
                 n_steps=1,
                 n_init_confs=0,
+            )
+
+
+# ---------------------------------------------------------------------------
+# Cartesian-kick proposer integration (Step 12)
+# ---------------------------------------------------------------------------
+
+
+def test_mcmm_cartesian_weight_zero_skips_kick_proposer():
+    """Default `cartesian_weight=0.0` runs pure DBT — the cartesian-kick
+    factory must not be constructed."""
+    cart_factory_calls = {"n": 0}
+
+    def _spy_cart_factory(mol, **kwargs):
+        del mol, kwargs
+        cart_factory_calls["n"] += 1
+        return _stub_proposer_factory(None, None, None)
+
+    mock_mace = _make_seq_mock_mace()
+    with (
+        patch("confsweeper.embed.EmbedMolecules", side_effect=_mock_etkdg_embed),
+        patch("confsweeper._mace_batch_energies", side_effect=mock_mace),
+        patch(
+            "nvmolkit.mmffOptimization.MMFFOptimizeMoleculesConfs",
+            return_value=[[]],
+        ),
+        patch("confsweeper.make_mcmm_proposer", side_effect=_stub_proposer_factory),
+        patch("mcmm.make_cartesian_kick_proposer", side_effect=_spy_cart_factory),
+    ):
+        get_mol_PE_mcmm(
+            TEST_SMILES,
+            get_embed_params(),
+            hardware_opts=None,
+            calc=MagicMock(),
+            n_walkers_per_temp=1,
+            n_temperatures=2,
+            n_steps=1,
+            cartesian_weight=0.0,
+            rmsd_threshold=0.0,
+        )
+    assert cart_factory_calls["n"] == 0
+
+
+def test_mcmm_cartesian_weight_positive_builds_composite():
+    """`cartesian_weight=0.5` should construct both proposers and route
+    walkers between them via the composite — both factories are called
+    once at setup."""
+    dbt_factory_calls = {"n": 0}
+    cart_factory_calls = {"n": 0}
+
+    def _spy_dbt_factory(mol, hardware_opts, calc, **kwargs):
+        del hardware_opts, calc, kwargs
+        dbt_factory_calls["n"] += 1
+        return _stub_proposer_factory(mol, None, None)
+
+    def _spy_cart_factory(mol, **kwargs):
+        del mol, kwargs
+        cart_factory_calls["n"] += 1
+        return _stub_proposer_factory(None, None, None)
+
+    mock_mace = _make_seq_mock_mace()
+    with (
+        patch("confsweeper.embed.EmbedMolecules", side_effect=_mock_etkdg_embed),
+        patch("confsweeper._mace_batch_energies", side_effect=mock_mace),
+        patch(
+            "nvmolkit.mmffOptimization.MMFFOptimizeMoleculesConfs",
+            return_value=[[]],
+        ),
+        patch("confsweeper.make_mcmm_proposer", side_effect=_spy_dbt_factory),
+        patch("mcmm.make_cartesian_kick_proposer", side_effect=_spy_cart_factory),
+    ):
+        get_mol_PE_mcmm(
+            TEST_SMILES,
+            get_embed_params(),
+            hardware_opts=None,
+            calc=MagicMock(),
+            n_walkers_per_temp=1,
+            n_temperatures=2,
+            n_steps=1,
+            cartesian_weight=0.5,
+            rmsd_threshold=0.0,
+        )
+    assert dbt_factory_calls["n"] == 1
+    assert cart_factory_calls["n"] == 1
+
+
+def test_mcmm_cartesian_weight_negative_raises():
+    mock_mace = _make_seq_mock_mace()
+    with (
+        patch("confsweeper.embed.EmbedMolecules", side_effect=_mock_etkdg_embed),
+        patch("confsweeper._mace_batch_energies", side_effect=mock_mace),
+        patch("confsweeper.make_mcmm_proposer", side_effect=_stub_proposer_factory),
+    ):
+        with pytest.raises(ValueError, match="cartesian_weight must be >= 0"):
+            get_mol_PE_mcmm(
+                TEST_SMILES,
+                get_embed_params(),
+                hardware_opts=None,
+                calc=MagicMock(),
+                n_walkers_per_temp=1,
+                n_temperatures=2,
+                n_steps=1,
+                cartesian_weight=-0.1,
             )

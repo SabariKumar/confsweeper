@@ -18,20 +18,27 @@ from confsweeper import (
 
 def _line_coords(positions: list[float], n_atoms: int = 4) -> torch.Tensor:
     """
-    Build [N, n_atoms, 3] coords where conformer i is a rigid translation of a
-    fixed atom layout by `positions[i]` along x. Pairwise normalised L1 distance
-    between conformer i and j equals |positions[i] - positions[j]|.
+    Build [N, n_atoms, 3] coords where conformer i has atoms anchored on the
+    x-axis except atom 0, which is displaced in z by `positions[i]`. Two
+    such conformers (offsets o1, o2) have non-zero Kabsch RMSD when
+    o1 ≠ o2 because the distortion is not a rigid-body motion. Rigid
+    translations of the whole structure would be removed by Kabsch
+    alignment and not register as basin distance — that's why we
+    perturb a single atom rather than the whole molecule.
 
     Params:
-        positions: list[float] : x-translation per conformer
+        positions: list[float] : per-conformer atom-0 z-displacement
         n_atoms: int : number of atoms (constant across conformers)
     Returns:
         torch.Tensor [N, n_atoms, 3] of conformer coordinates
     """
-    base = torch.zeros(n_atoms, 3)
-    base[:, 0] = torch.arange(n_atoms, dtype=torch.float32)
-    coords = torch.stack([base + torch.tensor([p, 0.0, 0.0]) for p in positions])
-    return coords
+    coords = []
+    for p in positions:
+        c = torch.zeros(n_atoms, 3)
+        c[:, 0] = torch.arange(n_atoms, dtype=torch.float32)
+        c[0, 2] = p
+        coords.append(c)
+    return torch.stack(coords)
 
 
 # ---------------------------------------------------------------------------
@@ -105,14 +112,13 @@ def test_energy_ranked_dedup_threshold_boundary():
     """A pair right at the threshold is treated as overlapping (strict < not <=)
     only when distance is *less than* the threshold. Distance exactly at the
     threshold is considered distinct."""
-    # On _line_coords, normalised L1 distance between conformer 0 (offset 0)
-    # and conformer 1 (offset 0.4) over n_atoms=4 atoms is
-    # (4 * 0.4) / (3 * 4) = 0.1333...
+    # _line_coords offset 0.4 vs 0.0 produces a Kabsch RMSD of ~0.173 Å for the
+    # 4-atom fixture (atom 0 lifted in z, others anchored on x-axis).
     coords = _line_coords([0.0, 0.4])
     energies = np.array([0.0, 1.0])
-    # Threshold 0.2 > 0.133, so the second is excluded
+    # Threshold 0.2 > 0.173, so the second is excluded
     assert _energy_ranked_dedup(coords, energies, rmsd_threshold=0.2) == [0]
-    # Threshold 0.1 < 0.133, so both survive
+    # Threshold 0.1 < 0.173, so both survive
     assert sorted(_energy_ranked_dedup(coords, energies, rmsd_threshold=0.1)) == [0, 1]
 
 
