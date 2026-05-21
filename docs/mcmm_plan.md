@@ -18,7 +18,7 @@ This document is the working design for the third sampler in the issue-#10 bench
 | 8 | `get_mol_PE_mcmm` entry point + proposer stub (`src/confsweeper.py`, `src/mcmm.py`) | ✓ complete (orchestration) |
 | 8b | Real `make_mcmm_proposer` (DBT + side-chain coupling + MMFF + MACE) | ✓ complete |
 | 9 | Sampler benchmark wiring (`scripts/sampler_benchmark.py`) | ✓ complete |
-| 10 | Documentation | pending |
+| 10 | Documentation | ✓ complete |
 | 11 | Kabsch heavy-atom RMSD dedup (replaces normalised-L1) | ✓ complete |
 | 12 | Cartesian-kick proposer (alongside DBT) | ✓ complete |
 | 13 | REMD vs. independent-T workers ablation | pending |
@@ -27,7 +27,7 @@ This document is the working design for the third sampler in the issue-#10 bench
 | 16 | CREMP basin-collapse sanity check (diagnostic experiment) | ✓ complete |
 | 17 | CREST-style three-criteria dedup as opt-in `dedup_mode='crest'` | ✓ complete |
 | 18 | Post-hoc union of basin sets across proposers (`scripts/union_basin_count.py`) | ✓ complete |
-| 19 | CREMP overlap statistics at scale (validation_subset, ~1k peptides) | pending |
+| 19 | CREMP overlap statistics at scale (validation_subset, ~1k peptides) | ✓ complete |
 
 ---
 
@@ -213,9 +213,11 @@ Add `"mcmm"` row to `SAMPLERS` dispatch in `scripts/sampler_benchmark.py`. Adapt
 
 **Outcome.** `_run_mcmm` adapter added to `scripts/sampler_benchmark.py` with the matched-budget mapping `n_steps = max(1, n_seeds // 64)` — at the issue-#11 default 8 × 8 = 64 walkers, this keeps total MMFF work proportional to `n_seeds` so MCMM and exhaustive ETKDG can be run at the same `--n_seeds` value for a fair comparison. Module docstring updated, CLI default `--samplers` is now `exhaustive_etkdg,pool_b,mcmm`. The `grids` argument is ignored by `_run_mcmm` (MCMM doesn't consume the Ramachandran prior). Verified: script imports cleanly, `SAMPLERS = ['exhaustive_etkdg', 'pool_b', 'mcmm']`, CLI help shows the updated default.
 
-### Step 10: Documentation — pending
+### Step 10: Documentation — ✓ complete
 
 Update `src/README.md` and `scripts/README.md`: new module(s), function, sampler entry, plus a section explaining the move set, replica-exchange architecture, and basin-memory bookkeeping. Remove the shared-tail refactor flag.
+
+**Outcome (2026-05-20).** Three READMEs updated. `src/README.md`: added full `## mcmm.py` section (architecture diagram, `BasinMemory` / `MCMMWalker` / `ReplicaExchangeMCMMDriver` / proposer-factory coverage, Kabsch + inertia helpers, sampler-benchmark adapter) and `## concerted_rotation.py` section (DBT + Coutsias closure, `MoveProposal`, `DEFAULT_CLOSURE_TOL`); added the `get_mol_PE_mcmm` narrative + parameter table to the pipeline-functions section; rewrote the old "Clustering" section into "Clustering and dedup" documenting the Step-11 Kabsch metric and Step-17 `dedup_mode='kabsch'|'crest'` AND-test; bumped the stale `rmsd_threshold` rows (0.1 L1 → 0.125 Å Kabsch) and added `dedup_mode` / `energy_threshold_eV` / `rotconst_anisotropy_threshold` rows; removed the obsolete "refactor flag" reference. `scripts/README.md`: added the `mcmm` row to the `sampler_benchmark.py` dispatch table (matched-budget `n_steps = max(1, n_seeds // 64)` + production tuning) and five new script sections (`analyze_basin_sdf.py`, `union_basin_count.py`, `cremp_collapse_test.py`, `sample_cremp_peptides.py`, `cremp_overlap_figure.py`). `src/validation/README.md`: cross-reference paragraphs from `cremp.py` and `make_validation_sets_cremp.py` to the parallel Step-19 scripts that share the pickle directory / `parse_topology`. A full `## References` section was also added to this plan (Saunders 1990, Chang-Guida-Still 1989, DBT 1993, Coutsias 2004, Wu-Deem 1999, GOAT) resolving the shorthand citations used in the docstrings.
 
 ---
 
@@ -473,7 +475,7 @@ This isn't a sampling failure — both proposers are doing useful work. It's a *
 
 Currently neither condition is met. The 2026-05-06 results suggest the composite proposer at the recommended hyperparams is doing 95% of what an ensemble would do; the remaining 5% is the per-track tuning flexibility above. Defer until paper review or a peptide class where it matters surfaces.
 
-### Step 19: CREMP overlap statistics at scale — pending
+### Step 19: CREMP overlap statistics at scale — ✓ complete
 
 Step 16 confirmed on cremp_typical (471) and cremp_sharp (190) that CREMP's `uniqueconfs` collapses 2× at the same Kabsch threshold (CREST's three-criteria AND-test inflates) and another 10× under MMFF relaxation (xtb-vs-MMFF basin disagreement). The follow-up question is whether this is **a CREMP-wide phenomenon** or specific to those two peptides — important because the downstream peptide-electrostatics retrain (Step 16's "Downstream action plan") needs to know whether the inflation is uniform across topologies and amino-acid types.
 
@@ -537,6 +539,8 @@ Two structural axes drive cyclic-peptide conformational entropy and MMFF-vs-xtb 
 
 - **Per-residue features beyond Pro / Gly** — aromatic (F/W/Y/H), charged (D/E/K/R/H), cysteine-disulfide. Useful if Panel C surfaces a chemistry-class signal we missed. Add as `has_aromatic` / `has_charged` flags in the sampler script (~5 lines each) and re-run if needed.
 - **Sample size > 1500** — if any cell hits the 30-peptide floor uncomfortably (e.g., D+NMe with both Pro and Gly is rare), bump per-cell target to 200 (~3000 total, ~17 hours). Trigger: cell counts in the summarize output.
+
+**Outcome (2026-05-20).** All three scripts shipped in `83efdc9` (`scripts/sample_cremp_peptides.py`, the `run`/`summarize` subcommands of `scripts/cremp_collapse_test.py`, `scripts/cremp_overlap_figure.py`) and the at-scale benchmark ran to completion: **1600 peptides, full 16-cell grid at N=100 each, zero failures.** The natural CREMP pool supported the 100-per-cell target everywhere, so no cell dropped below the 30-floor and the secondary-axis `num_monomers` strata are all well-populated. Headline: post-MMFF Kabsch collapse median **27.0×** sample-wide, **85.9 %** of peptides ≥10×, confirming the Step-16 CREMP-overcounts verdict generalises CREMP-wide. Two structural axes drive the inflation — **NMe topology** (NMe-only/D+NMe pre-MMFF median ~1.62 vs all-L/D-only ~1.45, confirming the Panel-A hypothesis) and **ring length** (4-mer 18× → 6-mer 43×). The Pro/Gly hypothesis was *refuted*: Pro/Gly cells collapse *less*, not more, consistently across all four topologies (see Findings 2026-05-20). Divergence from the plan: the 1180 post-partial peptides were processed in round-robin cell order (`overlap_benchmark_sample_roundrobin.csv`) so the topology contrast became interpretable at the midpoint; the run also spanned several detached restarts (host reaped the tracked background tasks — no code fault, see Stage-D notes in `~/.claude/plans/buzzing-chasing-gizmo.md`). Full numbers and the downstream-retrain consequence in the dated Findings entry below.
 
 ---
 
@@ -648,6 +652,89 @@ The Run-B post-mortem flagged two decisions: the 5 kT energy window was too tigh
 
 The previous defaults (`e_window_kT=5, saunders_exponent=0.5`) remain accessible via the CLI for reproducing Run B. The new defaults are not auto-applied — the in-code defaults still match the original Saunders 1990 / 5 kT pipeline conventions; the benchmark `_run_mcmm` adapter is the right place to lock these values for production runs.
 
+### CREMP overlap statistics — Step 19 partial run (2026-05-19)
+
+First read on the at-scale CREMP collapse-test after the May-7 chain stopped mid-run. The Step-19 plumbing (sampler, collapse-test with resume, summarize, figure) was shipped in `83efdc9` but the at-scale chain only got 420 / 1600 peptides done before pausing. Smoke (16 peptides) + partial (420) both flow cleanly through `cremp_collapse_test.py summarize` and `cremp_overlap_figure.py` without code changes — the plumbing is verified end-to-end. Numbers below are read off `results/cremp_overlap_summary_partial.csv`.
+
+**Coverage at the partial point.** Sampling is 100 / cell × 16 cells in `data/processed/cremp/overlap_benchmark_sample.csv`. The May-6 → May-7 chain processed peptides in alphabetical-by-cell order, so partial coverage is heavily skewed:
+
+| topology | has_proline × has_glycine cells done | peptides done |
+|---|---|---|
+| D+NMe | all 4 cells × 100 | 400 / 400 |
+| D-only | 1 cell × 20 | 20 / 400 |
+| all-L | none | 0 / 400 |
+| NMe-only | none | 0 / 400 |
+
+Topology contrast (Panel A of the paper figure) is not yet renderable — two of four topology boxes are N=0.
+
+**Sample-wide collapse medians (N = 420).**
+
+| dedup mode | stage | median collapse ratio | IQR |
+|---|---|---|---|
+| kabsch (0.125 Å) | pre-MMFF | 1.61 | 1.42 – 1.85 |
+| crest (0.125 Å + 0.05 eV + 1 % rot.) | pre-MMFF | 1.41 | 1.27 – 1.59 |
+| kabsch (0.125 Å, 5 kT filter) | post-MMFF | **30.5** | 17.1 – 53.3 |
+| crest (0.125 Å + 0.05 eV + 1 % rot., 5 kT filter) | post-MMFF | **27.2** | 15.2 – 45.8 |
+
+The pre-MMFF Kabsch median of 1.61 matches Step 16's two-peptide pattern (471 → 237 = 1.99×; 190 → 114 = 1.67×) and is biased high in the partial because D+NMe alone is over-represented. **CREST's three-criteria AND-test inflates `uniqueconfs` by a median ~1.6× at the same Kabsch threshold across the (partial) sample** — Step 16's headline is replicating at scale, not a two-peptide artefact.
+
+**88.8 % of peptides collapse ≥ 10×** under post-MMFF Kabsch dedup (415 / 420 above the 10× threshold). The CREMP-overcounts signal is the dominant interpretation of `n_basins ≪ uniqueconfs` for nearly all peptides in this partial sample, not just the two Step-16 picks.
+
+**Length axis.** Median post-MMFF Kabsch collapse stratified by `num_monomers`:
+
+| num_monomers | n_peptides | median collapse ratio |
+|---|---|---|
+| 4 | 165 | 21.8 |
+| 5 | 177 | 36.1 |
+| 6 | 78 | 42.8 |
+
+Bigger ring → more MMFF-vs-xtb basin disagreement. The effect is monotone and roughly doubles between 4-mers and 6-mers; expected from peptide conformational entropy scaling, but the explicit confirmation at N = 420 is the new datum. Implication for the downstream peptide-electrostatics retrain (Step 16's action plan): the per-peptide Boltzmann-weight inflation factor is itself length-dependent, so the post-process pass over the CREMP pickle directory should not assume a uniform deflation factor.
+
+**Provisional Pro × Gly pattern (D+NMe only).**
+
+| has_proline | has_glycine | n | post-MMFF kabsch median |
+|---|---|---|---|
+| False | False | 100 | 39.1 |
+| False | True | 100 | 27.9 |
+| True | False | 100 | 31.1 |
+| True | True | 100 | 22.0 |
+
+**This is the opposite direction of the hypothesis in the Step-19 plan.** The plan predicted Pro / Gly cells would collapse *hardest* (xtb's ring-pucker and broad φ-ψ basins MMFF can't reach). Within D+NMe at least, Pro / Gly peptides collapse *less* than no-Pro / no-Gly. Plausible explanation: Pro restricts φ to ~−60° and Gly's broad permissive region is conformationally simpler — both leave CREST less room to find sub-Å wobble variants in the first place, so the "uniqueconfs vs Kabsch" inflation that drives the post-MMFF collapse ratio is smaller. The MMFF-vs-xtb disagreement may still concentrate in Pro / Gly cells in absolute terms; it's just that those peptides also have lower numerators (`uniqueconfs`), so the *ratio* is smaller. **This is provisional — the all-L cells will tell us whether the inversion is a D+NMe artefact or a universal pattern.** Mark for revisit in the at-scale Findings entry once Stage B completes.
+
+**What remains.** Resume the chain on the 1180 remaining peptides (all-L 400, NMe-only 400, D-only 380). At the observed ~25–30 s / peptide rate from the May-6 log, ~8–10 wall hours on the free Quadro GV100. Resume is launched in Stage B of `~/.claude/plans/buzzing-chasing-gizmo.md`; at-scale Findings entry will follow on completion.
+
+### CREMP overlap statistics — Step 19 at-scale, 1600 peptides (2026-05-20)
+
+Full run complete: all 16 cells at N=100 (4 topology × 2 has-Pro × 2 has-Gly), 1600 peptides, zero failures. The remaining 1180 peptides after the 2026-05-19 partial were processed in **round-robin order across the 8 incomplete cells** (via `data/processed/cremp/overlap_benchmark_sample_roundrobin.csv` — identical peptides to `overlap_benchmark_sample.csv`, reordered so all-L and NMe-only filled in parallel rather than alphabetically; this only changed processing order, not the sample). Numbers below from `results/cremp_overlap_summary.csv`; figure in `results/cremp_overlap_figure.{svg,pdf,png}`.
+
+**Sample-wide collapse medians (N=1600).**
+
+| dedup mode | stage | median collapse ratio | IQR |
+|---|---|---|---|
+| kabsch (0.125 Å) | pre-MMFF | 1.54 | 1.33 – 1.79 |
+| crest (0.125 Å + 0.05 eV + 1 % rot.) | pre-MMFF | 1.35 | 1.20 – 1.52 |
+| kabsch (0.125 Å, 5 kT filter) | post-MMFF | **27.0** | 14.2 – 49.9 |
+| crest (0.125 Å + …, 5 kT filter) | post-MMFF | **24.0** | 12.7 – 43.8 |
+
+**85.9 % of peptides collapse ≥ 10×** under post-MMFF Kabsch. The headline numbers shifted slightly down from the 2026-05-19 partial (post-MMFF kabsch median 30.5 → 27.0; ≥10× fraction 88.8 % → 85.9 %) exactly as expected — the partial was D+NMe-heavy (the topology with the most inflation), and adding the all-L cells (the least) pulled the sample median down. **Step 16's CREMP-overcounts verdict generalises CREMP-wide:** raw `uniqueconfs` is not a usable benchmark ground truth, and the downstream peptide-electrostatics retrain (Step 16 action plan) applies across the whole dataset, not just the two diagnostic peptides.
+
+**Panel A — topology effect (the question the partial couldn't answer).** Pre-MMFF Kabsch collapse by topology:
+
+| topology | pre-MMFF kabsch median | post-MMFF kabsch median |
+|---|---|---|
+| all-L | 1.41 | 24.0 |
+| D-only | 1.48 | 25.3 |
+| NMe-only | 1.63 | 28.1 |
+| D+NMe | 1.61 | 30.8 |
+
+**The plan's Panel-A hypothesis is confirmed: N-methylated topologies show more CREST AND-test inflation than canonical L** (NMe-only/D+NMe ~1.61–1.63 vs all-L/D-only ~1.41–1.48 pre-MMFF; the ordering carries through post-MMFF). N-methylation adds energy/rotational distinctions that CREST's three-criteria test counts as separate conformers, so NMe-rich peptides have the most inflated raw `uniqueconfs`. The effect is modest (~15 % higher ratio) but monotone and consistent across both the pre- and post-MMFF metrics.
+
+**Length axis (post-MMFF kabsch median):** 4-mer 18.0 (N=692), 5-mer 32.3 (N=656), 6-mer 42.9 (N=252). The monotone length-dependence from the partial holds and is strong — 6-mers collapse ~2.4× harder than 4-mers. The per-peptide inflation factor the downstream retrain must correct for is length-dependent; a uniform deflation factor across CREMP would be wrong.
+
+**Panels B/C — the Pro/Gly inversion is confirmed universal.** Post-MMFF Kabsch median by Pro/Gly bucket (pooled): neither 32.4 > Pro-only 30.0 > Gly-only 23.5 > both 21.6. The provisional D+NMe-only inversion from the partial **holds in every topology row of the 16-cell heatmap** — "neither" is the hardest-collapsing cell and "both" the softest, within all four topologies (e.g. all-L 29.2 → 19.4; D+NMe 39.1 → 22.0). **This is the opposite of the Step-19 hypothesis** that Pro/Gly cells would collapse hardest. The structural reading: Pro restricts φ and Gly's permissive-but-simple φ-ψ both leave CREST less sub-Å wobble to over-discretise in the first place, so the `uniqueconfs / Kabsch` numerator is smaller for those peptides — the MMFF-vs-xtb disagreement may still concentrate there in absolute terms, but the *ratio* doesn't. The single hottest cell is **D+NMe / neither at 39.1** (NMe inflation × no-Pro/Gly wobble compounding).
+
+**Downstream consequence.** The inflation is broadly distributed (not concentrated in a few cells), so the Step-16 "downstream action plan" — post-process the full CREMP pickle directory through `_minimize_score_filter_dedup` and retrain the peptide-electrostatics pipeline on corrected conformer counts — applies CREMP-wide. The two interpretable structure axes for the correction: **NMe topology** (more inflation) and **ring length** (more inflation). The retrain should not assume a uniform per-peptide deflation factor; it should at minimum stratify by length and NMe content. The peptide-electrostatics AE-plan memory already flags this dependency.
+
 ### Reading on GOAT (ORCA's basin-hopping global optimiser)
 
 GOAT (https://www.faccts.de/docs/orca/6.0/manual/contents/typical/GOAT.html) is a basin-hopping algorithm with: (1) a topology-preserving Cartesian uphill kick (freeze bonds and ring sp² angles), (2) parallel temperature workers without swaps (363/726/1452/2904 K), (3) strict three-way dedup (0.125 Å Kabsch RMSD AND 0.1 kcal/mol AND rotational-constant anisotropy 1–2.5%), (4) adaptive termination on "no new global min in 2 iterations".
@@ -730,3 +817,19 @@ The priorities marked ★ are roughly ordered: **9 → 4 → 10 → 2/3/5 → 14
 3. Implement DBT from scratch. No published reference exists in the pixi `mace` environment. v0 uses numerical closure (Option B above); the analytical polynomial (Option A) is deferred to a future PR if benchmark data shows multi-branch enumeration is necessary.
 
 All three locked. Steps 1–9 complete (see Progress table at top). Step 10 (final docs in `src/README.md` and `scripts/README.md`) is the last item; after that the branch is ready for the issue-#10 benchmark run.
+
+---
+
+## References
+
+The shorthand citations used throughout this plan and in the `src/mcmm.py` /
+`src/concerted_rotation.py` docstrings:
+
+- **Saunders 1990** — Saunders, M.; Houk, K. N.; Wu, Y.-D.; Still, W. C.; Lipton, M.; Chang, G.; Guida, W. C. "Conformations of Cycloheptadecane. A Comparison of Methods for Conformational Searching." *J. Am. Chem. Soc.* **1990**, *112* (4), 1419–1427. DOI: [10.1021/ja00160a020](https://pubs.acs.org/doi/10.1021/ja00160a020). The cycloheptadecane benchmark comparing internal- vs. external-coordinate, systematic vs. random conformational searches.
+- **Chang-Guida-Still 1989** — Chang, G.; Guida, W. C.; Still, W. C. "An Internal-Coordinate Monte Carlo Method for Searching Conformational Space." *J. Am. Chem. Soc.* **1989**, *111* (12), 4379–4386. DOI: [10.1021/ja00194a035](https://pubs.acs.org/doi/10.1021/ja00194a035). The primary source for the usage-directed Monte Carlo Multiple Minimum (MCMM) algorithm itself — the `1/usage^p` re-discovery bias `BasinMemory` implements. Co-authored by Chang and Guida, who also co-author Saunders 1990; cite this as the MCMM method primary and Saunders 1990 as the benchmark comparison.
+- **DBT 1993** — Dodd, L. R.; Boone, T. D.; Theodorou, D. N. "A Concerted Rotation Algorithm for Atomistic Monte Carlo Simulation of Polymer Melts and Glasses." *Mol. Phys.* **1993**, *78* (4), 961–996. The concerted-rotation backbone move (`concerted_rotation.propose_move`): a correlated change in seven backbone degrees of freedom that leaves the rest of the chain fixed.
+- **Coutsias 2004** — Coutsias, E. A.; Seok, C.; Jacobson, M. P.; Dill, K. A. "A Kinematic View of Loop Closure." *J. Comput. Chem.* **2004**, *25* (4), 510–528. DOI: [10.1002/jcc.10416](https://onlinelibrary.wiley.com/doi/10.1002/jcc.10416), PMID 14735570. The better-conditioned reformulation of the six-torsion ring-closure problem as the real roots of a degree-16 polynomial; the geometry behind our numerical closure.
+- **Wu-Deem 1999** — Wu, M. G.; Deem, M. W. "Analytical Rebridging Monte Carlo: Application to cis/trans Isomerization in Proline-Containing, Cyclic Peptides." *J. Chem. Phys.* **1999**, *111* (14), 6625–6632. DOI: [10.1063/1.480015](https://pubs.aip.org/aip/jcp/article-abstract/111/14/6625). The Jacobian correction that makes the concerted-rotation move satisfy detailed balance on cyclic peptides (`MoveProposal.det_j`). Companion: Wu, M. G.; Deem, M. W. "Efficient Monte Carlo methods for cyclic peptides." *Mol. Phys.* **1999**, *97* (4), 559–580.
+- **GOAT** — Stahn, M.; Grimme, S. et al., ORCA's basin-hopping global optimiser. Manual: [faccts.de/docs/orca/6.0/manual — GOAT](https://www.faccts.de/docs/orca/6.0/manual/contents/typical/GOAT.html). Source of the topology-preserving Cartesian kick (Step 12), the three-criteria dedup (Step 17), and the adaptive-termination idea (Step 15).
+
+> **Verify before paper submission:** the `saunders_exponent=0.5` (`1/√usage`) functional form is attributed to Saunders 1990 in the code docstrings, but the search that produced these references did not confirm the exact `p=0.5` exponent appears verbatim there versus in Chang-Guida-Still 1989 or later formalizations. Check the primary PDFs before citing the specific exponent to a specific paper.

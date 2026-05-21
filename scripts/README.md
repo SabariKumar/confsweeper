@@ -77,11 +77,28 @@ list of MACE energies for the basin centroids. Currently:
 - `exhaustive_etkdg` — `get_mol_PE_exhaustive` at saturation-validated
   defaults (the production baseline).
 - `pool_b` — `get_mol_PE_pool_b` with `strategy='inverse'` and
-  `n_attempts=1` (matched-budget default — see refactor flag in
-  `src/README.md`).
+  `n_attempts=1` (matched-budget default).
+- `mcmm` — `get_mol_PE_mcmm` (MCMM-REMD with DBT + Cartesian composite
+  proposer, basin memory, replica exchange). The adapter maps the
+  benchmark's `n_seeds` knob onto MCMM step count via
+  `n_steps = max(1, n_seeds // 64)`, keeping total MMFF work
+  proportional across the three samplers at the same `--n_seeds`. The
+  adapter also locks the production tuning from
+  `docs/mcmm_plan.md`'s 2026-05-06 findings
+  (`drive_sigma_rad=0.3, closure_tol=0.05, kt_high=8 × kT_298,
+  n_init_confs=8, cartesian_weight=0.5, e_window_kT=10,
+  saunders_exponent=1.0`); the in-code function defaults preserve the
+  original Saunders 1990 / 5 kT conventions.
 
-Future entries (CREST-fast, MCMM, REMD) plug in as a new adapter function
-plus a single dispatch-table key. The benchmark protocol stays unchanged.
+Future entries (CREST-fast, independent-T MCMM) plug in as a new adapter
+function plus a single dispatch-table key. The benchmark protocol stays
+unchanged.
+
+The benchmark also dumps per-peptide basin SDFs to a configurable output
+directory when run with `--dump_basin_sdfs`. Each SDF carries the
+basin-representative conformers tagged with `MACE_ENERGY`; these are the
+inputs that `union_basin_count.py` consumes for post-hoc cross-method
+overlap analysis.
 
 Output CSV is keyed by `(peptide_id, sampler, n_seeds)` and is resume-aware.
 Failed runs are logged and skipped — the loop moves on to the next cell.
@@ -118,6 +135,127 @@ backend choice matters and we'd need to rescore (or replace MACE).
 Self-contained: takes a SMILES, runs the pool through both backends, and
 prints results. Does not write into the saturation CSV. Optional
 per-conformer CSV (`--out_csv`) preserves both energies for follow-up.
+
+### `analyze_basin_sdf.py`
+
+Quick diagnostic that takes a dumped basin SDF (from
+`sampler_benchmark.py --dump_basin_sdfs`) and reports the pairwise
+heavy-atom Kabsch RMSD matrix plus the per-conformer MACE-energy spread.
+The tool that surfaced the metric-noise pathology of the pre-Step-11
+normalised-L1 dedup (`cremp_sharp` 4 "basins" all within 0.21 Å of each
+other; `pampa_small` 16 basins with median pairwise 0.25 Å). Used to
+discriminate between the "deep-basin trap" hypothesis and the
+"sub-Å wobble passing as distinct basins" hypothesis — see Findings
+2026-05-05 in `docs/mcmm_plan.md`.
+
+Self-contained, no CSV input, no GPU required. CLI is a single
+positional argument (the SDF path). Prints to stdout.
+
+### `union_basin_count.py`
+
+Post-hoc union analysis across two `sampler_benchmark.py` runs (DBT-only
+vs DBT + Cartesian-kick). Loads the dumped basin SDFs from each run,
+concatenates the conformers onto a single template mol per peptide, and
+reports four metrics (Step 18):
+
+- **Discovery diversity** (`n_union_all`): all union conformers deduped
+  at the configured Kabsch threshold with no energy filter. Independent
+  of where the global `e_min` lands — the right "how many distinct
+  basins did either method find?" number for the paper.
+- **Filtered union** (`n_union_filtered_5kT`): standard 5 kT filter
+  relative to union `e_min`, then dedup. Comparable to single-method
+  `n_basins`.
+- **Per-method split**: `n_dbt_only`, `n_cart_only`, `n_overlap` —
+  answers "what did each proposer contribute that the other missed?"
+- **Coverage % vs the CREMP-rescored ceiling**: union count divided by
+  `post_mmff_kabsch_0125` from `cremp_collapse_test.py` when a
+  matching peptide exists; the apples-to-apples comparison the paper
+  needs.
+
+Energies come from the SDF's `MACE_ENERGY` per-conformer property — no
+GPU needed. Outputs one row per peptide to the configured `--out_csv`.
+
+### `cremp_collapse_test.py`
+
+Two-subcommand CLI (`run` and `summarize`) for the CREMP basin-collapse
+benchmark — diagnostic for Step 16 on the original two-peptide sanity
+check, scaled to ~1500 peptides for Step 19's at-scale variance study.
+
+**`run`** — per-peptide, feeds CREMP's GFN2-xTB-relaxed conformer set
+through five pipeline stages and reports the conformer count at each:
+
+1. Pre-MMFF Kabsch dedup at 0.125 Å (xtb energies for the ranking).
+2. Pre-MMFF Kabsch dedup at 0.5 Å (looser threshold for sanity).
+3. Pre-MMFF CREST three-criteria dedup at 0.125 Å + 0.05 kcal/mol +
+   1 % rotational-constant anisotropy.
+4. MMFF-relax in-place (nvmolkit batched), then MACE-score every
+   relaxed conformer.
+5. Post-MMFF: 5 kT filter relative to MACE `e_min`, then Kabsch dedup
+   at 0.125 / 0.5 Å and CREST dedup at 0.125 Å.
+
+CLI consumes a CSV with a `sequence` column via `--peptide_list_csv`
+(the output of `sample_cremp_peptides.py` is the canonical input).
+Feature columns (`topology`, `has_proline`, `has_glycine`,
+`num_monomers`) on the input CSV are passed through to the output CSV
+so the summarize step can stratify without re-deriving.
+**Resume-aware** — at start, reads the existing `--out_csv` and skips
+sequences already present. Per-peptide try/except so a single bad
+pickle doesn't abort the run; per-row append + flush guarantees no
+in-memory loss on interrupt.
+
+**`summarize`** — reads a completed collapse-test CSV and emits a
+plot-ready per-stratum summary: median + IQR of four collapse ratios
+(pre-MMFF kabsch, pre-MMFF crest, post-MMFF kabsch, post-MMFF crest)
+across the 16 `(topology, has_proline, has_glycine)` cells, the
+`num_monomers` marginal, and the sample aggregate. Plus the fraction
+of peptides with post-MMFF Kabsch `n_basins` < `uniqueconfs / 10` per
+stratum — the "≥ 10× collapse" fraction that headlines the Step-19
+paper claim.
+
+### `sample_cremp_peptides.py`
+
+Stratified sampler over the full CREMP `summary.csv` (36k peptides)
+for Step 19's at-scale collapse benchmark. The stratification grid is
+**4 topology classes × 2 has-Proline × 2 has-Glycine = 16 cells**;
+the default target is 100 peptides per cell with a 30-peptide floor
+(cells below the floor are dropped with a logged warning).
+
+Topology comes from `validation.make_validation_sets_cremp.parse_topology`,
+the same parser the validation-subset script uses, so the topology
+labels agree across both subset definitions. The Pro / Gly axes are
+binary presence flags — derived from each sequence's residue tokens
+after stripping any `Me` prefix and case-folding. The output CSV
+mirrors `validation_subset.csv`'s schema plus the new feature columns
+`topology`, `has_proline`, `has_glycine`, and `cell`.
+
+Deterministic via `--seed` (default 42). One-shot script — once the
+sample is generated for a given seed, downstream consumers
+(`cremp_collapse_test.py`, `cremp_overlap_figure.py`) work on the same
+file.
+
+### `cremp_overlap_figure.py`
+
+3-panel paper figure for Step 19's at-scale CREMP overlap statistics.
+Reads a completed `cremp_collapse_test.py run` output (with the
+feature columns the sampler emits) and renders:
+
+- **Panel A** — pre-MMFF Kabsch collapse ratio boxplot grouped by
+  topology. Tests whether NMe / D-amino-acid topologies have more
+  CREST AND-test inflation than canonical L peptides.
+- **Panel B** — post-MMFF Kabsch collapse ratio boxplot grouped by
+  Pro / Gly bucket (`neither` / `Pro-only` / `Gly-only` / `both`).
+  Tests whether the MMFF-vs-xtb basin disagreement concentrates in
+  conformationally-special residue classes.
+- **Panel C** — heatmap of post-MMFF Kabsch median collapse ratio
+  across the full 16-cell grid, with cell counts overlaid. Direct
+  visual of whether the inflation is uniform across the
+  `(topology × Pro × Gly)` grid.
+
+SVG is the default and required output (vector, editable in Illustrator
+/ Inkscape, lossless for the paper). PDF and PNG are optional via
+`--out_pdf` and `--out_png`. One function per panel (`_panel_a / _b
+/ _c`) so any panel can be re-rendered or extracted in isolation; layout
+tweaks live in `main`.
 
 ## Critical parameters or constraints
 
