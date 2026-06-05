@@ -40,6 +40,7 @@ The three pipelines share the same return contract, so downstream consumers
 """
 
 import contextlib
+import logging
 import os
 import random
 import uuid
@@ -64,10 +65,20 @@ from rdkit.Chem.rdDistGeom import ETKDGv3
 from rdkit.ML.Cluster.Butina import ClusterData
 from tqdm import tqdm
 
+from mcmm import (
+    BasinMemory,
+    MCMMWalker,
+    ReplicaExchangeMCMMDriver,
+    _inertia_eigvals,
+    _kabsch_rmsd_pairwise,
+    make_mcmm_proposer,
+)
 from torsional_sampling import load_ramachandran_grids, sample_constrained_confs
 
 warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
+
+logger = logging.getLogger("confsweeper")
 
 RANDOM_SEED = 42
 rd = random.Random()
@@ -442,6 +453,12 @@ def _energy_ranked_dedup(
     coords: torch.Tensor,
     energies: np.ndarray,
     rmsd_threshold: float,
+    heavy_atom_indices=None,
+    *,
+    dedup_mode: str = "kabsch",
+    energy_threshold_eV: float = 0.05,
+    rotconst_anisotropy_threshold: float = 0.01,
+    atomic_numbers=None,
 ) -> list[int]:
     """
     Pick basin representatives by energy rank with a geometric exclusion radius.
@@ -451,35 +468,92 @@ def _energy_ranked_dedup(
     iterates lowest energy first, so each basin's representative is its
     energy minimum.
 
-    Distances use the same normalised L1 metric as get_mol_PE_batched so the
-    rmsd_threshold parameter is comparable to its cutoff_dist (default 0.1).
+    Two dedup modes are available — same contract as `BasinMemory`:
+
+    - `dedup_mode='kabsch'` (default): two conformers are merged when
+      their Kabsch heavy-atom RMSD is below `rmsd_threshold`.
+    - `dedup_mode='crest'`: CREST/CREMP three-criteria — merge only
+      when Kabsch RMSD < threshold AND |ΔE| <
+      `energy_threshold_eV` AND inertia-eigenvalue max relative
+      diff < `rotconst_anisotropy_threshold`. Requires
+      `atomic_numbers` for inertia-tensor masses. Step 17 of
+      docs/mcmm_plan.md.
 
     Params:
         coords: torch.Tensor : conformer coordinates [N, A, 3]
         energies: ndarray [N] : potential energies in eV (any shift; only differences matter)
-        rmsd_threshold: float : exclusion radius in normalised L1 units (sum |Δ| / 3·A)
+        rmsd_threshold: float : exclusion radius as Kabsch RMSD in Å
+            (default 0.125 across the get_mol_PE_* family, matching
+            CREMP / CREST / GOAT)
+        heavy_atom_indices: list[int] | None : atoms used for distance
+            comparisons. None means all atoms (synthetic-test convention);
+            production callers extract heavy atoms from the mol so the
+            metric matches CREST's heavy-atom convention.
+        dedup_mode: str : 'kabsch' (default) or 'crest'.
+        energy_threshold_eV: float : energy criterion in eV; default
+            0.05 (≈ 1.2 kcal/mol; loose to absorb MACE float32 noise
+            but still 2× tighter than thermal kT_298).
+        rotconst_anisotropy_threshold: float : rotational-constant
+            criterion; default 0.01 (1%).
+        atomic_numbers: list[int] | None : per-atom Z used to derive
+            masses for the inertia tensor in `dedup_mode='crest'`.
     Returns:
         list[int] : indices into the input arrays of the chosen centroids,
                     ordered by ascending energy
     """
+    if dedup_mode not in ("kabsch", "crest"):
+        raise ValueError(f"dedup_mode must be 'kabsch' or 'crest', got {dedup_mode!r}")
     n = coords.shape[0]
     if n == 0:
         return []
     if n == 1:
         return [0]
 
-    n_atoms = coords.shape[1]
-    flat = coords.reshape(n, -1)
+    if heavy_atom_indices is None:
+        compare_coords = coords
+    else:
+        idx_tensor = torch.tensor(
+            list(heavy_atom_indices), dtype=torch.int64, device=coords.device
+        )
+        compare_coords = coords.index_select(dim=1, index=idx_tensor)
+
+    if dedup_mode == "crest":
+        if atomic_numbers is None:
+            raise ValueError("atomic_numbers is required when dedup_mode='crest'")
+        from rdkit.Chem import GetPeriodicTable
+
+        pt = GetPeriodicTable()
+        masses = torch.tensor(
+            [pt.GetAtomicWeight(int(z)) for z in atomic_numbers],
+            dtype=torch.float64,
+            device=coords.device,
+        )
+        rotconsts = _inertia_eigvals(coords.to(torch.float64), masses)  # (N, 3)
+        e_t = torch.as_tensor(
+            np.asarray(energies), dtype=torch.float64, device=coords.device
+        )
+
     order = np.argsort(np.asarray(energies), kind="stable")
 
-    excluded = torch.zeros(n, dtype=torch.bool, device=flat.device)
+    excluded = torch.zeros(n, dtype=torch.bool, device=compare_coords.device)
     centroids: list[int] = []
     for idx in order.tolist():
         if bool(excluded[idx]):
             continue
         centroids.append(idx)
-        d = (flat - flat[idx].unsqueeze(0)).abs().sum(dim=1) / (3 * n_atoms)
-        excluded |= d < rmsd_threshold
+        d = _kabsch_rmsd_pairwise(compare_coords[idx], compare_coords)  # (N,)
+        rmsd_close = d < rmsd_threshold
+        if dedup_mode == "crest":
+            de_close = (e_t - e_t[idx]).abs() < energy_threshold_eV
+            diff = (rotconsts - rotconsts[idx].unsqueeze(0)).abs()
+            denom = torch.maximum(
+                rotconsts.abs(), rotconsts[idx].unsqueeze(0).abs()
+            ).clamp(min=1e-12)
+            rot_diff = (diff / denom).max(dim=-1).values  # (N,)
+            rot_close = rot_diff < rotconst_anisotropy_threshold
+            excluded |= rmsd_close & de_close & rot_close
+        else:
+            excluded |= rmsd_close
     return centroids
 
 
@@ -568,6 +642,154 @@ def _jitter_rotatable_dihedrals(
     return len(dihedrals)
 
 
+def _minimize_score_filter_dedup(
+    mol: Chem.Mol,
+    all_conf_ids: List[int],
+    hardware_opts,
+    calc,
+    score_chunk_size: int,
+    e_window_kT: float,
+    rmsd_threshold: float,
+    minimize: bool,
+    mmff_backend: str,
+    *,
+    dedup_mode: str = "kabsch",
+    energy_threshold_eV: float = 0.05,
+    rotconst_anisotropy_threshold: float = 0.01,
+) -> Tuple[Chem.Mol, List[int], List[float]]:
+    """
+    Shared post-sampling pipeline tail used by every get_mol_PE_* family
+    function whose Phase 1 sampler produces a pool of raw conformers attached
+    to a single mol.
+
+    Pipeline:
+      1. Optional MMFF94 minimization in place. Two backends:
+         'gpu' calls nvmolkit.mmffOptimization.MMFFOptimizeMoleculesConfs in a
+         single batched CUDA pass. 'cpu' calls RDKit's serial
+         AllChem.MMFFOptimizeMolecule per conformer.
+      2. Batched MACE scoring in chunks of score_chunk_size.
+      3. Energy filter: drop conformers with (E - E_min) > e_window_kT * kT
+         (kT_298K ≈ 26 meV). At least one conformer is always retained even
+         when every scored energy is degenerate (e.g. all NaN); the
+         argmin-energy conformer is force-kept in that case.
+      4. Energy-ranked geometric dedup via _energy_ranked_dedup, keeping the
+         lowest-energy member of each geometric basin defined by
+         rmsd_threshold (Kabsch heavy-atom RMSD in Å). Heavy-atom
+         indices are derived from `mol` here. Singleton survivors skip
+         dedup entirely.
+      5. Drop non-centroid conformers from the mol so the returned object
+         matches the (mol, conf_ids, energies) contract used across the
+         get_mol_PE_* family.
+
+    Callers must guarantee all_conf_ids is non-empty. The empty-pool case is
+    handled at the Phase 1 layer where it can be detected before the helper
+    is invoked (returning (mol, [], []) without paying for MMFF or MACE).
+
+    Params:
+        mol: Chem.Mol : input mol with the raw conformer pool already attached
+        all_conf_ids: List[int] : conformer IDs to process (must be non-empty)
+        hardware_opts : nvmolkit hardware options (only used when mmff_backend='gpu')
+        calc : MACECalculator from get_mace_calc()
+        score_chunk_size: int : per-batch MACE forward pass cap
+        e_window_kT: float : energy filter window in units of kT_298K
+        rmsd_threshold: float : geometric dedup exclusion radius
+            (Kabsch heavy-atom RMSD, Å; default 0.125 matches CREMP)
+        minimize: bool : MMFF94-minimize each conformer before scoring
+        mmff_backend: str : 'gpu' (nvmolkit batched CUDA) or 'cpu' (RDKit serial).
+            Only consulted when minimize=True.
+    Returns:
+        rdkit.Chem.Mol : mol with only basin-representative conformers attached
+        List[int] : conformer IDs of basin representatives, ordered by ascending energy
+        List[float] : potential energies in eV for each representative
+    """
+    # 1. Optional MMFF94 minimization. Errors leave the conformer at its
+    # pre-minimize geometry; we don't track per-conformer success/failure
+    # because MACE scoring afterwards naturally surfaces any pathological
+    # geometries through extreme energies.
+    if minimize:
+        if mmff_backend == "gpu":
+            # nvmolkit batched CUDA implementation — single call optimises
+            # every conformer of `mol` in place. Order-dependent import:
+            # nvmolkit.embedMolecules must be loaded first to register some
+            # global C++ state, which the module-level import already did.
+            from nvmolkit.mmffOptimization import MMFFOptimizeMoleculesConfs
+
+            MMFFOptimizeMoleculesConfs([mol], hardwareOptions=hardware_opts)
+        elif mmff_backend == "cpu":
+            from rdkit.Chem import AllChem
+
+            for cid in all_conf_ids:
+                AllChem.MMFFOptimizeMolecule(mol, confId=cid)
+        else:
+            raise ValueError(
+                f"unknown mmff_backend {mmff_backend!r}; expected 'gpu' or 'cpu'"
+            )
+
+    # 2. Batched MACE scoring, chunked to bound the GPU forward-pass batch size.
+    atomic_nums = [a.GetAtomicNum() for a in mol.GetAtoms()]
+    energies: List[float] = []
+    for start in range(0, len(all_conf_ids), score_chunk_size):
+        chunk_ids = all_conf_ids[start : start + score_chunk_size]
+        ase_mols = [
+            ase.Atoms(
+                positions=mol.GetConformer(cid).GetPositions(),
+                numbers=atomic_nums,
+            )
+            for cid in chunk_ids
+        ]
+        energies.extend(_mace_batch_energies(calc, ase_mols))
+
+    energies_arr = np.asarray(energies, dtype=np.float64)
+
+    # 3. Energy filter: keep conformers within e_window_kT * kT of the minimum.
+    e_min = energies_arr.min()
+    keep_mask = (energies_arr - e_min) <= e_window_kT * _KT_EV_298K
+    if not keep_mask.any():
+        # Only reachable on degenerate inputs (e.g. NaN energies). Force the
+        # caller's contract: at least one centroid is always returned.
+        keep_mask = np.zeros_like(keep_mask)
+        keep_mask[int(np.argmin(energies_arr))] = True
+
+    kept_pool_idx = np.where(keep_mask)[0].tolist()
+    kept_conf_ids = [all_conf_ids[i] for i in kept_pool_idx]
+    kept_energies = energies_arr[kept_pool_idx]
+
+    # 4. Energy-ranked geometric dedup. With a single survivor there is
+    # nothing to cluster; otherwise use the basin-energy primitive.
+    if len(kept_conf_ids) == 1:
+        centroid_ids = list(kept_conf_ids)
+        centroid_energies = [float(kept_energies[0])]
+    else:
+        coords = torch.tensor(
+            np.array([mol.GetConformer(cid).GetPositions() for cid in kept_conf_ids])
+        )
+        heavy_atom_indices = [
+            i for i, a in enumerate(mol.GetAtoms()) if a.GetAtomicNum() != 1
+        ]
+        centroid_pool_idx = _energy_ranked_dedup(
+            coords,
+            kept_energies,
+            rmsd_threshold=rmsd_threshold,
+            heavy_atom_indices=heavy_atom_indices,
+            dedup_mode=dedup_mode,
+            energy_threshold_eV=energy_threshold_eV,
+            rotconst_anisotropy_threshold=rotconst_anisotropy_threshold,
+            atomic_numbers=atomic_nums if dedup_mode == "crest" else None,
+        )
+        centroid_ids = [kept_conf_ids[i] for i in centroid_pool_idx]
+        centroid_energies = [float(kept_energies[i]) for i in centroid_pool_idx]
+
+    # 5. Output: drop non-centroid conformers from the mol so the returned
+    # object matches the (mol, ids, energies) contract used across the
+    # get_mol_PE_* family.
+    centroid_set = set(centroid_ids)
+    for cid in all_conf_ids:
+        if cid not in centroid_set:
+            mol.RemoveConformer(cid)
+
+    return mol, centroid_ids, centroid_energies
+
+
 def get_mol_PE_exhaustive(
     smi: str,
     params,
@@ -577,10 +799,13 @@ def get_mol_PE_exhaustive(
     embed_chunk_size: int = 1000,
     score_chunk_size: int = 500,
     e_window_kT: float = 5.0,
-    rmsd_threshold: float = 0.1,
+    rmsd_threshold: float = 0.125,
     minimize: bool = True,
     mmff_backend: str = "gpu",
     dihedral_jitter_deg: float = 0.0,
+    dedup_mode: str = "kabsch",
+    energy_threshold_eV: float = 0.05,
+    rotconst_anisotropy_threshold: float = 0.01,
     seed: int = 0,
 ) -> Tuple[Chem.Mol, List[int], List[float]]:
     """
@@ -662,7 +887,8 @@ def get_mol_PE_exhaustive(
         embed_chunk_size: int : per-call cap before chunking; tune to GPU memory
         score_chunk_size: int : per-batch MACE forward pass cap
         e_window_kT: float : energy filter window in units of kT_298K
-        rmsd_threshold: float : geometric dedup exclusion radius (normalised L1)
+        rmsd_threshold: float : geometric dedup exclusion radius
+            (Kabsch heavy-atom RMSD, Å; default 0.125 matches CREMP)
         minimize: bool : MMFF94-minimize each conformer before scoring
         mmff_backend: str : 'gpu' (default; nvmolkit batched CUDA) or 'cpu'
             (RDKit serial). Only consulted when minimize=True. See pipeline
@@ -722,82 +948,506 @@ def get_mol_PE_exhaustive(
             + 1_000_003,  # large prime offset to avoid clashing with chunked embed seeds
         )
 
-    # 3. Optional MMFF94 minimization. Errors leave the conformer at its
-    # pre-minimize geometry; we don't track per-conformer success/failure
-    # because MACE scoring afterwards naturally surfaces any pathological
-    # geometries through extreme energies.
+    # 3-7. MMFF + MACE batched score + 5 kT energy filter + energy-ranked
+    # dedup + non-centroid prune. Shared with get_mol_PE_pool_b (and any
+    # future sampler with the same post-Phase-1 pipeline).
+    return _minimize_score_filter_dedup(
+        mol,
+        all_conf_ids,
+        hardware_opts,
+        calc,
+        score_chunk_size=score_chunk_size,
+        e_window_kT=e_window_kT,
+        rmsd_threshold=rmsd_threshold,
+        minimize=minimize,
+        mmff_backend=mmff_backend,
+        dedup_mode=dedup_mode,
+        energy_threshold_eV=energy_threshold_eV,
+        rotconst_anisotropy_threshold=rotconst_anisotropy_threshold,
+    )
+
+
+def get_mol_PE_pool_b(
+    smi: str,
+    grids: dict,
+    hardware_opts,
+    calc,
+    n_samples: int = 10000,
+    n_attempts: int = 1,
+    tolerance_deg: float = 30.0,
+    strategy: str = "inverse",
+    score_chunk_size: int = 500,
+    e_window_kT: float = 5.0,
+    rmsd_threshold: float = 0.125,
+    minimize: bool = True,
+    mmff_backend: str = "gpu",
+    dedup_mode: str = "kabsch",
+    energy_threshold_eV: float = 0.05,
+    rotconst_anisotropy_threshold: float = 0.01,
+    seed: int = 0,
+) -> Tuple[Chem.Mol, List[int], List[float]]:
+    """
+    Sample backbone-dihedral-constrained ('Pool B') conformers, MACE-score them,
+    energy-filter, and dedup geometrically. Macrocyclic peptides only.
+
+    Sister function to get_mol_PE_exhaustive: same `(mol, conf_ids, energies)`
+    contract and the same post-sampling tail (MMFF → MACE batched scoring → kT
+    energy window → _energy_ranked_dedup), but Phase 1 swaps nvmolkit ETKDG for
+    sample_constrained_confs, which embeds each conformer with the bounds matrix
+    tightened to a CREMP-derived (phi, psi) target. The premise is that
+    randomized ETKDG cannot push through to certain low-energy basins on large
+    macrocycles (pampa_large) regardless of MMFF; constrained DG samples those
+    basins directly and lets the rest of the pipeline judge whether they
+    survive scoring.
+
+    Defaults are calibrated for benchmarking against get_mol_PE_exhaustive at a
+    matched compute budget:
+      * n_samples=10000 matches exhaustive ETKDG's saturation-validated n_seeds.
+      * n_attempts=1 (vs. sample_constrained_confs's own default of 5) caps the
+        raw conformer count near 10k so wall-clock and basin-coverage curves
+        compare cleanly. Bump for tight macrocycles where ring-closure failures
+        dominate the feasibility rate.
+      * strategy='inverse' weights rare-but-accessible Ramachandran cells, which
+        is the design intent: the gaps ETKDG misses are exactly the rare cells
+        in the GFN2-xTB distribution. Use 'uniform' for an unbiased sweep over
+        the full CREMP-accessible region.
+
+    The post-sampling tail (MMFF → MACE batched scoring → 5 kT energy filter
+    → energy-ranked dedup → non-centroid pruning) is shared with
+    get_mol_PE_exhaustive via the private _minimize_score_filter_dedup helper.
+
+    Params:
+        smi: str : input SMILES string (must be a head-to-tail cyclic peptide;
+            sample_constrained_confs requires backbone (phi, psi) atoms)
+        grids: dict : CREMP Ramachandran grids from load_ramachandran_grids()
+        hardware_opts : nvmolkit hardware options from get_hardware_opts
+        calc : MACECalculator from get_mace_calc()
+        n_samples: int : number of (phi, psi) draws to attempt (raw budget;
+            actual conformer count depends on per-sample feasibility)
+        n_attempts: int : ETKDGv3 attempts per (phi, psi) draw (default 1 to
+            keep raw pool comparable to get_mol_PE_exhaustive's n_seeds)
+        tolerance_deg: float : dihedral constraint half-width in degrees
+        strategy: str : 'inverse' (default; oversample rare cells) or 'uniform'
+        score_chunk_size: int : per-batch MACE forward pass cap
+        e_window_kT: float : energy filter window in units of kT_298K
+        rmsd_threshold: float : geometric dedup exclusion radius
+            (Kabsch heavy-atom RMSD, Å; default 0.125 matches CREMP)
+        minimize: bool : MMFF94-minimize each conformer before scoring
+        mmff_backend: str : 'gpu' (nvmolkit batched CUDA) or 'cpu' (RDKit serial)
+        seed: int : random seed for the (phi, psi) RNG and CPU embed attempts
+    Returns:
+        rdkit.Chem.Mol : mol with only basin-representative conformers attached
+        List[int] : conformer IDs of basin representatives, ordered by ascending energy
+        List[float] : potential energies in eV for each representative
+    """
+    mol = Chem.AddHs(Chem.MolFromSmiles(smi))
+
+    sample_constrained_confs(
+        mol,
+        grids,
+        n_samples=n_samples,
+        n_attempts=n_attempts,
+        tolerance_deg=tolerance_deg,
+        strategy=strategy,
+        seed=seed,
+    )
+
+    all_conf_ids = [c.GetId() for c in mol.GetConformers()]
+    if not all_conf_ids:
+        return mol, [], []
+
+    return _minimize_score_filter_dedup(
+        mol,
+        all_conf_ids,
+        hardware_opts,
+        calc,
+        score_chunk_size=score_chunk_size,
+        e_window_kT=e_window_kT,
+        rmsd_threshold=rmsd_threshold,
+        minimize=minimize,
+        mmff_backend=mmff_backend,
+        dedup_mode=dedup_mode,
+        energy_threshold_eV=energy_threshold_eV,
+        rotconst_anisotropy_threshold=rotconst_anisotropy_threshold,
+    )
+
+
+def _geometric_temperature_ladder(kt_low: float, kt_high: float, n: int) -> List[float]:
+    """
+    Build a geometric temperature ladder of length `n` spanning kT_low to
+    kT_high inclusive.
+
+    Used by get_mol_PE_mcmm to seed the replica-exchange driver. Geometric
+    spacing keeps the swap-acceptance rate roughly uniform across the
+    ladder (the standard REMD convention).
+
+    Params:
+        kt_low: float : kT at the lowest temperature, in eV
+        kt_high: float : kT at the highest temperature, in eV
+        n: int : number of temperatures (ladder rungs)
+    Returns:
+        list[float] : kT values, monotone increasing, length n
+    """
+    if n <= 0:
+        raise ValueError(f"n must be positive, got {n}")
+    if n == 1:
+        return [float(kt_low)]
+    if not (0 < kt_low < kt_high):
+        raise ValueError(
+            f"require 0 < kt_low < kt_high, got kt_low={kt_low}, kt_high={kt_high}"
+        )
+    ratio = (kt_high / kt_low) ** (1.0 / (n - 1))
+    return [float(kt_low * ratio**i) for i in range(n)]
+
+
+def get_mol_PE_mcmm(
+    smi: str,
+    params,
+    hardware_opts,
+    calc,
+    n_walkers_per_temp: int = 8,
+    n_temperatures: int = 8,
+    kt_low: float = None,
+    kt_high: float = None,
+    n_steps: int = 200,
+    swap_interval: int = 20,
+    drive_sigma_rad: float = 0.1,
+    closure_tol: float = 0.01,
+    sigma_kick_a: float = 0.1,
+    cartesian_weight: float = 0.0,
+    score_chunk_size: int = 500,
+    e_window_kT: float = 5.0,
+    rmsd_threshold: float = 0.125,
+    minimize: bool = True,
+    mmff_backend: str = "gpu",
+    n_init_confs: int = 1,
+    dedup_mode: str = "kabsch",
+    energy_threshold_eV: float = 0.05,
+    rotconst_anisotropy_threshold: float = 0.01,
+    saunders_exponent: float = 0.5,
+    seed: int = 0,
+) -> Tuple[Chem.Mol, List[int], List[float]]:
+    """
+    Multiple Minimum Monte Carlo sampler with replica exchange and DBT
+    concerted-rotation backbone moves. Macrocyclic peptides only.
+
+    Sister function to get_mol_PE_exhaustive and get_mol_PE_pool_b. Same
+    `(mol, conf_ids, energies)` contract and the same post-sampling tail
+    (MMFF → MACE batched scoring → 5 kT energy filter →
+    `_energy_ranked_dedup` → non-centroid pruning) via the shared
+    `_minimize_score_filter_dedup` helper. Phase 1 is the new MCMM
+    pipeline: ETKDG seed → MMFF minimise → run replica-exchange MC for
+    `n_steps` steps with N walkers across the temperature ladder → take
+    the basin set from the shared `BasinMemory` as the starting pool
+    for the shared tail.
+
+    Sampler premise (issue #11): exhaustive ETKDG saturates near
+    one-hot Boltzmann distributions on `pampa_large`-style peptides
+    despite the saturation-validated 10000-seed default. The
+    hypothesis is that pure randomisation cannot push through to
+    certain low-energy basins regardless of seed budget — a
+    connectivity problem rather than a sampling-density one. MCMM
+    walks adaptively from a known minimum with shared basin memory:
+    each move perturbs near a current state, locally minimises, and
+    biases against re-discovery via the Saunders 1/√usage factor.
+    Replica exchange's high-T replicas cross barriers; the low-T
+    replicas refine. See docs/mcmm_plan.md for the complete design.
+
+    Defaults: 8 temperatures geometric 300 K → 600 K, 8 walkers per
+    temperature (64 walkers total), 200 steps per walker (12 800
+    minimisations total — matched-budget against
+    `get_mol_PE_exhaustive`'s 10 000 seeds), swap attempts every 20
+    steps. The `make_mcmm_proposer` factory in `src/mcmm.py` builds
+    the per-step proposer: DBT concerted-rotation geometry on a
+    backbone window, side-chain coupling via rigid-body transport,
+    batched MMFF relaxation, and batched MACE scoring across all
+    walkers' proposals. When `cartesian_weight > 0`,
+    `make_composite_proposer` routes each walker per step between DBT
+    and a GOAT-style Cartesian kick. See docs/mcmm_plan.md.
+
+    Params:
+        smi: str : input SMILES string (must be a head-to-tail cyclic
+            peptide; the proposer enumerates backbone windows on it)
+        params : ETKDG params for the seed conformer; typically from
+            `get_embed_params_macrocycle()` for cyclic peptides
+        hardware_opts : nvmolkit hardware options
+        calc : MACECalculator from `get_mace_calc()`
+        n_walkers_per_temp: int : walkers at each temperature (default 8)
+        n_temperatures: int : ladder size (default 8)
+        kt_low: float | None : kT at the coldest replica in eV; defaults
+            to `_KT_EV_298K` (≈300 K)
+        kt_high: float | None : kT at the hottest replica in eV;
+            defaults to `2 * _KT_EV_298K` (≈600 K)
+        n_steps: int : MC steps per walker (default 200)
+        swap_interval: int : steps between swap attempts (default 20)
+        drive_sigma_rad: float : Gaussian σ for drive-angle perturbation
+            in radians (default 0.1 ≈ 5.7°)
+        closure_tol: float : DBT closure tolerance in Å (default 0.01)
+        sigma_kick_a: float : Gaussian σ for the GOAT-style Cartesian
+            kick proposer in Å (default 0.1). Only consulted when
+            cartesian_weight > 0.
+        cartesian_weight: float : routing weight for the Cartesian kick
+            proposer relative to DBT. Default 0.0 means pure-DBT
+            (legacy behaviour). Set to 0.5 for a 50/50 mix per walker
+            per step — DBT for backbone-topology moves, Cartesian
+            kicks for side-chain rotamer / non-dihedral motions.
+            Step 12 in docs/mcmm_plan.md.
+        score_chunk_size: int : MACE per-batch forward pass cap
+        e_window_kT: float : energy filter window in kT_298K units
+        rmsd_threshold: float : geometric dedup exclusion radius
+            (Kabsch heavy-atom RMSD, Å; default 0.125 matches CREMP /
+            `_energy_ranked_dedup` / `BasinMemory`)
+        minimize: bool : MMFF94-minimise the seed and final basins
+        mmff_backend: str : 'gpu' (nvmolkit) or 'cpu' (RDKit serial)
+        n_init_confs: int : number of distinct ETKDG seed conformers
+            (default 1, the original behaviour). With n_init_confs > 1,
+            ETKDG embeds that many seeds and walkers are distributed
+            round-robin across them — walker `i` starts at seed
+            `i % n_init_confs`. Round-robin (vs. block) means each
+            temperature stack gets exposure to every seed basin, which
+            preserves replica-exchange's mixing behaviour. The basin
+            memory ends up pre-populated with up to `n_init_confs`
+            distinct basins after walker construction (deduped per
+            `rmsd_threshold`), giving MCMM a head start over the
+            single-seed default. Lever C9 in docs/mcmm_plan.md.
+        seed: int : base seed; derived seeds are produced for each
+            walker, the proposer, and the swap RNG by adding fixed
+            offsets, so two runs with the same seed are deterministic
+    Returns:
+        rdkit.Chem.Mol : mol with only basin-representative conformers
+            attached (one per centroid surviving the energy filter and
+            geometric dedup)
+        List[int] : conformer IDs of basin representatives, ordered by
+            ascending MACE energy
+        List[float] : potential energies in eV for each representative
+    """
+    if kt_low is None:
+        kt_low = _KT_EV_298K
+    if kt_high is None:
+        kt_high = 2.0 * _KT_EV_298K
+    if n_init_confs < 1:
+        raise ValueError(f"n_init_confs must be >= 1, got {n_init_confs}")
+
+    # 1. Build seed conformer(s): ETKDG embed + MMFF + MACE-score per
+    # seed for its initial energy. With n_init_confs > 1 we embed that
+    # many distinct conformers up front; walkers later distribute
+    # round-robin across them (lever C9 in docs/mcmm_plan.md).
+    mol = Chem.AddHs(Chem.MolFromSmiles(smi))
+    params.randomSeed = seed
+    embed.EmbedMolecules(
+        [mol], params, confsPerMolecule=n_init_confs, hardwareOptions=hardware_opts
+    )
+    if mol.GetNumConformers() == 0:
+        return mol, [], []
+
     if minimize:
         if mmff_backend == "gpu":
-            # nvmolkit batched CUDA implementation — single call optimises
-            # every conformer of `mol` in place. Order-dependent import:
-            # nvmolkit.embedMolecules must be loaded first to register some
-            # global C++ state, which the embed call above already did.
             from nvmolkit.mmffOptimization import MMFFOptimizeMoleculesConfs
 
             MMFFOptimizeMoleculesConfs([mol], hardwareOptions=hardware_opts)
         elif mmff_backend == "cpu":
             from rdkit.Chem import AllChem
 
-            for cid in all_conf_ids:
+            for cid in [c.GetId() for c in mol.GetConformers()]:
                 AllChem.MMFFOptimizeMolecule(mol, confId=cid)
         else:
             raise ValueError(
                 f"unknown mmff_backend {mmff_backend!r}; expected 'gpu' or 'cpu'"
             )
 
-    # 4. Batched MACE scoring, chunked to bound the GPU forward-pass batch size.
+    n_atoms = mol.GetNumAtoms()
     atomic_nums = [a.GetAtomicNum() for a in mol.GetAtoms()]
-    energies: List[float] = []
-    for start in range(0, len(all_conf_ids), score_chunk_size):
-        chunk_ids = all_conf_ids[start : start + score_chunk_size]
-        ase_mols = [
-            ase.Atoms(
-                positions=mol.GetConformer(cid).GetPositions(),
-                numbers=atomic_nums,
+    seed_conf_ids = [c.GetId() for c in mol.GetConformers()]
+    n_actual_seeds = len(seed_conf_ids)
+
+    # MACE-score every embedded seed in one batched call. Each walker's
+    # initial energy is its assigned seed's energy.
+    seed_ase_mols = [
+        ase.Atoms(
+            positions=mol.GetConformer(cid).GetPositions(),
+            numbers=atomic_nums,
+        )
+        for cid in seed_conf_ids
+    ]
+    seed_energies = [float(e) for e in _mace_batch_energies(calc, seed_ase_mols)]
+    seed_coords_list = [
+        torch.tensor(mol.GetConformer(cid).GetPositions(), dtype=torch.float64)
+        for cid in seed_conf_ids
+    ]
+
+    # 2. Build the shared basin memory. Heavy-atom indices are derived
+    # from the mol so the Kabsch RMSD comparison ignores hydrogens —
+    # matches CREST/CREMP's heavy-atom convention and removes the
+    # noisier H-position contribution from the basin distinguisher.
+    # `dedup_mode='crest'` activates the three-criteria AND-test (Step
+    # 17 of docs/mcmm_plan.md) and aligns BasinMemory's in-run dedup
+    # with the post-MCMM filter — see the entry-point validation note
+    # below for why these have to match.
+    heavy_atom_indices = [i for i, num in enumerate(atomic_nums) if num != 1]
+    memory = BasinMemory(
+        n_atoms=n_atoms,
+        rmsd_threshold=rmsd_threshold,
+        heavy_atom_indices=heavy_atom_indices,
+        dedup_mode=dedup_mode,
+        energy_threshold_eV=energy_threshold_eV,
+        rotconst_anisotropy_threshold=rotconst_anisotropy_threshold,
+        atomic_numbers=atomic_nums if dedup_mode == "crest" else None,
+        saunders_exponent=saunders_exponent,
+    )
+
+    # 3. Build the temperature ladder and walkers. Per-walker random_fns
+    # use deterministic offsets from `seed` so replicate runs are
+    # reproducible without sharing global RNG state. Walkers distribute
+    # round-robin across the embedded seeds: walker w (with global index
+    # t * n_walkers_per_temp + i) starts at seed `w % n_actual_seeds`.
+    # Round-robin (rather than block) gives each temperature stack
+    # exposure to every seed basin, preserving REMD's mixing behaviour.
+    kts = _geometric_temperature_ladder(kt_low, kt_high, n_temperatures)
+    walkers_by_temp: List[List] = []
+    for t, kt in enumerate(kts):
+        group = []
+        for i in range(n_walkers_per_temp):
+            walker_idx_global = t * n_walkers_per_temp + i
+            seed_idx = walker_idx_global % n_actual_seeds
+            walker_rng = np.random.default_rng(seed + 1_000_003 + walker_idx_global)
+            walker = MCMMWalker(
+                seed_coords_list[seed_idx],
+                seed_energies[seed_idx],
+                kt=kt,
+                memory=memory,
+                random_fn=walker_rng.random,
             )
-            for cid in chunk_ids
-        ]
-        energies.extend(_mace_batch_energies(calc, ase_mols))
+            group.append(walker)
+        walkers_by_temp.append(group)
 
-    energies_arr = np.asarray(energies, dtype=np.float64)
-
-    # 5. Energy filter: keep conformers within e_window_kT * kT of the minimum.
-    e_min = energies_arr.min()
-    keep_mask = (energies_arr - e_min) <= e_window_kT * _KT_EV_298K
-    if not keep_mask.any():
-        # Only reachable on degenerate inputs (e.g. NaN energies). Force the
-        # caller's contract: at least one centroid is always returned.
-        keep_mask = np.zeros_like(keep_mask)
-        keep_mask[int(np.argmin(energies_arr))] = True
-
-    kept_pool_idx = np.where(keep_mask)[0].tolist()
-    kept_conf_ids = [all_conf_ids[i] for i in kept_pool_idx]
-    kept_energies = energies_arr[kept_pool_idx]
-
-    # 6. Energy-ranked geometric dedup. With a single survivor there is
-    # nothing to cluster; otherwise use the basin-energy primitive.
-    if len(kept_conf_ids) == 1:
-        centroid_ids = list(kept_conf_ids)
-        centroid_energies = [float(kept_energies[0])]
+    # 4. Build the batch proposer. Pure DBT by default; if
+    # cartesian_weight > 0, compose with a GOAT-style Cartesian-kick
+    # proposer that adds isotropic Gaussian noise + MMFF relax (Step 12,
+    # docs/mcmm_plan.md). Routing happens per walker per step; each
+    # sub-proposer keeps its own batched MMFF/MACE call.
+    if cartesian_weight < 0:
+        raise ValueError(f"cartesian_weight must be >= 0, got {cartesian_weight}")
+    dbt_proposer = make_mcmm_proposer(
+        mol,
+        hardware_opts=hardware_opts,
+        calc=calc,
+        drive_sigma_rad=drive_sigma_rad,
+        closure_tol=closure_tol,
+        score_chunk_size=score_chunk_size,
+        mmff_backend=mmff_backend,
+        seed=seed + 7_777_777,
+    )
+    if cartesian_weight == 0.0:
+        batch_propose_fn = dbt_proposer
     else:
-        coords = torch.tensor(
-            np.array([mol.GetConformer(cid).GetPositions() for cid in kept_conf_ids])
-        )
-        centroid_pool_idx = _energy_ranked_dedup(
-            coords, kept_energies, rmsd_threshold=rmsd_threshold
-        )
-        centroid_ids = [kept_conf_ids[i] for i in centroid_pool_idx]
-        centroid_energies = [float(kept_energies[i]) for i in centroid_pool_idx]
+        from mcmm import make_cartesian_kick_proposer, make_composite_proposer
 
-    # 7. Output: drop non-centroid conformers from the mol so the returned
-    # object matches the (mol, ids, energies) contract used by callers of
-    # get_mol_PE / get_mol_PE_batched.
-    centroid_set = set(centroid_ids)
-    for cid in all_conf_ids:
-        if cid not in centroid_set:
-            mol.RemoveConformer(cid)
+        cart_proposer = make_cartesian_kick_proposer(
+            mol,
+            hardware_opts=hardware_opts,
+            calc=calc,
+            sigma_kick_a=sigma_kick_a,
+            score_chunk_size=score_chunk_size,
+            mmff_backend=mmff_backend,
+            seed=seed + 8_888_888,
+        )
+        batch_propose_fn = make_composite_proposer(
+            [dbt_proposer, cart_proposer],
+            weights=[1.0 - cartesian_weight, cartesian_weight],
+            seed=seed + 6_666_666,
+        )
 
-    return mol, centroid_ids, centroid_energies
+    # 5. Build the replica-exchange driver and run.
+    swap_rng = np.random.default_rng(seed + 9_999_999)
+    driver = ReplicaExchangeMCMMDriver(
+        walkers_by_temp,
+        batch_propose_fn,
+        swap_interval=swap_interval,
+        swap_random_fn=swap_rng.random,
+    )
+    driver.run(n_steps)
+
+    # Diagnostic log so the "1 basin" pathology on small peptides is
+    # easy to triage: closure-failure rate near 1.0 means DBT can't find
+    # closing geometries (try looser closure_tol or larger
+    # drive_sigma_rad); low Metropolis acceptance with healthy closure
+    # means moves get rejected on energy alone (rare on small peptides);
+    # low swap rate means the temperature ladder is too wide.
+    #
+    # `stats` shape depends on the proposer in use:
+    #   - DBT proposer (`make_mcmm_proposer`):       dict
+    #   - Cartesian-kick (`make_cartesian_kick_proposer`): dict
+    #   - Composite (`make_composite_proposer`):     list of those dicts
+    # Aggregate across sub-proposers when composite, so n_proposed
+    # always reflects "total proposals across all move types this run".
+    proposer_stats = getattr(batch_propose_fn, "stats", None)
+    if isinstance(proposer_stats, list):
+        sub_stats = proposer_stats
+    elif isinstance(proposer_stats, dict):
+        sub_stats = [proposer_stats]
+    else:
+        sub_stats = [{}]
+    n_proposed = sum(int(s.get("n_proposed", 0)) for s in sub_stats)
+    # Closure failures only apply to the DBT proposer; non-DBT sub-proposers
+    # (Cartesian kicks) won't have the key, so .get default is correct.
+    n_closure_failures = sum(int(s.get("n_closure_failures", 0)) for s in sub_stats)
+    closure_failure_rate = (
+        n_closure_failures / n_proposed if n_proposed > 0 else float("nan")
+    )
+    metropolis_accept_rate = (
+        driver.n_accepted / n_proposed if n_proposed > 0 else float("nan")
+    )
+    logger.info(
+        "MCMM diagnostics for %r: n_proposed=%d, closure_failure_rate=%.3f, "
+        "metropolis_accept_rate=%.3f, swap_accept_rate=%.3f, "
+        "basins_in_memory=%d (incl. initial)",
+        smi,
+        n_proposed,
+        closure_failure_rate,
+        metropolis_accept_rate,
+        driver.swap_acceptance_rate,
+        memory.n_basins,
+    )
+
+    # 6. Extract the basin set as conformers on the mol. Drop the seed
+    # conformer first; we re-add the basin representatives below. Each
+    # walker's initial state is already in memory (added on construction
+    # via the MCMMWalker init's add_basin call), so memory.n_basins
+    # reflects every distinct starting basin plus every novel basin
+    # accepted during the run.
+    mol.RemoveAllConformers()
+    all_conf_ids: List[int] = []
+    for k in range(memory.n_basins):
+        conf = Chem.Conformer(n_atoms)
+        coords_np = memory.coords[k].cpu().numpy()
+        for atom_idx in range(n_atoms):
+            x, y, z = coords_np[atom_idx]
+            conf.SetAtomPosition(atom_idx, (float(x), float(y), float(z)))
+        cid = mol.AddConformer(conf, assignId=True)
+        all_conf_ids.append(cid)
+
+    if not all_conf_ids:
+        # Defensive: at least one basin (the initial state) is always
+        # added on walker init, so this branch is reachable only if every
+        # walker construction failed. Match the empty-pool convention of
+        # the get_mol_PE_* family.
+        return mol, [], []
+
+    # 7. Pass through the shared MMFF + MACE + filter + dedup tail.
+    return _minimize_score_filter_dedup(
+        mol,
+        all_conf_ids,
+        hardware_opts,
+        calc,
+        score_chunk_size=score_chunk_size,
+        e_window_kT=e_window_kT,
+        rmsd_threshold=rmsd_threshold,
+        minimize=minimize,
+        mmff_backend=mmff_backend,
+        dedup_mode=dedup_mode,
+        energy_threshold_eV=energy_threshold_eV,
+        rotconst_anisotropy_threshold=rotconst_anisotropy_threshold,
+    )
 
 
 def get_mol_PE_mmff(

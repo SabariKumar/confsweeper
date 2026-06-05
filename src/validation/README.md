@@ -23,6 +23,14 @@ backbone traversal order is not guaranteed to match the atom order of the CREMP 
 and standard RMSD without symmetry handling gives artificially large values when the
 two atom orderings are equivalent by ring automorphism.
 
+**Downstream consumer outside this directory.** `scripts/cremp_collapse_test.py`
+(Steps 16 + 19 of `docs/mcmm_plan.md`) reads the same CREMP pickle directory,
+but bypasses `iter_validation_mols` — it operates on the raw CREMP RDKit mol
+plus its xtb energies directly because the basin-collapse benchmark needs all
+conformers of each peptide, not just a validation-subset slice. Its
+per-peptide collapse counts feed the at-scale variance study for the
+peptide-electrostatics retrain plan.
+
 ---
 
 ## cremp_coverage.py
@@ -108,6 +116,16 @@ python src/validation/make_validation_sets_cremp.py \
     --n_per_stratum 14 \
     --seed 42
 ```
+
+**Parallel stratified sampler outside this directory.**
+`scripts/sample_cremp_peptides.py` (Step 19 of `docs/mcmm_plan.md`) builds a
+larger stratified sample for the at-scale collapse benchmark
+(`scripts/cremp_collapse_test.py`). It reuses `parse_topology` from this
+module, so the four-class topology label is canonical across both subset
+definitions. Its stratification grid is
+`topology × has_proline × has_glycine` (16 cells, default 100 per cell)
+rather than `topology × num_monomers × atom_bin` (36 cells, default 28 per
+cell) — different purpose, same topology parser.
 
 ---
 
