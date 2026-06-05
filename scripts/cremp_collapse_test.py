@@ -48,6 +48,7 @@ from confsweeper import (  # noqa: E402
     _mace_batch_energies,
     get_hardware_opts,
     get_mace_calc,
+    write_sdf,
 )
 
 logging.basicConfig(
@@ -122,15 +123,17 @@ def _filter_then_dedup(
     energy_threshold_eV: float = 0.05,
     rotconst_anisotropy_threshold: float = 0.01,
     atomic_numbers=None,
-) -> int:
+) -> list[int]:
     """
     Apply the standard 5 kT energy filter then Kabsch (or CREST-style
-    three-criteria) dedup at the given threshold; return the number of
-    survivors.
+    three-criteria) dedup at the given threshold; return the basin
+    survivors as indices into the input `coords` / `energies` arrays.
 
     Mirrors stages 3+4 of `_minimize_score_filter_dedup` so the
     counts we report here are directly comparable to what
-    `get_mol_PE_mcmm` would report for the same coords.
+    `get_mol_PE_mcmm` would report for the same coords. Callers that
+    only want the count take `len(...)`; the indices let callers also
+    dump the surviving basin geometries (the ceiling-SDF dump).
 
     Params:
         coords: torch.Tensor (N, n_atoms, 3) : already-relaxed coords
@@ -144,7 +147,9 @@ def _filter_then_dedup(
             anisotropy threshold (relative)
         atomic_numbers: list[int] | None : required for crest mode
     Returns:
-        int : number of basin survivors
+        list[int] : indices into the input arrays of the surviving basin
+            representatives (one per basin, lowest-energy member), ordered
+            by ascending energy
     """
     e_min = energies.min()
     keep_mask = (energies - e_min) <= e_window_kT * _KT_EV_298K
@@ -155,7 +160,7 @@ def _filter_then_dedup(
     kept_coords = coords[kept_idx]
     kept_energies = energies[kept_idx]
     if len(kept_coords) == 1:
-        return 1
+        return [int(kept_idx[0])]
     centroids = _energy_ranked_dedup(
         kept_coords,
         kept_energies,
@@ -166,7 +171,9 @@ def _filter_then_dedup(
         rotconst_anisotropy_threshold=rotconst_anisotropy_threshold,
         atomic_numbers=atomic_numbers,
     )
-    return len(centroids)
+    # Map dedup centroid indices (into the filtered subset) back to indices
+    # into the original input arrays.
+    return [int(kept_idx[c]) for c in centroids]
 
 
 def _run_one_peptide(
@@ -175,6 +182,7 @@ def _run_one_peptide(
     calc,
     hardware_opts,
     score_chunk_size: int = 500,
+    dump_ceiling_sdf_dir: Path | None = None,
 ) -> dict:
     """
     Run the full collapse-test pipeline on one CREMP peptide.
@@ -185,6 +193,11 @@ def _run_one_peptide(
         calc : MACECalculator from `get_mace_calc()`
         hardware_opts : nvmolkit hardware options for batched MMFF
         score_chunk_size: int : MACE per-batch forward-pass cap
+        dump_ceiling_sdf_dir: Path | None : when set, write the post-MMFF
+            Kabsch-0.125 Å ceiling basins (geometries + MACE energy) to
+            `<dir>/<sequence>.sdf`. These are the reference "ceiling"
+            basins consumed by the Boltzmann-weighted coverage analysis
+            in `union_basin_count.py`. None (default) skips the dump.
     Returns:
         dict : one row of the output CSV (see OUTPUT_COLUMNS below)
     """
@@ -283,22 +296,46 @@ def _run_one_peptide(
 
     e_min_post = post_mmff_mace_e.min()
     n_within_5kt = int(((post_mmff_mace_e - e_min_post) <= 5.0 * _KT_EV_298K).sum())
-    post_mmff_kabsch_0125 = _filter_then_dedup(
+    # Kabsch 0.125 Å is the canonical ceiling: keep its survivor indices so we
+    # can optionally dump the basin geometries + MACE energies below.
+    kabsch_0125_idx = _filter_then_dedup(
         post_mmff_coords, post_mmff_mace_e, heavy, rmsd_threshold=0.125
     )
-    post_mmff_kabsch_05 = _filter_then_dedup(
-        post_mmff_coords, post_mmff_mace_e, heavy, rmsd_threshold=0.5
+    post_mmff_kabsch_0125 = len(kabsch_0125_idx)
+    post_mmff_kabsch_05 = len(
+        _filter_then_dedup(
+            post_mmff_coords, post_mmff_mace_e, heavy, rmsd_threshold=0.5
+        )
     )
-    post_mmff_crest_0125 = _filter_then_dedup(
-        post_mmff_coords,
-        post_mmff_mace_e,
-        heavy,
-        rmsd_threshold=0.125,
-        dedup_mode="crest",
-        energy_threshold_eV=0.05,
-        rotconst_anisotropy_threshold=0.01,
-        atomic_numbers=atomic_nums,
+    post_mmff_crest_0125 = len(
+        _filter_then_dedup(
+            post_mmff_coords,
+            post_mmff_mace_e,
+            heavy,
+            rmsd_threshold=0.125,
+            dedup_mode="crest",
+            energy_threshold_eV=0.05,
+            rotconst_anisotropy_threshold=0.01,
+            atomic_numbers=atomic_nums,
+        )
     )
+
+    # Optional: persist the post-MMFF Kabsch ceiling basins (geometries +
+    # MACE energy) for the Boltzmann-weighted coverage analysis. The mol is
+    # MMFF-relaxed in place above, so its conformers are the ceiling geometries.
+    if dump_ceiling_sdf_dir is not None:
+        conf_ids_all = [c.GetId() for c in mol.GetConformers()]
+        ceiling_conf_ids = [conf_ids_all[i] for i in kabsch_0125_idx]
+        ceiling_energies = [float(post_mmff_mace_e[i]) for i in kabsch_0125_idx]
+        write_sdf(
+            mol,
+            ceiling_conf_ids,
+            ceiling_energies,
+            sequence,
+            dump_ceiling_sdf_dir,
+            save_lowest_energy=False,
+        )
+
     logger.info(
         "  %s: post-MMFF n_within_5kt=%d  dedup → kabsch %d @ 0.125 Å,  %d @ 0.5 Å;  crest %d @ 0.125 Å",
         sequence,
@@ -460,12 +497,22 @@ def cli() -> None:
     default="medium",
     help="MACE-OFF model size passed to get_mace_calc()",
 )
+@click.option(
+    "--dump_ceiling_sdf_dir",
+    type=Path,
+    default=None,
+    help="When set, write per-peptide post-MMFF Kabsch-0.125 Å ceiling "
+    "basins (geometries + MACE_ENERGY) to <dir>/<sequence>.sdf. These are "
+    "the reference basins consumed by union_basin_count.py's "
+    "Boltzmann-weighted coverage analysis.",
+)
 def run_cmd(
     pickle_dir: Path,
     peptide_list_csv: Path,
     out_csv: Path,
     score_chunk_size: int,
     mace_model: str,
+    dump_ceiling_sdf_dir: Path | None,
 ) -> None:
     """
     Run the CREMP basin-collapse sanity check on every peptide in
@@ -480,10 +527,14 @@ def run_cmd(
         out_csv: Path : output CSV path (resume-aware)
         score_chunk_size: int : MACE per-batch cap
         mace_model: str : MACE-OFF size token (medium / large / etc.)
+        dump_ceiling_sdf_dir: Path | None : when set, dump per-peptide
+            post-MMFF Kabsch ceiling basin SDFs for coverage analysis
     Returns:
         None : appends rows to `out_csv` as each peptide completes
     """
     out_csv.parent.mkdir(parents=True, exist_ok=True)
+    if dump_ceiling_sdf_dir is not None:
+        dump_ceiling_sdf_dir.mkdir(parents=True, exist_ok=True)
     peptides = _read_peptide_list(peptide_list_csv)
     done = _read_done_set(out_csv)
     if done:
@@ -515,6 +566,7 @@ def run_cmd(
                 calc,
                 hardware_opts,
                 score_chunk_size=score_chunk_size,
+                dump_ceiling_sdf_dir=dump_ceiling_sdf_dir,
             )
         except Exception as e:
             logger.exception("failed %s: %s", sequence, e)

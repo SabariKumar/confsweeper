@@ -41,6 +41,7 @@ import numpy as np
 import pandas as pd
 import torch
 from rdkit import Chem
+from rdkit.Geometry import Point3D
 
 # Match other scripts' import shape so this picks up the in-tree package.
 SCRIPT_ROOT = Path(__file__).resolve().parent
@@ -50,6 +51,7 @@ if str(SRC_ROOT) not in sys.path:
 
 from confsweeper import _KT_EV_298K, _energy_ranked_dedup  # noqa: E402
 from mcmm import _inertia_eigvals, _kabsch_rmsd_pairwise  # noqa: E402
+from validation.cremp import calc_coverage  # noqa: E402
 
 # Default thresholds for crest-mode union analysis. The 0.05 eV energy
 # threshold matches what `_minimize_score_filter_dedup` uses post-MMFF
@@ -97,6 +99,208 @@ def _load_basin_sdf(sdf_path: Path) -> tuple[Chem.Mol | None, np.ndarray]:
 def _heavy_indices(mol: Chem.Mol) -> list[int]:
     """Return atom indices of all non-hydrogen atoms in `mol`."""
     return [i for i, a in enumerate(mol.GetAtoms()) if a.GetAtomicNum() != 1]
+
+
+def _boltzmann_weights(energies_eV: np.ndarray, kT: float) -> np.ndarray:
+    """
+    Normalised Boltzmann weights at thermal energy `kT` (eV) over a set of
+    basin energies. Mirrors the weight computation in
+    `saturation_etkdg._bw_metrics`.
+
+    Params:
+        energies_eV: ndarray (K,) : basin energies in eV
+        kT: float : thermal energy in eV
+    Returns:
+        ndarray (K,) : weights summing to 1.0 (empty array if input empty)
+    """
+    e = np.asarray(energies_eV, dtype=np.float64)
+    if e.size == 0:
+        return e
+    w = np.exp(-(e - e.min()) / kT)
+    return w / w.sum()
+
+
+def _mol_from_coords(template: Chem.Mol, coords: torch.Tensor) -> Chem.Mol:
+    """
+    Build a mol from `template`'s topology / atom ordering carrying one
+    conformer per row of `coords`. Used to wrap the sampler's union basin
+    geometries (a coordinate tensor) in an RDKit mol so spyrmsd symmetric
+    RMSD can compare them against the CREMP ceiling mol — which uses a
+    different atom ordering, so raw index-aligned RMSD would be invalid.
+
+    Params:
+        template: Chem.Mol : provides topology + atom ordering (Hs included)
+        coords: torch.Tensor (K, n_atoms, 3) : basin coordinates
+    Returns:
+        Chem.Mol : copy of `template` carrying K conformers (ids 0..K-1)
+    """
+    m = Chem.Mol(template)
+    m.RemoveAllConformers()
+    arr = coords.cpu().numpy()
+    n_atoms = m.GetNumAtoms()
+    for k in range(arr.shape[0]):
+        conf = Chem.Conformer(n_atoms)
+        for i in range(n_atoms):
+            x, y, z = arr[k, i]
+            conf.SetAtomPosition(i, Point3D(float(x), float(y), float(z)))
+        m.AddConformer(conf, assignId=True)
+    return m
+
+
+def _boltzmann_coverage(
+    template: Chem.Mol,
+    union_coords: torch.Tensor,
+    union_energies: np.ndarray,
+    heavy: list[int],
+    ceiling_mol: Chem.Mol,
+    ceiling_e: np.ndarray,
+    kT: float,
+    match_rmsd: float,
+    basin_rmsd: float,
+) -> dict:
+    """
+    Boltzmann-weighted coverage of the CREMP-rescored ceiling by the sampler's
+    union basin set, plus joint-reference masses and a new-basin (discovery)
+    metric. Physically: missing a low-energy (high-weight) ceiling basin costs
+    more than missing a high-energy one.
+
+    The sampler basin set is the Kabsch-deduped discovery set (geometrically
+    distinct basins, no energy filter) — independent of the row's dedup_mode, so
+    the coverage is a pure geometric+thermodynamic property. Matching uses
+    spyrmsd symmetric, heavy-atom RMSD (`calc_coverage(..., strip=True)`) because
+    the ceiling and sampler mols carry different atom orderings. Energies are
+    MACE for both sides ⇒ same absolute scale ⇒ a joint Boltzmann distribution
+    is valid.
+
+    Params:
+        template: Chem.Mol : sampler topology / atom ordering
+        union_coords: torch.Tensor (N, n_atoms, 3) : raw union basin coords
+        union_energies: ndarray (N,) : union basin MACE energies (eV)
+        heavy: list[int] : heavy-atom indices on the sampler mol
+        ceiling_mol: Chem.Mol : ceiling basins (CREMP-rescored, MACE-scored)
+        ceiling_e: ndarray (M,) : ceiling MACE energies (eV)
+        kT: float : thermal energy in eV for the Boltzmann weights
+        match_rmsd: float : cross-method symmetric-RMSD tolerance (Å) used to
+            decide whether a sampler basin matches a ceiling basin. Looser than
+            `basin_rmsd` because MMFF (sampler) and GFN2-xTB (ceiling) relax the
+            same conformational basin to geometries that typically differ by a
+            few tenths of an Å.
+        basin_rmsd: float : within-method Kabsch threshold (Å) used to dedup the
+            sampler union into distinct basins (the 0.125 Å basin-identity
+            convention). Fixed independent of `match_rmsd` so the sampler basin
+            set is stable while the cross-method match tolerance varies.
+    Returns:
+        dict : the Boltzmann-coverage / joint / discovery columns
+    """
+    # Sampler basin set = Kabsch-deduped discovery set at the within-method
+    # basin threshold (NOT match_rmsd), so the distinct-basin count is stable
+    # while the cross-method match tolerance τ varies.
+    s_idx = _energy_ranked_dedup(
+        union_coords,
+        union_energies,
+        rmsd_threshold=basin_rmsd,
+        heavy_atom_indices=heavy,
+        dedup_mode="kabsch",
+    )
+    s_coords = union_coords[s_idx]
+    s_e = union_energies[np.asarray(s_idx)]
+    sampler_mol = _mol_from_coords(template, s_coords)
+    sampler_conf_ids = [c.GetId() for c in sampler_mol.GetConformers()]
+    ceiling_conf_ids = [c.GetId() for c in ceiling_mol.GetConformers()]
+
+    # Basin sets are tiny (tens), and the ceiling (GFN2-xTB frame) and sampler
+    # (MMFF frame) sit in arbitrary rotational frames. calc_coverage's tensor
+    # pre-filter centers translation but does NOT align rotation, so a large
+    # filter_factor effectively disables it — every pair is handed to the
+    # rotation- and symmetry-minimizing spyrmsd, which is what actually decides.
+    _NO_PREFILTER = 1.0e6
+
+    # ceiling basin i covered by the sampler?  (heavy-atom symmetric RMSD)
+    _, ceiling_min_rmsds = calc_coverage(
+        ceiling_mol,
+        sampler_mol,
+        sampler_conf_ids,
+        rmsd_cutoff=match_rmsd,
+        filter_factor=_NO_PREFILTER,
+        strip=True,
+    )
+    covered_C = np.array([r <= match_rmsd for r in ceiling_min_rmsds], dtype=bool)
+
+    # sampler basin j absent from the ceiling?  → a discovery
+    _, sampler_min_rmsds = calc_coverage(
+        sampler_mol,
+        ceiling_mol,
+        ceiling_conf_ids,
+        rmsd_cutoff=match_rmsd,
+        filter_factor=_NO_PREFILTER,
+        strip=True,
+    )
+    new_S = np.array([r > match_rmsd for r in sampler_min_rmsds], dtype=bool)
+
+    # 1. Ceiling-only recovered Boltzmann mass (headline).
+    p = _boltzmann_weights(ceiling_e, kT)
+    coverage_bw_ceiling = float(p[covered_C].sum()) if covered_C.any() else 0.0
+    coverage_count_matched = float(covered_C.mean()) if covered_C.size else 0.0
+    max_missed_bw = float(p[~covered_C].max()) if (~covered_C).any() else 0.0
+
+    # 2. Joint reference (ceiling ∪ new sampler basins).
+    new_idx = np.where(new_S)[0]
+    joint_e = np.concatenate([ceiling_e, s_e[new_idx]])
+    q = _boltzmann_weights(joint_e, kT)
+    n_c = len(ceiling_e)
+    q_ceiling, q_new = q[:n_c], q[n_c:]
+    ceiling_mass_joint = float(q_ceiling.sum())
+    new_basin_mass_joint = float(q_new.sum())
+    missed_ceiling_mass_joint = (
+        float(q_ceiling[~covered_C].sum()) if (~covered_C).any() else 0.0
+    )
+    sampler_mass_joint = float(q_ceiling[covered_C].sum() + q_new.sum())
+
+    # 3. New-basins / discovery.
+    n_new_basins = int(new_S.sum())
+    e_min_ceiling = float(ceiling_e.min())
+    if n_new_basins > 0:
+        e_min_new = float(s_e[new_idx].min())
+        delta_emin = e_min_new - e_min_ceiling
+        found_new_global_min = bool(e_min_new < e_min_ceiling - 1e-3)
+    else:
+        e_min_new = ""
+        delta_emin = ""
+        found_new_global_min = False
+
+    return {
+        "n_ceiling_basins": n_c,
+        "n_sampler_basins": len(s_idx),
+        "coverage_bw_ceiling": coverage_bw_ceiling,
+        "coverage_count_matched": coverage_count_matched,
+        "max_missed_bw": max_missed_bw,
+        "sampler_mass_joint": sampler_mass_joint,
+        "ceiling_mass_joint": ceiling_mass_joint,
+        "missed_ceiling_mass_joint": missed_ceiling_mass_joint,
+        "n_new_basins": n_new_basins,
+        "new_basin_mass_joint": new_basin_mass_joint,
+        "e_min_new_eV": e_min_new,
+        "delta_emin_vs_ceiling": delta_emin,
+        "found_new_global_min": found_new_global_min,
+    }
+
+
+# Boltzmann-coverage columns (blank for peptides without a CREMP ceiling).
+_BW_COVERAGE_COLUMNS = [
+    "n_ceiling_basins",
+    "n_sampler_basins",
+    "coverage_bw_ceiling",
+    "coverage_count_matched",
+    "max_missed_bw",
+    "sampler_mass_joint",
+    "ceiling_mass_joint",
+    "missed_ceiling_mass_joint",
+    "n_new_basins",
+    "new_basin_mass_joint",
+    "e_min_new_eV",
+    "delta_emin_vs_ceiling",
+    "found_new_global_min",
+]
 
 
 def _peptide_id_from_sdf(sdf_path: Path) -> str:
@@ -225,6 +429,10 @@ def _process_peptide(
     dedup_mode: str,
     energy_threshold_eV: float,
     rotconst_anisotropy_threshold: float,
+    ceiling_mol: Chem.Mol | None = None,
+    ceiling_e: np.ndarray | None = None,
+    coverage_kT: float = _KT_EV_298K,
+    match_rmsd: float = 0.125,
 ) -> dict | None:
     """
     Compute the union analysis for one peptide under one dedup mode.
@@ -242,6 +450,12 @@ def _process_peptide(
         energy_threshold_eV: float : crest-mode energy criterion in eV
         rotconst_anisotropy_threshold: float : crest-mode rotational-
             anisotropy criterion
+        ceiling_mol: Chem.Mol | None : ceiling basin mol (from the
+            `--dump_ceiling_sdf_dir` SDF); enables the Boltzmann-coverage
+            columns. None for peptides with no CREMP ceiling.
+        ceiling_e: ndarray | None : ceiling MACE energies (eV)
+        coverage_kT: float : thermal energy (eV) for the Boltzmann weights
+        match_rmsd: float : heavy-atom symmetric-RMSD match threshold (Å)
     Returns:
         dict : one row of the output CSV
     """
@@ -351,7 +565,7 @@ def _process_peptide(
         **classify_kwargs,
     )
 
-    # Coverage vs CREMP-rescored ceiling.
+    # Coverage vs CREMP-rescored ceiling (count ratio — kept for continuity).
     if cremp_row is not None:
         cremp_ceiling_kabsch = int(cremp_row["post_mmff_kabsch_0125"])
         cremp_ceiling_crest = int(cremp_row.get("post_mmff_crest_0125", float("nan")))
@@ -359,7 +573,25 @@ def _process_peptide(
         cremp_ceiling_kabsch = None
         cremp_ceiling_crest = None
 
-    return {
+    # Boltzmann-weighted coverage (geometric matching against the dumped
+    # ceiling basins). dedup-mode-independent: identical on the kabsch and
+    # crest rows. Blank columns when no ceiling SDF was provided.
+    if ceiling_mol is not None and ceiling_e is not None and len(ceiling_e) > 0:
+        bw_cols = _boltzmann_coverage(
+            template,
+            union_coords,
+            union_energies,
+            heavy,
+            ceiling_mol,
+            ceiling_e,
+            coverage_kT,
+            match_rmsd,
+            basin_rmsd=rmsd_threshold,
+        )
+    else:
+        bw_cols = {c: "" for c in _BW_COVERAGE_COLUMNS}
+
+    row = {
         "peptide_id": peptide_id,
         "dedup_mode": dedup_mode,
         "n_dbt": dbt_n,
@@ -393,6 +625,8 @@ def _process_peptide(
             n_union_all / cremp_ceiling_crest if cremp_ceiling_crest else ""
         ),
     }
+    row.update(bw_cols)
+    return row
 
 
 OUTPUT_COLUMNS = [
@@ -416,7 +650,7 @@ OUTPUT_COLUMNS = [
     "coverage_union_filtered_vs_crest",
     "coverage_union_all_vs_kabsch",
     "coverage_union_all_vs_crest",
-]
+] + _BW_COVERAGE_COLUMNS
 
 
 @click.command()
@@ -485,6 +719,36 @@ OUTPUT_COLUMNS = [
     "documented 1–2.5% range.",
 )
 @click.option(
+    "--ceiling_sdf_dir",
+    type=Path,
+    default=None,
+    help="Directory of <sequence>.sdf ceiling basins dumped by "
+    "`cremp_collapse_test.py run --dump_ceiling_sdf_dir`. When provided, the "
+    "Boltzmann-weighted coverage columns (coverage_bw_ceiling, joint masses, "
+    "new-basin discovery) are computed for any peptide whose CREMP sequence "
+    "matches the SDF filename.",
+)
+@click.option(
+    "--coverage_kT",
+    "coverage_kT",
+    type=float,
+    default=_KT_EV_298K,
+    show_default=True,
+    help="Thermal energy (eV) for the Boltzmann coverage weights (default 298 K).",
+)
+@click.option(
+    "--match_rmsd",
+    type=float,
+    default=0.5,
+    show_default=True,
+    help="Heavy-atom symmetric-RMSD tolerance (Å) for matching sampler basins "
+    "to ceiling basins in the Boltzmann coverage analysis. Note this is "
+    "*looser* than the 0.125 Å within-method dedup threshold (`--rmsd_threshold`) "
+    "because MMFF (sampler) and GFN2-xTB (ceiling) relax the same basin to "
+    "geometries that typically differ by a few tenths of an Å. 0.5 Å is the "
+    "convention used by `src/validation/cremp_coverage.py`.",
+)
+@click.option(
     "--out_csv",
     required=True,
     type=Path,
@@ -499,12 +763,16 @@ def main(
     dedup_mode: str,
     energy_threshold_eV: float,
     rotconst_anisotropy_threshold: float,
+    ceiling_sdf_dir: Path | None,
+    coverage_kT: float,
+    match_rmsd: float,
     out_csv: Path,
 ) -> None:
     """
     Compute the post-hoc union of basin sets from a DBT-only run and a
-    DBT+Cart run, with optional coverage % against the CREMP-rescored
-    ceiling.
+    DBT+Cart run, with optional count-ratio coverage against the
+    CREMP-rescored ceiling and (when `--ceiling_sdf_dir` is given)
+    Boltzmann-weighted coverage of the ceiling distribution.
 
     Params:
         dbt_sdf_dir: Path : DBT-only SDF directory
@@ -516,6 +784,10 @@ def main(
         energy_threshold_eV: float : crest-mode energy threshold
         rotconst_anisotropy_threshold: float : crest-mode rotation
             anisotropy threshold
+        ceiling_sdf_dir: Path | None : ceiling-basin SDF directory for
+            Boltzmann coverage; None disables those columns
+        coverage_kT: float : thermal energy (eV) for the coverage weights
+        match_rmsd: float : heavy-atom symmetric-RMSD match threshold (Å)
         out_csv: Path : output CSV path
     Returns:
         None
@@ -532,10 +804,23 @@ def main(
         peptide_id = _peptide_id_from_sdf(dbt_sdf)
         cart_sdf = cart_sdf_dir / dbt_sdf.name
         cremp_row = None
+        seq = None
         if cremp_df is not None:
             seq = _match_cremp_sequence(peptide_id, cremp_df)
             if seq is not None:
                 cremp_row = cremp_df.loc[cremp_df["sequence"] == seq].iloc[0]
+
+        # Load the ceiling basins for the Boltzmann-coverage analysis, if a
+        # dump dir was given and this peptide maps to a CREMP sequence.
+        ceiling_mol, ceiling_e = None, None
+        if ceiling_sdf_dir is not None and seq is not None:
+            ceiling_mol, ceiling_e = _load_basin_sdf(ceiling_sdf_dir / f"{seq}.sdf")
+            if ceiling_mol is None:
+                logger.warning(
+                    "no ceiling SDF for %s at %s; Boltzmann coverage skipped",
+                    seq,
+                    ceiling_sdf_dir / f"{seq}.sdf",
+                )
 
         for mode in mode_list:
             logger.info("processing %s (dedup=%s)", peptide_id, mode)
@@ -549,6 +834,10 @@ def main(
                 dedup_mode=mode,
                 energy_threshold_eV=energy_threshold_eV,
                 rotconst_anisotropy_threshold=rotconst_anisotropy_threshold,
+                ceiling_mol=ceiling_mol,
+                ceiling_e=ceiling_e,
+                coverage_kT=coverage_kT,
+                match_rmsd=match_rmsd,
             )
             if row is None:
                 continue

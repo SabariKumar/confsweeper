@@ -131,6 +131,7 @@ def symmetric_rmsd(
     conf_id_a: int,
     mol_b: rdkit.Chem.Mol,
     conf_id_b: int,
+    strip: bool = False,
 ) -> float:
     """
     Symmetry-aware, rotation-minimised RMSD between two conformers via spyrmsd.
@@ -143,12 +144,16 @@ def symmetric_rmsd(
         conf_id_a  : conformer index in mol_a
         mol_b      : RDKit Mol containing conformer b
         conf_id_b  : conformer index in mol_b
+        strip      : when True, strip hydrogens before the comparison so the
+                     RMSD is heavy-atom only. Default False (all atoms).
+                     Heavy-atom mode aligns with the 0.125 Å Kabsch basin-dedup
+                     convention used for basin matching.
     Returns:
         float : minimum symmetric RMSD in Angstroms
     """
     ref = Molecule.from_rdkit(Chem.Mol(mol_a, confId=conf_id_a))
     comp = Molecule.from_rdkit(Chem.Mol(mol_b, confId=conf_id_b))
-    return float(rmsdwrapper(ref, comp, minimize=True, strip=False, symmetry=True)[0])
+    return float(rmsdwrapper(ref, comp, minimize=True, strip=strip, symmetry=True)[0])
 
 
 def calc_coverage(
@@ -157,6 +162,7 @@ def calc_coverage(
     gen_conf_ids: list[int],
     rmsd_cutoff: float = 1.0,
     filter_factor: float = 2.0,
+    strip: bool = False,
 ) -> tuple[float, list[float]]:
     """
     Calculates what fraction of CREMP reference conformers are covered by
@@ -174,7 +180,12 @@ def calc_coverage(
         gen_mol      : confsweeper RDKit Mol with generated conformers (Hs included)
         gen_conf_ids : list of conformer IDs to use from gen_mol
         rmsd_cutoff  : coverage threshold in Angstroms (default 1.0)
-        filter_factor: pre-filter uses rmsd_cutoff * filter_factor (default 2.0)
+        filter_factor: pre-filter uses rmsd_cutoff * filter_factor (default 2.0).
+                       Raise this when `strip=True` so the full-atom pre-filter
+                       does not drop genuine heavy-atom matches whose H positions
+                       wobble.
+        strip        : forwarded to `symmetric_rmsd`; when True the precise RMSD
+                       is heavy-atom only (default False, all atoms)
     Returns:
         coverage     : fraction of reference conformers covered (0.0–1.0)
         ref_min_rmsds: for each reference conformer, the minimum symmetric RMSD
@@ -229,7 +240,7 @@ def calc_coverage(
         min_rmsd = float("inf")
         for j in candidate_idxs:
             gen_cid = gen_conf_ids[j]
-            r = symmetric_rmsd(ref_mol, ref_cid, gen_mol, gen_cid)
+            r = symmetric_rmsd(ref_mol, ref_cid, gen_mol, gen_cid, strip=strip)
             if r < min_rmsd:
                 min_rmsd = r
 

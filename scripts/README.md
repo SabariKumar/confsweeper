@@ -169,8 +169,25 @@ reports four metrics (Step 18):
   answers "what did each proposer contribute that the other missed?"
 - **Coverage % vs the CREMP-rescored ceiling**: union count divided by
   `post_mmff_kabsch_0125` from `cremp_collapse_test.py` when a
-  matching peptide exists; the apples-to-apples comparison the paper
-  needs.
+  matching peptide exists; the legacy count-ratio metric kept for
+  backward continuity.
+- **Boltzmann-weighted coverage** (when `--ceiling_sdf_dir` is given):
+  reports `coverage_bw_ceiling` (fraction of the CREMP ceiling's 298 K
+  Boltzmann population the sampler recovers), `coverage_count_matched`
+  (a *true* matched fraction via spyrmsd symmetric RMSD, replacing the
+  count ratio that could exceed 1), joint-reference masses, and a
+  **new-basins / discovery** metric (`n_new_basins`,
+  `new_basin_mass_joint`, `delta_emin_vs_ceiling`,
+  `found_new_global_min`) capturing basins the sampler found that CREMP
+  missed plus their thermodynamic weight. **Two-threshold design:**
+  basin sets are deduped at the within-method `--rmsd_threshold`
+  (0.125 Å, the CREMP / CREST / GOAT convention), but cross-method
+  ceiling↔sampler matching uses `--match_rmsd` (default **0.5 Å**, the
+  `validation/cremp_coverage.py` convention) because MMFF and
+  GFN2-xTB relax the same basin to geometries 0.3–0.5 Å apart. Inputs
+  come from `cremp_collapse_test.py run --dump_ceiling_sdf_dir`. See
+  the 2026-05-21 Findings entry in `docs/mcmm_plan.md` for the
+  rotation-naive pre-filter and threshold rationale.
 
 Energies come from the SDF's `MACE_ENERGY` per-conformer property — no
 GPU needed. Outputs one row per peptide to the configured `--out_csv`.
@@ -202,6 +219,12 @@ so the summarize step can stratify without re-deriving.
 sequences already present. Per-peptide try/except so a single bad
 pickle doesn't abort the run; per-row append + flush guarantees no
 in-memory loss on interrupt.
+
+Optional `--dump_ceiling_sdf_dir PATH` writes the post-MMFF Kabsch
+ceiling basins (geometries + per-conformer `MACE_ENERGY`) to
+`<dir>/<sequence>.sdf` for each peptide. These are the canonical
+"ceiling" basins consumed by `union_basin_count.py`'s Boltzmann-weighted
+coverage analysis.
 
 **`summarize`** — reads a completed collapse-test CSV and emits a
 plot-ready per-stratum summary: median + IQR of four collapse ratios

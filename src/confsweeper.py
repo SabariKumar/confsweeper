@@ -1158,14 +1158,12 @@ def get_mol_PE_mcmm(
     minimisations total — matched-budget against
     `get_mol_PE_exhaustive`'s 10 000 seeds), swap attempts every 20
     steps. The `make_mcmm_proposer` factory in `src/mcmm.py` builds
-    the per-step DBT geometry + batched MMFF + batched MACE pipeline.
-
-    **v0 status note**: `make_mcmm_proposer` is currently a stub that
-    returns `success=False` for every proposal, so no MC exploration
-    occurs and the basin set ends with only the initial conformer.
-    The orchestration around it is fully wired and tested. Step 8b
-    swaps in the real DBT + MMFF + MACE proposer to enable
-    exploration; see docs/mcmm_plan.md.
+    the per-step proposer: DBT concerted-rotation geometry on a
+    backbone window, side-chain coupling via rigid-body transport,
+    batched MMFF relaxation, and batched MACE scoring across all
+    walkers' proposals. When `cartesian_weight > 0`,
+    `make_composite_proposer` routes each walker per step between DBT
+    and a GOAT-style Cartesian kick. See docs/mcmm_plan.md.
 
     Params:
         smi: str : input SMILES string (must be a head-to-tail cyclic
