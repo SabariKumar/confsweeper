@@ -787,6 +787,8 @@ Ours and GOAT's pipelines share the perturb-then-minimise loop and parallel temp
 
 - **Re-run baseline benchmark CSVs after Step 11 lands.** Every `n_basins`/`max_bw`/`eff_n` number in `results/sampler_benchmark*.csv` was collected with the normalised-L1 metric. Once the Kabsch swap is in, those baselines need re-running before any further interpretation.
 
+- **Side-chain dihedral-kick proposer (addresses 2026-05-21 Findings — cremp_sharp 0% Boltzmann coverage).** The 2026-05-21 Boltzmann-coverage Finding showed cremp_sharp's MCMM basin set sits geometrically 3+ Å from every CREMP ceiling basin while the dominant ceiling basin holds 72% of the 298 K population — a hard 0% on `coverage_bw_ceiling`. The failure mode points at NMe-Trp χ₁ / χ₂ rotamers that DBT (backbone-only) cannot reach and that small Cartesian kicks + MMFF relax cannot cross because the indole-ring chi barriers are 10–15 kcal/mol. The fix is a third proposer alongside DBT and the GOAT-style Cartesian kick: a side-chain dihedral rotation that picks one rotatable side-chain bond per step, rotates the downstream subtree (trivial Jacobian, unlike DBT's closed-loop concerted rotation), MMFF-relaxes, and MACE-scores. Tracked separately in [docs/dihedral_kick_plan.md](dihedral_kick_plan.md) and issue #12 — that doc owns the numbered Steps, design-choice levers, and Findings record for the new proposer.
+
 ---
 
 ## Lever menu for basin coverage
