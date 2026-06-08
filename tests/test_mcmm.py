@@ -30,6 +30,7 @@ from mcmm import (
     make_composite_proposer,
     make_mcmm_proposer,
 )
+from proposers import _enumerate_side_chain_dihedrals
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -173,6 +174,89 @@ def test_ordered_residues_within_residue_bonds():
     for n_idx, ca_idx, c_idx in residues:
         assert mol.GetBondBetweenAtoms(n_idx, ca_idx) is not None
         assert mol.GetBondBetweenAtoms(ca_idx, c_idx) is not None
+
+
+# ---------------------------------------------------------------------------
+# _enumerate_side_chain_dihedrals
+# ---------------------------------------------------------------------------
+
+# cremp_sharp = head-to-tail cyclic 6-mer Ser-Ser-Asn-NMeTrp-NMeAla-NMeAsn —
+# the headline failure case from the 2026-05-21 Boltzmann-coverage Finding
+# (`docs/mcmm_plan.md`) that motivates the dihedral-kick proposer. The
+# SMILES below is the canonical form recorded in
+# `results/cremp_ceiling_sdfs/S.S.N.MeW.MeA.MeN.sdf`.
+_CREMP_SHARP_SMILES = (
+    "C[C@H]1C(=O)N(C)[C@@H](CC(N)=O)C(=O)N[C@@H](CO)C(=O)N[C@@H](CO)"
+    "C(=O)N[C@@H](CC(N)=O)C(=O)N(C)[C@@H](Cc2c[nH]c3ccccc23)C(=O)N1C"
+)
+
+
+def _cremp_sharp_mol() -> Chem.Mol:
+    """Build the cremp_sharp test mol with explicit Hs."""
+    return Chem.AddHs(Chem.MolFromSmiles(_CREMP_SHARP_SMILES))
+
+
+def test_enumerate_side_chain_dihedrals_empty_for_all_methyl_peptide():
+    """Cyclic L-alanine homopolymers have only methyl side chains, so every
+    rotatable-bond match is either a backbone bond (excluded) or a methyl
+    rotation (one endpoint has heavy-atom degree 1, also excluded)."""
+    for n_residues in (4, 6):
+        mol = _cycloala_mol(n_residues)
+        result = _enumerate_side_chain_dihedrals(mol)
+        assert result == [], (
+            f"expected empty side-chain enumeration for cyclo(Ala){n_residues}, "
+            f"got {result}"
+        )
+
+
+def test_enumerate_side_chain_dihedrals_contains_trp_chi1():
+    """The χ₁ dihedral of Trp (Cα-Cβ-Cγ_aromatic axis) must appear so the
+    dihedral-kick proposer can perturb it. cremp_sharp's NMe-Trp is the
+    headline target from `docs/dihedral_kick_plan.md`."""
+    mol = _cremp_sharp_mol()
+    result = _enumerate_side_chain_dihedrals(mol)
+    # Trp χ₁: sp3 Cα → sp3 Cβ → aromatic Cγ of the indole. cremp_sharp's
+    # only aromatic residue is Trp, so this SMARTS uniquely identifies the
+    # Cα-Cβ bond of the NMe-Trp side chain.
+    chi1_pattern = Chem.MolFromSmarts("[CX4][CX4][c]")
+    matches = mol.GetSubstructMatches(chi1_pattern)
+    assert matches, "expected sp3-sp3-aromatic substructure match for Trp χ₁"
+    ca, cb, _ = matches[0]
+    # The χ₁ axis is the (Cα, Cβ) bond. Some enumerated tuple must have
+    # (b, c) ∈ {(Cα, Cβ), (Cβ, Cα)} — order depends on SMARTS iteration.
+    chi1_present = any(
+        (b == ca and c == cb) or (b == cb and c == ca) for _, b, c, _ in result
+    )
+    assert (
+        chi1_present
+    ), f"Trp χ₁ axis (Cα={ca}, Cβ={cb}) not in enumeration; got {result}"
+
+
+def test_enumerate_side_chain_dihedrals_excludes_backbone():
+    """Strict separation from DBT: no backbone bond may leak into the
+    side-chain enumeration. Sentinel: for every returned (a, b, c, d),
+    NOT both b and c lie on the macrocycle backbone."""
+    mol = _cremp_sharp_mol()
+    result = _enumerate_side_chain_dihedrals(mol)
+    assert result, "expected non-empty side-chain enumeration for cremp_sharp"
+    backbone_atoms = _backbone_atom_set(mol)
+    for a, b, c, d in result:
+        assert not (
+            b in backbone_atoms and c in backbone_atoms
+        ), f"backbone bond ({b}, {c}) leaked into side-chain enumeration"
+
+
+def test_enumerate_side_chain_dihedrals_returns_int_quadruples():
+    """Output type contract: list of `(int, int, int, int)` tuples; each
+    entry is ready to hand to `Chem.rdMolTransforms.SetDihedralDeg`."""
+    mol = _cremp_sharp_mol()
+    result = _enumerate_side_chain_dihedrals(mol)
+    assert isinstance(result, list)
+    for entry in result:
+        assert isinstance(entry, tuple)
+        assert len(entry) == 4
+        for x in entry:
+            assert isinstance(x, int)
 
 
 # ---------------------------------------------------------------------------

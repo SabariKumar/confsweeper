@@ -12,7 +12,7 @@ This document is the working design for a third MCMM proposer — a **side-chain
 |------|-------------|--------|
 | 1 | Lock the four open design choices (see *Design choices to lock* below) | ✓ complete |
 | 2 | Refactor: extract proposer factories from `src/mcmm.py` to a new `src/proposers.py` | ✓ complete |
-| 3 | Side-chain rotatable-bond enumeration (`_enumerate_side_chain_dihedrals`) | pending |
+| 3 | Side-chain rotatable-bond enumeration (`_enumerate_side_chain_dihedrals`) | ✓ complete |
 | 4 | `make_dihedral_kick_proposer` factory + tests | pending |
 | 5 | Extend `make_composite_proposer` to n-way routing across (DBT, Cartesian, dihedral) | pending |
 | 6 | Wire `get_mol_PE_mcmm` kwargs + `scripts/sampler_benchmark._run_mcmm` defaults | pending |
@@ -129,7 +129,7 @@ Mechanical move that lands BEFORE the new dihedral-kick code so it goes in the r
 
 **Verification:** `pixi run python -m pytest tests/ -q` → **381 passed, 8 skipped, 3 warnings in 1292.63s (21m32s)** — bit-for-bit match with the pre-refactor baseline of 381 / 8. Step 3 unblocked.
 
-### Step 3: Side-chain rotatable-bond enumeration — pending
+### Step 3: Side-chain rotatable-bond enumeration — ✓ complete
 
 - New helper `_enumerate_side_chain_dihedrals(mol) -> list[tuple[int, int, int, int]]` in [src/mcmm.py](../src/mcmm.py) returning the four-atom tuples `(a, b, c, d)` for each rotatable bond `(b, c)` that is NOT on the backbone.
 - Uses RDKit's rotatable-bond SMARTS (`[!$(*#*)&!D1]-&!@[!$(*#*)&!D1]`) to enumerate candidate bonds, then subtracts the backbone dihedrals already enumerated by `enumerate_backbone_windows` ([src/mcmm.py:94](../src/mcmm.py#L94)).
@@ -141,6 +141,12 @@ Mechanical move that lands BEFORE the new dihedral-kick code so it goes in the r
 - Empty list for a single-amino-acid model with no side-chain rotatable bond.
 - For NMe-Trp (standalone or as part of cremp_sharp), the χ₁ dihedral (Cα–Cβ–Cγ–Cδ1) appears in the output.
 - No backbone dihedral appears in the output — sentinel: `set(result) ∩ set(enumerate_backbone_windows(mol)) == ∅`.
+
+**Outcome (2026-05-22).** `_enumerate_side_chain_dihedrals(mol)` shipped in `src/proposers.py` along with two small private helpers (`_heavy_degree`, `_pick_flanking_atom`) and the cached module-level `_ROTATABLE_BOND_SMARTS = Chem.MolFromSmarts("[!$(*#*)&!D1]-&!@[!$(*#*)&!D1]")`. Implementation matches the locked design: RDKit canonical rotatable-bond SMARTS → backbone-bond exclusion via `_backbone_atom_set` → heavy-degree-1 filter (catches methyl-type and -OH / -NH₂ terminal-heavy rotations in a single rule) → deterministic flanking-atom pick by lowest-index non-H neighbour. The methyl filter cleanly subsumes the more naive "is methyl?" check by also catching Ser's -OH and Asn's -NH₂ terminal groups, where heavy-atom rotation is H-dominated and adds no conformational diversity. New section `# Side-chain rotatable-bond enumeration — used by the dihedral-kick proposer` between the existing side-chain helpers and the DBT proposer factory.
+
+**Tests:** 4 new tests in `tests/test_mcmm.py` covering the test invariants from the design: cycloAla4 + cycloAla6 → empty (all-methyl-side-chain case); cremp_sharp → contains Trp χ₁ (sp3-sp3-aromatic identified via `[CX4][CX4][c]` SMARTS, which uniquely matches Trp here); no backbone bond leaks (sentinel: NOT both b and c in backbone atoms); output type contract is list of 4-int tuples. New SMILES constant `_CREMP_SHARP_SMILES` and `_cremp_sharp_mol()` helper added near the top of the test file. New code imports directly from `proposers` (`from proposers import _enumerate_side_chain_dihedrals`) — the back-compat re-export through `mcmm` is reserved for pre-refactor callers.
+
+**Verification:** targeted `pixi run python -m pytest tests/test_mcmm.py -q -k enumerate_side_chain_dihedrals` → 4 passed in 1.37 s. Full regression `pixi run python -m pytest tests/ -q` → **385 passed, 8 skipped, 3 warnings in 1287.27s (21m27s)** — exactly the predicted +4 over Step 2's 381 / 8 baseline.
 
 ### Step 4: `make_dihedral_kick_proposer` factory + tests — pending
 

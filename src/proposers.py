@@ -135,6 +135,132 @@ def _compute_window_downstream_sets(
 
 
 # ---------------------------------------------------------------------------
+# Side-chain rotatable-bond enumeration — used by the dihedral-kick proposer
+# ---------------------------------------------------------------------------
+
+
+# RDKit's canonical rotatable-bond SMARTS: single bond between two
+# non-triple-bonded heavy atoms with degree > 1 and not in a ring. Matches
+# pairs (b, c) for each rotatable bond. Cached at module load.
+_ROTATABLE_BOND_SMARTS = Chem.MolFromSmarts("[!$(*#*)&!D1]-&!@[!$(*#*)&!D1]")
+
+
+def _heavy_degree(mol: Chem.Mol, atom_idx: int) -> int:
+    """
+    Return the number of non-hydrogen neighbours of `atom_idx` in `mol`.
+
+    Heavy-atom degree of 1 indicates a terminal heavy atom (e.g., the
+    methyl carbon of a CH3, the Oγ of a Ser hydroxyl, the Nδ of an Asn
+    amide head). Rotating around the bond to its parent is 3-fold
+    symmetric or H-dominated — conformationally trivial — so the
+    side-chain dihedral enumeration filters these out.
+
+    Params:
+        mol: Chem.Mol : input molecule
+        atom_idx: int : atom index
+    Returns:
+        int : count of non-H neighbours
+    """
+    return sum(
+        1
+        for nb in mol.GetAtomWithIdx(atom_idx).GetNeighbors()
+        if nb.GetAtomicNum() != 1
+    )
+
+
+def _pick_flanking_atom(mol: Chem.Mol, atom_idx: int, exclude: int) -> int | None:
+    """
+    Pick a flanking atom for a dihedral defined around a bond ending at
+    `atom_idx`. Used to assemble the `(a, b, c, d)` four-atom tuple given
+    the bond `(b, c)`: pick `a` ∈ neighbours(b) − {c}; pick `d` ∈
+    neighbours(c) − {b}.
+
+    Selection rule: lowest-index non-H neighbour preferred so the
+    enumeration is deterministic across runs. Falls back to any neighbour
+    (H included) if no non-H candidate is available — this branch is
+    defensive (it shouldn't fire for the rotatable bonds the caller
+    enumerates) but guards the result. Returns `None` when `atom_idx`
+    has no neighbour besides `exclude`.
+
+    Params:
+        mol: Chem.Mol : input molecule
+        atom_idx: int : atom whose neighbour to pick
+        exclude: int : atom index to exclude from candidates
+    Returns:
+        int | None : neighbour atom index, or None if none available
+    """
+    atom = mol.GetAtomWithIdx(atom_idx)
+    non_h = sorted(
+        nb.GetIdx()
+        for nb in atom.GetNeighbors()
+        if nb.GetIdx() != exclude and nb.GetAtomicNum() != 1
+    )
+    if non_h:
+        return non_h[0]
+    any_nb = sorted(nb.GetIdx() for nb in atom.GetNeighbors() if nb.GetIdx() != exclude)
+    return any_nb[0] if any_nb else None
+
+
+def _enumerate_side_chain_dihedrals(
+    mol: Chem.Mol,
+) -> list[tuple[int, int, int, int]]:
+    """
+    Enumerate side-chain rotatable dihedrals of a cyclic peptide as
+    four-atom tuples `(a, b, c, d)`, where `(b, c)` is the rotation-axis
+    bond. The dihedral-kick proposer samples one of these tuples per
+    walker per step (see `docs/dihedral_kick_plan.md`, Step 3).
+
+    A bond `(b, c)` is included iff:
+
+      - It matches RDKit's canonical rotatable-bond SMARTS
+        `[!$(*#*)&!D1]-&!@[!$(*#*)&!D1]` (single, non-ring, no
+        triple-bond endpoints, no terminal-degree endpoints).
+      - It is NOT a backbone bond — defined as both endpoints lying on
+        the macrocycle ring (`_backbone_atom_set`). DBT already owns
+        backbone dihedrals; strict separation keeps the move sets
+        disjoint.
+      - Neither endpoint has heavy-atom degree 1 (filters Cα-CH3 of Ala,
+        N-CH3 of N-methylated residues, side-chain methyls and -OH/-NH2
+        terminal heavies — all conformationally trivial under heavy-atom
+        rotation, since the moving group is symmetric or H-dominated).
+
+    Flanking atoms `a` (on b's side) and `d` (on c's side) are chosen by
+    lowest-index non-H neighbour, falling back to any neighbour. Order
+    over the rotatable-bond matches follows RDKit's deterministic
+    iteration order so the enumeration is reproducible across runs.
+
+    Params:
+        mol: Chem.Mol : a cyclic peptide with explicit Hs. The
+            macrocycle must be ring-perceived (implicit on mol
+            construction); side chains and Hs are otherwise handled
+            transparently.
+    Returns:
+        list[tuple[int, int, int, int]] : per-dihedral `(a, b, c, d)`
+            atom indices, ready for `Chem.rdMolTransforms.SetDihedralDeg`
+            or `GetDihedralDeg`. Empty list if no side-chain rotatable
+            bonds qualify (e.g., cyclic homo-alanine: every side chain
+            is a methyl, every rotatable-bond match is filtered).
+    """
+    backbone_atoms = _backbone_atom_set(mol)
+    matches = mol.GetSubstructMatches(_ROTATABLE_BOND_SMARTS)
+    result: list = []
+    for b, c in matches:
+        # Strict separation from DBT: backbone bonds belong to DBT's territory.
+        if b in backbone_atoms and c in backbone_atoms:
+            continue
+        # Filter methyl-type rotations (3-fold symmetric, no useful diversity)
+        # and -OH / -NH2 terminal-heavy rotations (H-dominated).
+        if _heavy_degree(mol, b) == 1 or _heavy_degree(mol, c) == 1:
+            continue
+        a = _pick_flanking_atom(mol, b, exclude=c)
+        d = _pick_flanking_atom(mol, c, exclude=b)
+        if a is None or d is None:
+            continue
+        result.append((a, b, c, d))
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Real-mol proposer factory — DBT concerted rotation
 # ---------------------------------------------------------------------------
 
