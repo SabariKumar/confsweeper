@@ -15,6 +15,8 @@ the contract `ParallelMCMMDriver` / `ReplicaExchangeMCMMDriver` consume:
 imports like `from mcmm import make_mcmm_proposer` continue to work.
 """
 
+import math
+
 import ase
 import numpy as np
 import torch
@@ -627,6 +629,262 @@ def make_cartesian_kick_proposer(
         # symmetric Gaussian kick. Walkers whose post-MMFF energy is
         # non-finite (MMFF blow-up — rare but possible at large
         # sigma_kick_a) get success=False so the driver rejects.
+        proposals: list = []
+        for slot, cid in enumerate(post_mmff_conf_ids):
+            new_coords = torch.tensor(
+                throwaway.GetConformer(cid).GetPositions(), dtype=torch.float64
+            )
+            e = float(energies[slot])
+            if not np.isfinite(e):
+                stats["n_relax_failures"] += 1
+                proposals.append((coords_list[slot], 0.0, 0.0, False))
+            else:
+                stats["n_relax_successes"] += 1
+                proposals.append((new_coords, e, 1.0, True))
+        return proposals
+
+    batch_propose_fn.stats = stats
+    return batch_propose_fn
+
+
+# ---------------------------------------------------------------------------
+# Side-chain dihedral-kick proposer — hybrid Gaussian + rotamer jump
+# ---------------------------------------------------------------------------
+
+
+def make_dihedral_kick_proposer(
+    mol: Chem.Mol,
+    hardware_opts,
+    calc,
+    sigma_chi_rad: float = 0.5,
+    p_rotamer_jump: float = 0.3,
+    rotamer_wells_deg: tuple = (-60.0, 60.0, 180.0),
+    score_chunk_size: int = 500,
+    mmff_backend: str = "gpu",
+    dihedral_weight_by_atom_count: bool = False,
+    seed: int = 0,
+):
+    """
+    Build a `batch_propose_fn` that perturbs one side-chain dihedral per
+    walker per step (hybrid Gaussian + discrete rotamer jump),
+    MMFF-relaxes, and MACE-scores. Complements DBT (backbone-only) and
+    the Cartesian kick (atom-position perturbation) by reaching
+    side-chain rotamer states neither of the other proposers can flip.
+
+    Motivated by the 2026-05-21 Boltzmann-coverage Finding in
+    `docs/mcmm_plan.md`: cremp_sharp's MCMM basin set sits geometrically
+    3+ Å from every CREMP ceiling basin and a single CREMP basin holds
+    72 % of the 298 K Boltzmann population. The failure points at
+    NMe-Trp χ₁ / χ₂ rotamers DBT (backbone-only) cannot reach and
+    σ ≈ 0.1 Å Cartesian kicks cannot push through (indole χ barriers
+    are ~10–15 kcal/mol — MMFF snaps small Δχ back to the starting
+    well). See `docs/dihedral_kick_plan.md` for the full design and
+    locked design choices (Step 1).
+
+    Per-call pipeline:
+
+      1. **Per-walker rotation** (CPU, sequential): pick one side-chain
+         dihedral uniformly at random from
+         `_enumerate_side_chain_dihedrals(mol)` (captured at factory
+         build time); sample Δχ via the hybrid rule (Gaussian
+         `N(0, σ_chi_rad)` by default; with probability
+         `p_rotamer_jump`, set χ to a discrete rotameric well from
+         `rotamer_wells_deg`). Apply via
+         `Chem.rdMolTransforms.SetDihedralDeg`, which rotates only the
+         atomic subtree downstream of the bond — backbone, ring, and
+         other side chains stay put.
+      2. **Batched MMFF** (GPU, one call): every rotated candidate
+         lives as a conformer on a shared throwaway mol; run
+         `nvmolkit.mmffOptimization.MMFFOptimizeMoleculesConfs` for
+         in-place minimisation.
+      3. **Batched MACE** (GPU, chunked) via `_mace_batch_energies`.
+      4. **Return** `(coords_tensor, energy_float, det_j=1.0,
+         success=True)` per walker. A single open-tree dihedral
+         rotation is volume-preserving in dihedral space, so detailed
+         balance needs no Jacobian correction (unlike DBT's closed-loop
+         concerted rotation with its Wu-Deem term). Walkers whose
+         post-MMFF energy is non-finite get `success=False` so the
+         driver rejects.
+
+    **Known risk — MMFF rotamer snap-back / artificial collapse.**
+    Stage 2's batched MMFF relax operates on the MMFF94 potential
+    energy surface, NOT MACE. For small Δχ on the Gaussian path this is
+    benign (MMFF faithfully relaxes within the starting rotameric
+    well). For rotamer jumps that land near a well boundary, MMFF can
+    sometimes pull the geometry back across the barrier into the
+    starting well — collapsing the intended diversity before MACE ever
+    sees the proposal. If Step-7 validation shows cremp_sharp coverage
+    stays poor despite the new proposer landing, the diagnostic is to
+    disable Stage 2 (skip MMFF, score MACE on the rotated geometry
+    directly) and re-check whether the union basin set diversifies.
+    Tracked under "Risks to instrument" and "Deferred follow-ups" in
+    `docs/dihedral_kick_plan.md`.
+
+    Lazy import of `_mace_batch_energies` from `confsweeper` avoids the
+    confsweeper → mcmm → proposers circular dependency at module load
+    time (same convention as `make_mcmm_proposer` and
+    `make_cartesian_kick_proposer`).
+
+    Params:
+        mol: Chem.Mol : reference cyclic peptide with explicit Hs.
+            Topology + side-chain dihedral enumeration are captured at
+            factory build time; do not mutate the mol structurally
+            afterwards.
+        hardware_opts : nvmolkit hardware options for batched MMFF
+            (only used when `mmff_backend='gpu'`).
+        calc : MACECalculator from `get_mace_calc()`.
+        sigma_chi_rad: float : Gaussian standard deviation in radians
+            for the refinement-mode step (default 0.5 ≈ 28.6°). Tuned
+            to leave the starting micro-well within a few steps but
+            stay inside a rotameric well so MMFF doesn't immediately
+            snap back. Locked by `docs/dihedral_kick_plan.md` Findings
+            2026-05-22.
+        p_rotamer_jump: float : probability (per walker per step) of a
+            discrete rotamer jump instead of a Gaussian refinement step
+            (default 0.3). Set to 0 for pure Gaussian (ablation); set
+            to 1 for pure rotameric jumps. The jump path provides
+            barrier-crossing — without it MMFF tends to undo small Δχ
+            and the proposer can't escape its starting rotamer.
+        rotamer_wells_deg: tuple[float, ...] : rotameric well centres
+            in degrees (default `(-60.0, 60.0, 180.0)` — standard sp3
+            χ₁ wells; applied uniformly to all rotatable side-chain
+            bonds in v0). Aromatic χ₂ has `{-90, +90}` wells in
+            principle; the uniform 3-well set is a v0 simplification.
+        score_chunk_size: int : MACE per-batch forward pass cap
+            (default 500).
+        mmff_backend: str : 'gpu' (nvmolkit batched CUDA, default) or
+            'cpu' (RDKit serial).
+        dihedral_weight_by_atom_count: bool : v0 stub — when False
+            (default, locked Step 1 choice), pick a side-chain dihedral
+            uniformly at random. The True branch (bias toward bulky
+            side chains by their heavy-atom count) is plumbed for a
+            future follow-up; raises `NotImplementedError` if set True
+            so we don't ship a silent stub.
+        seed: int : RNG seed for the per-step dihedral pick + Δχ sample.
+    Returns:
+        callable : `batch_propose_fn(coords_list) -> list[tuple]`
+            matching the `ParallelMCMMDriver` /
+            `ReplicaExchangeMCMMDriver` proposer contract.
+    Raises:
+        ValueError: on unknown `mmff_backend`, `p_rotamer_jump` not in
+            [0, 1], non-positive `sigma_chi_rad`, empty
+            `rotamer_wells_deg` when `p_rotamer_jump > 0`, or when
+            `mol` has no enumerable side-chain rotatable dihedrals
+            (e.g., cyclic homo-alanine — every side chain is a methyl,
+            every rotatable-bond match is filtered).
+        NotImplementedError: if `dihedral_weight_by_atom_count=True`
+            (v0 only ships uniform selection).
+    """
+    if mmff_backend not in ("gpu", "cpu"):
+        raise ValueError(
+            f"unknown mmff_backend {mmff_backend!r}; expected 'gpu' or 'cpu'"
+        )
+    if not 0.0 <= p_rotamer_jump <= 1.0:
+        raise ValueError(f"p_rotamer_jump must be in [0, 1], got {p_rotamer_jump}")
+    if sigma_chi_rad <= 0.0:
+        raise ValueError(f"sigma_chi_rad must be positive, got {sigma_chi_rad}")
+    if p_rotamer_jump > 0.0 and len(rotamer_wells_deg) == 0:
+        raise ValueError("rotamer_wells_deg must be non-empty when p_rotamer_jump > 0")
+    if dihedral_weight_by_atom_count:
+        raise NotImplementedError(
+            "dihedral_weight_by_atom_count=True is a v0 deferred branch; "
+            "see docs/dihedral_kick_plan.md Deferred follow-ups"
+        )
+
+    dihedrals = _enumerate_side_chain_dihedrals(mol)
+    if not dihedrals:
+        raise ValueError(
+            "mol has no enumerable side-chain rotatable dihedrals; "
+            "check that the input is a cyclic peptide with non-methyl side chains"
+        )
+    n_dihedrals = len(dihedrals)
+    n_atoms = mol.GetNumAtoms()
+    atomic_nums = [a.GetAtomicNum() for a in mol.GetAtoms()]
+
+    # Throwaway-mol template: structure-only, no conformers. Cloning per
+    # call is required because nvmolkit MMFF mutates conformers in place
+    # and we don't want to corrupt walker state across step() calls.
+    template_mol = Chem.Mol(mol)
+    template_mol.RemoveAllConformers()
+
+    rotamer_wells_arr = np.asarray(rotamer_wells_deg, dtype=np.float64)
+    n_wells = len(rotamer_wells_arr)
+    sigma_chi_deg = math.degrees(sigma_chi_rad)
+
+    rng = np.random.default_rng(seed)
+    stats = {
+        "n_proposed": 0,
+        "n_gaussian_steps": 0,
+        "n_rotamer_jumps": 0,
+        "n_relax_failures": 0,
+        "n_relax_successes": 0,
+    }
+
+    def batch_propose_fn(coords_list):
+        # Lazy import: confsweeper imports from mcmm at module load time;
+        # importing _mace_batch_energies here defers resolution until the
+        # closure is actually called, breaking the circular dependency.
+        from confsweeper import _mace_batch_energies
+
+        n_walkers = len(coords_list)
+        if n_walkers == 0:
+            return []
+        stats["n_proposed"] += n_walkers
+
+        # Stage 1: stage walker coords on a fresh throwaway mol, then apply
+        # the per-walker rotation in place. SetDihedralDeg rotates only the
+        # subtree downstream of the bond, so backbone + other side chains
+        # are preserved by construction.
+        throwaway = Chem.Mol(template_mol)
+        for coords in coords_list:
+            conf = Chem.Conformer(n_atoms)
+            coords_np = coords.detach().cpu().numpy().astype(np.float64)
+            for a_idx in range(n_atoms):
+                x, y, z = coords_np[a_idx]
+                conf.SetAtomPosition(a_idx, (float(x), float(y), float(z)))
+            throwaway.AddConformer(conf, assignId=True)
+        pre_mmff_conf_ids = [c.GetId() for c in throwaway.GetConformers()]
+        for cid in pre_mmff_conf_ids:
+            conf = throwaway.GetConformer(cid)
+            dihedral_idx = int(rng.integers(n_dihedrals))
+            a, b, c, d = dihedrals[dihedral_idx]
+            if rng.uniform() < p_rotamer_jump:
+                stats["n_rotamer_jumps"] += 1
+                new_chi_deg = float(rotamer_wells_arr[rng.integers(n_wells)])
+            else:
+                stats["n_gaussian_steps"] += 1
+                current = Chem.rdMolTransforms.GetDihedralDeg(conf, a, b, c, d)
+                delta_deg = float(rng.normal(0.0, sigma_chi_deg))
+                new_chi_deg = current + delta_deg
+            Chem.rdMolTransforms.SetDihedralDeg(conf, a, b, c, d, new_chi_deg)
+
+        # Stage 2: batched MMFF on the throwaway mol.
+        if mmff_backend == "gpu":
+            from nvmolkit.mmffOptimization import MMFFOptimizeMoleculesConfs
+
+            MMFFOptimizeMoleculesConfs([throwaway], hardwareOptions=hardware_opts)
+        else:
+            from rdkit.Chem import AllChem as _AllChem
+
+            for cid in pre_mmff_conf_ids:
+                _AllChem.MMFFOptimizeMolecule(throwaway, confId=cid)
+
+        # Stage 3: batched MACE scoring, chunked.
+        post_mmff_conf_ids = [c.GetId() for c in throwaway.GetConformers()]
+        energies: list = []
+        for start in range(0, len(post_mmff_conf_ids), score_chunk_size):
+            chunk_ids = post_mmff_conf_ids[start : start + score_chunk_size]
+            ase_mols = [
+                ase.Atoms(
+                    positions=throwaway.GetConformer(cid).GetPositions(),
+                    numbers=atomic_nums,
+                )
+                for cid in chunk_ids
+            ]
+            energies.extend(_mace_batch_energies(calc, ase_mols))
+
+        # Stage 4: assemble per-walker proposals. det_j=1.0 (open-tree
+        # rotation is volume-preserving). Non-finite energies → reject.
         proposals: list = []
         for slot, cid in enumerate(post_mmff_conf_ids):
             new_coords = torch.tensor(

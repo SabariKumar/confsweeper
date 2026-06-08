@@ -2261,8 +2261,258 @@ def test_cartesian_kick_proposer_perturbs_coords():
 
 
 # ---------------------------------------------------------------------------
-# make_composite_proposer
+# make_dihedral_kick_proposer
 # ---------------------------------------------------------------------------
+
+# Small head-to-tail cyclic 4-mer Ala-Ser-Ala-Ala — used as the test mol for
+# the dihedral-kick proposer. Has exactly one side-chain rotatable dihedral
+# (Ser χ₁ = Cα-Cβ; Cβ-Oγ is excluded because Oγ has heavy-atom degree 1).
+# Small enough to embed cleanly with default ETKDG via `_seed_full_mol_coords`.
+_CYCLIC_ALA_SER_SMILES = "C[C@@H]1NC(=O)[C@@H](CO)NC(=O)[C@@H](C)NC(=O)[C@@H](C)NC1=O"
+
+
+def _cyclic_ala_ser_mol() -> Chem.Mol:
+    return Chem.AddHs(Chem.MolFromSmiles(_CYCLIC_ALA_SER_SMILES))
+
+
+def _make_dihedral_kick_with_mocks(mol, **kwargs):
+    """Build a real `make_dihedral_kick_proposer` callable while patching the
+    GPU stages — same pattern as `_make_cart_kick_with_mocks`."""
+    from contextlib import contextmanager
+    from unittest.mock import patch as _patch
+
+    from proposers import make_dihedral_kick_proposer
+
+    proposer = make_dihedral_kick_proposer(
+        mol,
+        hardware_opts=None,
+        calc=None,
+        **kwargs,
+    )
+
+    counter = [0]
+
+    def _mock_mace(_calc, ase_mols):
+        out = [(counter[0] + i) * 0.01 for i in range(len(ase_mols))]
+        counter[0] += len(ase_mols)
+        return out
+
+    @contextmanager
+    def patched():
+        with (
+            _patch("confsweeper._mace_batch_energies", side_effect=_mock_mace),
+            _patch(
+                "nvmolkit.mmffOptimization.MMFFOptimizeMoleculesConfs",
+                return_value=[[]],
+            ),
+        ):
+            yield
+
+    return proposer, patched
+
+
+def test_dihedral_kick_proposer_invalid_mmff_backend_raises():
+    from proposers import make_dihedral_kick_proposer
+
+    mol = _cyclic_ala_ser_mol()
+    with pytest.raises(ValueError, match="unknown mmff_backend"):
+        make_dihedral_kick_proposer(
+            mol, hardware_opts=None, calc=None, mmff_backend="bogus"
+        )
+
+
+def test_dihedral_kick_proposer_invalid_p_rotamer_jump_raises():
+    """`p_rotamer_jump` must be a probability in [0, 1]."""
+    from proposers import make_dihedral_kick_proposer
+
+    mol = _cyclic_ala_ser_mol()
+    for bad in (1.5, -0.1):
+        with pytest.raises(ValueError, match="p_rotamer_jump"):
+            make_dihedral_kick_proposer(
+                mol, hardware_opts=None, calc=None, p_rotamer_jump=bad
+            )
+
+
+def test_dihedral_kick_proposer_non_positive_sigma_chi_rad_raises():
+    from proposers import make_dihedral_kick_proposer
+
+    mol = _cyclic_ala_ser_mol()
+    with pytest.raises(ValueError, match="sigma_chi_rad"):
+        make_dihedral_kick_proposer(
+            mol, hardware_opts=None, calc=None, sigma_chi_rad=0.0
+        )
+
+
+def test_dihedral_kick_proposer_empty_rotamer_wells_raises():
+    """When `p_rotamer_jump > 0`, `rotamer_wells_deg` must be non-empty."""
+    from proposers import make_dihedral_kick_proposer
+
+    mol = _cyclic_ala_ser_mol()
+    with pytest.raises(ValueError, match="rotamer_wells_deg"):
+        make_dihedral_kick_proposer(
+            mol,
+            hardware_opts=None,
+            calc=None,
+            p_rotamer_jump=0.5,
+            rotamer_wells_deg=(),
+        )
+
+
+def test_dihedral_kick_proposer_no_side_chains_raises():
+    """cyclo(Ala) has only methyl side chains → no enumerable side-chain
+    dihedrals → factory raises so callers learn at build time, not at
+    step time. Strict separation from DBT also means we can't fall back
+    to a backbone dihedral here."""
+    from proposers import make_dihedral_kick_proposer
+
+    mol = _cycloala_mol(4)
+    with pytest.raises(
+        ValueError, match="no enumerable side-chain rotatable dihedrals"
+    ):
+        make_dihedral_kick_proposer(mol, hardware_opts=None, calc=None)
+
+
+def test_dihedral_kick_proposer_atom_count_weight_not_implemented():
+    """v0 only ships uniform selection; the bulky-side-chain weighting
+    branch is plumbed but raises `NotImplementedError` if turned on so we
+    don't silently ship a stub."""
+    from proposers import make_dihedral_kick_proposer
+
+    mol = _cyclic_ala_ser_mol()
+    with pytest.raises(NotImplementedError, match="dihedral_weight_by_atom_count"):
+        make_dihedral_kick_proposer(
+            mol,
+            hardware_opts=None,
+            calc=None,
+            dihedral_weight_by_atom_count=True,
+        )
+
+
+def test_dihedral_kick_proposer_returns_proposal_per_walker():
+    mol = _cyclic_ala_ser_mol()
+    proposer, patched = _make_dihedral_kick_with_mocks(mol, seed=42)
+    seed_coords = _seed_full_mol_coords(mol)
+    for n in [1, 3, 8]:
+        coords_list = [seed_coords.clone() for _ in range(n)]
+        with patched():
+            proposals = proposer(coords_list)
+        assert len(proposals) == n
+        for p in proposals:
+            assert len(p) == 4
+            new_coords, _, _, _ = p
+            assert isinstance(new_coords, torch.Tensor)
+            assert new_coords.shape == seed_coords.shape
+
+
+def test_dihedral_kick_proposer_empty_input():
+    """Empty coords list returns empty proposal list — locks the
+    short-circuit so no MMFF/MACE work runs on zero walkers."""
+    mol = _cyclic_ala_ser_mol()
+    proposer, _ = _make_dihedral_kick_with_mocks(mol, seed=0)
+    assert proposer([]) == []
+
+
+def test_dihedral_kick_proposer_det_j_is_one_for_success():
+    """A single open-tree dihedral rotation is volume-preserving in
+    dihedral space → no Wu-Deem correction → every successful proposal
+    carries det_j = 1.0. Locks the contract that distinguishes side-chain
+    kicks from DBT's closed-loop concerted rotation."""
+    mol = _cyclic_ala_ser_mol()
+    proposer, patched = _make_dihedral_kick_with_mocks(mol, seed=0)
+    seed_coords = _seed_full_mol_coords(mol)
+    coords_list = [seed_coords.clone() for _ in range(8)]
+    with patched():
+        proposals = proposer(coords_list)
+    successful = [p for p in proposals if p[3]]
+    assert successful, "no successful proposals — mock pipeline is broken"
+    for _, _, det_j, _ in successful:
+        assert det_j == 1.0
+
+
+def test_dihedral_kick_proposer_stats_initialised_and_increment():
+    """Stats start at zero across all five counters and increment correctly:
+    every step is either a Gaussian or a rotamer jump (the two sum to
+    n_proposed); every step is either a relax success or failure (also
+    sums to n_proposed)."""
+    mol = _cyclic_ala_ser_mol()
+    proposer, patched = _make_dihedral_kick_with_mocks(mol, seed=7)
+    seed_coords = _seed_full_mol_coords(mol)
+    assert proposer.stats == {
+        "n_proposed": 0,
+        "n_gaussian_steps": 0,
+        "n_rotamer_jumps": 0,
+        "n_relax_failures": 0,
+        "n_relax_successes": 0,
+    }
+    with patched():
+        proposer([seed_coords.clone() for _ in range(5)])
+        proposer([seed_coords.clone() for _ in range(3)])
+    assert proposer.stats["n_proposed"] == 8
+    assert (
+        proposer.stats["n_gaussian_steps"] + proposer.stats["n_rotamer_jumps"]
+        == proposer.stats["n_proposed"]
+    )
+    assert (
+        proposer.stats["n_relax_successes"] + proposer.stats["n_relax_failures"]
+        == proposer.stats["n_proposed"]
+    )
+
+
+def test_dihedral_kick_proposer_pure_gaussian_when_p_zero():
+    """`p_rotamer_jump=0` → every step is a Gaussian, zero rotamer jumps."""
+    mol = _cyclic_ala_ser_mol()
+    proposer, patched = _make_dihedral_kick_with_mocks(mol, seed=1, p_rotamer_jump=0.0)
+    seed_coords = _seed_full_mol_coords(mol)
+    with patched():
+        proposer([seed_coords.clone() for _ in range(10)])
+    assert proposer.stats["n_rotamer_jumps"] == 0
+    assert proposer.stats["n_gaussian_steps"] == 10
+
+
+def test_dihedral_kick_proposer_pure_rotamer_when_p_one():
+    """`p_rotamer_jump=1` → every step is a rotamer jump, zero Gaussian."""
+    mol = _cyclic_ala_ser_mol()
+    proposer, patched = _make_dihedral_kick_with_mocks(mol, seed=2, p_rotamer_jump=1.0)
+    seed_coords = _seed_full_mol_coords(mol)
+    with patched():
+        proposer([seed_coords.clone() for _ in range(10)])
+    assert proposer.stats["n_rotamer_jumps"] == 10
+    assert proposer.stats["n_gaussian_steps"] == 0
+
+
+def test_dihedral_kick_proposer_does_not_mutate_input_coords():
+    """Walker input coords must be unchanged after a call — the proposer
+    writes to throwaway-mol conformers, never to walker tensors."""
+    mol = _cyclic_ala_ser_mol()
+    proposer, patched = _make_dihedral_kick_with_mocks(mol, seed=3)
+    seed_coords = _seed_full_mol_coords(mol)
+    coords_list = [seed_coords.clone() for _ in range(4)]
+    coords_snapshot = [c.clone() for c in coords_list]
+    with patched():
+        proposer(coords_list)
+    for original, after in zip(coords_snapshot, coords_list):
+        assert torch.equal(original, after), "proposer mutated input coords"
+
+
+def test_dihedral_kick_proposer_preserves_backbone_atoms():
+    """Strict separation from DBT: rotating a side-chain dihedral must not
+    move any backbone atom. With MMFF mocked as a no-op (the throwaway
+    mol's conformers are not touched by the mock), the post-rotation
+    backbone coords must equal the input backbone coords bit-for-bit."""
+    mol = _cyclic_ala_ser_mol()
+    proposer, patched = _make_dihedral_kick_with_mocks(mol, seed=0, p_rotamer_jump=1.0)
+    seed_coords = _seed_full_mol_coords(mol)
+    backbone_atoms = sorted(_backbone_atom_set(mol))
+    coords_list = [seed_coords.clone() for _ in range(4)]
+    with patched():
+        proposals = proposer(coords_list)
+    for new_coords, _, _, success in proposals:
+        if not success:
+            continue
+        for a_idx in backbone_atoms:
+            assert torch.allclose(
+                new_coords[a_idx], seed_coords[a_idx], atol=1e-10
+            ), f"backbone atom {a_idx} moved during a side-chain dihedral kick"
 
 
 def _stub_proposer(tag: str, n_atoms: int = _TEST_N_ATOMS):
