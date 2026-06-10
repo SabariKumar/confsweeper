@@ -1115,6 +1115,11 @@ def get_mol_PE_mcmm(
     closure_tol: float = 0.01,
     sigma_kick_a: float = 0.1,
     cartesian_weight: float = 0.0,
+    dihedral_weight: float = 0.0,
+    sigma_chi_rad: float = 0.5,
+    p_rotamer_jump: float = 0.3,
+    rotamer_wells_deg: tuple = (-60.0, 60.0, 180.0),
+    dihedral_weight_by_atom_count: bool = False,
     score_chunk_size: int = 500,
     e_window_kT: float = 5.0,
     rmsd_threshold: float = 0.125,
@@ -1161,9 +1166,12 @@ def get_mol_PE_mcmm(
     the per-step proposer: DBT concerted-rotation geometry on a
     backbone window, side-chain coupling via rigid-body transport,
     batched MMFF relaxation, and batched MACE scoring across all
-    walkers' proposals. When `cartesian_weight > 0`,
-    `make_composite_proposer` routes each walker per step between DBT
-    and a GOAT-style Cartesian kick. See docs/mcmm_plan.md.
+    walkers' proposals. When `cartesian_weight > 0` and/or
+    `dihedral_weight > 0`, `make_default_mcmm_composite` routes each
+    walker per step across (DBT, GOAT-style Cartesian kick, side-chain
+    dihedral kick); zero-weight sub-proposers are skipped so their MMFF
+    + MACE setup is never paid. See docs/mcmm_plan.md and
+    docs/dihedral_kick_plan.md.
 
     Params:
         smi: str : input SMILES string (must be a head-to-tail cyclic
@@ -1192,6 +1200,31 @@ def get_mol_PE_mcmm(
             per step — DBT for backbone-topology moves, Cartesian
             kicks for side-chain rotamer / non-dihedral motions.
             Step 12 in docs/mcmm_plan.md.
+        dihedral_weight: float : routing weight for the side-chain
+            dihedral-kick proposer relative to DBT. Default 0.0
+            means the dihedral kick is not in the route at all (its
+            factory is not called and pays no MMFF + MACE setup cost).
+            DBT residual weight is `1 - cartesian_weight - dihedral_weight`
+            (the helper rejects sums > 1). See issue #12 and
+            docs/dihedral_kick_plan.md — added to recover the
+            cremp_sharp Boltzmann population where DBT (backbone-only) +
+            Cartesian kicks (sub-rotameric scale) could not cross
+            indole-ring χ barriers.
+        sigma_chi_rad: float : Gaussian σ for the dihedral-kick
+            refinement step in radians (default 0.5 ≈ 28°). Only
+            consulted when `dihedral_weight > 0`.
+        p_rotamer_jump: float : probability per walker per step of the
+            dihedral-kick taking a discrete rotamer jump (sampled
+            uniformly from `rotamer_wells_deg`) instead of a Gaussian
+            Δχ. Default 0.3. Only consulted when `dihedral_weight > 0`.
+        rotamer_wells_deg: tuple[float, ...] : rotameric well centres
+            in degrees, sampled uniformly when the dihedral kick takes a
+            rotamer jump. Default `(-60.0, 60.0, 180.0)` (standard sp3
+            χ₁ wells). Only consulted when `dihedral_weight > 0`.
+        dihedral_weight_by_atom_count: bool : v0 stub — when False
+            (default) the dihedral kick uniformly samples side-chain
+            rotatable bonds; True is a deferred follow-up
+            (NotImplementedError) for atom-count-weighted selection.
         score_chunk_size: int : MACE per-batch forward pass cap
         e_window_kT: float : energy filter window in kT_298K units
         rmsd_threshold: float : geometric dedup exclusion radius
@@ -1321,12 +1354,16 @@ def get_mol_PE_mcmm(
         walkers_by_temp.append(group)
 
     # 4. Build the batch proposer. Pure DBT by default; if
-    # cartesian_weight > 0, compose with a GOAT-style Cartesian-kick
-    # proposer that adds isotropic Gaussian noise + MMFF relax (Step 12,
-    # docs/mcmm_plan.md). Routing happens per walker per step; each
-    # sub-proposer keeps its own batched MMFF/MACE call.
+    # cartesian_weight > 0 and/or dihedral_weight > 0, compose with the
+    # GOAT-style Cartesian kick (Step 12, docs/mcmm_plan.md) and/or the
+    # side-chain dihedral kick (issue #12, docs/dihedral_kick_plan.md).
+    # Routing happens per walker per step; each sub-proposer keeps its
+    # own batched MMFF/MACE call. The (cartesian_weight + dihedral_weight
+    # <= 1) constraint is enforced inside make_default_mcmm_composite.
     if cartesian_weight < 0:
         raise ValueError(f"cartesian_weight must be >= 0, got {cartesian_weight}")
+    if dihedral_weight < 0:
+        raise ValueError(f"dihedral_weight must be >= 0, got {dihedral_weight}")
     dbt_proposer = make_mcmm_proposer(
         mol,
         hardware_opts=hardware_opts,
@@ -1337,7 +1374,11 @@ def get_mol_PE_mcmm(
         mmff_backend=mmff_backend,
         seed=seed + 7_777_777,
     )
-    from proposers import make_cartesian_kick_proposer, make_default_mcmm_composite
+    from proposers import (
+        make_cartesian_kick_proposer,
+        make_default_mcmm_composite,
+        make_dihedral_kick_proposer,
+    )
 
     cart_proposer = None
     if cartesian_weight > 0.0:
@@ -1350,12 +1391,26 @@ def get_mol_PE_mcmm(
             mmff_backend=mmff_backend,
             seed=seed + 8_888_888,
         )
+    dihedral_proposer = None
+    if dihedral_weight > 0.0:
+        dihedral_proposer = make_dihedral_kick_proposer(
+            mol,
+            hardware_opts=hardware_opts,
+            calc=calc,
+            sigma_chi_rad=sigma_chi_rad,
+            p_rotamer_jump=p_rotamer_jump,
+            rotamer_wells_deg=rotamer_wells_deg,
+            score_chunk_size=score_chunk_size,
+            mmff_backend=mmff_backend,
+            dihedral_weight_by_atom_count=dihedral_weight_by_atom_count,
+            seed=seed + 5_555_555,
+        )
     batch_propose_fn = make_default_mcmm_composite(
         dbt_proposer,
         cart_proposer=cart_proposer,
-        dihedral_proposer=None,
+        dihedral_proposer=dihedral_proposer,
         cartesian_weight=cartesian_weight,
-        dihedral_weight=0.0,
+        dihedral_weight=dihedral_weight,
         seed=seed + 6_666_666,
     )
 

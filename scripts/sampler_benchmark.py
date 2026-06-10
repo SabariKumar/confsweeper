@@ -280,6 +280,7 @@ def _run_mcmm(
     dump_sdf_dir=None,
     dedup_mode: str = "kabsch",
     cartesian_weight: float = 0.0,
+    dihedral_weight: float = 0.0,
     e_window_kT: float = 5.0,
     saunders_exponent: float = 0.5,
 ) -> list[float]:
@@ -354,6 +355,7 @@ def _run_mcmm(
         n_init_confs=8,
         dedup_mode=dedup_mode,
         cartesian_weight=cartesian_weight,
+        dihedral_weight=dihedral_weight,
         e_window_kT=e_window_kT,
         saunders_exponent=saunders_exponent,
     )
@@ -518,6 +520,7 @@ def run_one(
     dump_sdf_dir=None,
     dedup_mode: str = "kabsch",
     cartesian_weight: float = 0.0,
+    dihedral_weight: float = 0.0,
     e_window_kT: float = 5.0,
     saunders_exponent: float = 0.5,
 ) -> dict:
@@ -540,6 +543,11 @@ def run_one(
             Cartesian-kick proposer in MCMM. 0 = pure DBT (legacy);
             0.5 = 50/50 mix per walker per step. Ignored by non-MCMM
             samplers. Step 12 of docs/mcmm_plan.md.
+        dihedral_weight: float : routing weight for the side-chain
+            dihedral-kick proposer in MCMM. 0 = not in the route at
+            all. Combined constraint: `cartesian_weight +
+            dihedral_weight <= 1` (DBT is the residual). Ignored by
+            non-MCMM samplers. Issue #12 / docs/dihedral_kick_plan.md.
     Returns:
         dict with all OUTPUT_COLUMNS populated for this run
     """
@@ -548,6 +556,7 @@ def run_one(
     runner_kwargs = {"dump_sdf_dir": dump_sdf_dir, "dedup_mode": dedup_mode}
     if sampler == "mcmm":
         runner_kwargs["cartesian_weight"] = cartesian_weight
+        runner_kwargs["dihedral_weight"] = dihedral_weight
         runner_kwargs["e_window_kT"] = e_window_kT
         runner_kwargs["saunders_exponent"] = saunders_exponent
     energies_eV = runner(
@@ -660,6 +669,18 @@ def run_one(
     "samplers. Step 12 of docs/mcmm_plan.md.",
 )
 @click.option(
+    "--dihedral_weight",
+    type=float,
+    default=0.0,
+    show_default=True,
+    help="MCMM proposer mix: routing weight for the side-chain "
+    "dihedral-kick proposer alongside DBT and (optionally) the "
+    "Cartesian kick. 0 = not in the route at all (legacy). DBT "
+    "residual weight = 1 - cartesian_weight - dihedral_weight; "
+    "the sum must be <= 1. Ignored by non-MCMM samplers. Issue "
+    "#12 / docs/dihedral_kick_plan.md.",
+)
+@click.option(
     "--e_window_kT",
     "e_window_kT",
     type=float,
@@ -693,6 +714,7 @@ def main(
     dump_sdf_dir: Path | None,
     dedup_mode: str,
     cartesian_weight: float,
+    dihedral_weight: float,
     e_window_kT: float,
     saunders_exponent: float,
 ) -> None:
@@ -751,11 +773,12 @@ def main(
         )
     logger.info(
         "samplers=%s  n_seeds=%d  dedup_modes=%s  cartesian_weight=%.2f  "
-        "e_window_kT=%.2f  saunders_exponent=%.2f",
+        "dihedral_weight=%.2f  e_window_kT=%.2f  saunders_exponent=%.2f",
         sampler_list,
         n_seeds,
         mode_list,
         cartesian_weight,
+        dihedral_weight,
         e_window_kT,
         saunders_exponent,
     )
@@ -810,6 +833,7 @@ def main(
                         dump_sdf_dir=dump_sdf_dir,
                         dedup_mode=mode,
                         cartesian_weight=cartesian_weight,
+                        dihedral_weight=dihedral_weight,
                         e_window_kT=e_window_kT,
                         saunders_exponent=saunders_exponent,
                     )
