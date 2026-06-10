@@ -14,7 +14,7 @@ This document is the working design for a third MCMM proposer — a **side-chain
 | 2 | Refactor: extract proposer factories from `src/mcmm.py` to a new `src/proposers.py` | ✓ complete |
 | 3 | Side-chain rotatable-bond enumeration (`_enumerate_side_chain_dihedrals`) | ✓ complete |
 | 4 | `make_dihedral_kick_proposer` factory + tests | ✓ complete |
-| 5 | Extend `make_composite_proposer` to n-way routing across (DBT, Cartesian, dihedral) | pending |
+| 5 | Extend `make_composite_proposer` to n-way routing across (DBT, Cartesian, dihedral) | ✓ complete |
 | 6 | Wire `get_mol_PE_mcmm` kwargs + `scripts/sampler_benchmark._run_mcmm` defaults | pending |
 | 7 | Validation: re-run sampler benchmark on cremp_sharp + cremp_typical; recompute Boltzmann coverage | pending |
 | 8 | Documentation (`src/README.md`, `scripts/README.md`, dated Findings entry in mcmm_plan.md) | pending |
@@ -175,9 +175,9 @@ Mechanical move that lands BEFORE the new dihedral-kick code so it goes in the r
 
 ## Phase 2 — Composition + integration
 
-### Step 5: n-way `make_composite_proposer` — pending
+### Step 5: n-way `make_composite_proposer` — ✓ complete
 
-- Extend `make_composite_proposer` ([src/mcmm.py:1914](../src/mcmm.py#L1914)) per the locked composition-weights API. Backward compatibility: existing callers passing only `cartesian_weight` keep working; the new `dihedral_weight` defaults to 0.0.
+- Extend `make_composite_proposer` ([src/proposers.py:911](../src/proposers.py#L911)) per the locked composition-weights API. Backward compatibility: existing callers passing only `cartesian_weight` keep working; the new `dihedral_weight` defaults to 0.0.
 - Each sub-proposer is invoked on its assigned subset of walkers; results reassembled in walker order (same pattern as the current 2-way routing).
 - Routing weights must sum to ≤ 1 with the residual going to DBT; raise on invalid combinations.
 
@@ -187,6 +187,8 @@ Mechanical move that lands BEFORE the new dihedral-kick code so it goes in the r
 - Zero-weight paths skip the corresponding factory entirely (no overhead).
 - Walker-order preservation across all routing combinations.
 - Sub-stats from each proposer reachable via the composite's `.stats`.
+
+**Outcome (2026-06-08).** `make_composite_proposer` itself is already n-way (it takes a `list[proposers]` + `list[weights]`); the real work was the layer above it — the routing assembly logic that owns "weights sum to ≤ 1, residual to DBT, skip zero-weight paths" and that lives at the `get_mol_PE_mcmm` call site. Step 5 ships that layer as a new helper `make_default_mcmm_composite(dbt_proposer, cart_proposer=None, dihedral_proposer=None, *, cartesian_weight=0.0, dihedral_weight=0.0, seed=0)` at [src/proposers.py:990](../src/proposers.py#L990). The helper validates non-negativity + the `cartesian_weight + dihedral_weight ≤ 1` sum, enforces a `weight > 0 ↔ proposer not None` contract (so a caller can't silently build an `~$MMFF + MACE-warmed` sub-proposer that never routes), short-circuits to the single active sub-proposer when only one weight is positive (preserving the dict-shaped `.stats` the issue-#10 aggregation block at [src/confsweeper.py:1383-1393](../src/confsweeper.py#L1383-L1393) reads), and otherwise wraps the active set in `make_composite_proposer`. The existing 2-way `get_mol_PE_mcmm` call site (now [src/confsweeper.py:1340-1358](../src/confsweeper.py#L1340-L1358)) was swapped to use it — `cartesian_weight=0.0` callers still take the zero-overhead identity path (the helper returns `dbt_proposer` directly), `cartesian_weight>0` callers still get a 2-element composite with the same weights as before. No new `get_mol_PE_mcmm` kwargs in this step — `dihedral_proposer=None` is hard-coded for now; Step 6 wires it. 16 new tests cover all 7 validation paths (negative weights ×2, sum > 1, weight↔proposer-presence ×4) + 9 behaviour invariants (pure-DBT identity short-circuit, pure-cart identity, pure-dihedral identity, 2-way DBT+cart back-compat 50/50 distribution, 2-way DBT+dihedral new combination 50/50, 3-way 40/30/30 distribution at N=3000 with ±10% slack, 3-way walker-order preservation, 3-way `.stats` reachability, dict-stats shape preserved through short-circuit). Targeted run: 16/16 in 1.4 s; combined with the 7 existing `composite_proposer` tests: 23/23 in 1.2 s. First full-suite run came back at **1 failed, 414 passed, 8 skipped** — the regression was in `tests/test_get_mol_PE_mcmm.py::test_mcmm_cartesian_weight_positive_builds_composite`, which patches `mcmm.make_cartesian_kick_proposer` to spy on the factory call. The call-site swap routed the import through `from proposers import make_cartesian_kick_proposer`, so the `mcmm.*` patch target no longer intercepted the symbol the running code resolved — the spy never incremented. Fixed by retargeting both spy patches in that file to `proposers.make_cartesian_kick_proposer` (the zero-weight test happened to keep passing because the spy was never expected to be called, but I updated it too for consistency with the new import path). Re-run after the patch fix: **415 passed, 8 skipped** (+16 over Step 4's 399/8).
 
 ### Step 6: `get_mol_PE_mcmm` + sampler-benchmark adapter — pending
 

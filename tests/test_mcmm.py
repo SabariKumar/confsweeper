@@ -30,7 +30,7 @@ from mcmm import (
     make_composite_proposer,
     make_mcmm_proposer,
 )
-from proposers import _enumerate_side_chain_dihedrals
+from proposers import _enumerate_side_chain_dihedrals, make_default_mcmm_composite
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -2615,3 +2615,219 @@ def test_composite_proposer_exposes_substats():
     b = _stub_proposer("b")
     composite = make_composite_proposer([a, b])
     assert composite.stats == [a.stats, b.stats]
+
+
+# ---------------------------------------------------------------------------
+# make_default_mcmm_composite — n-way routing helper (DBT + cart + dihedral)
+# ---------------------------------------------------------------------------
+
+
+def test_default_mcmm_composite_validation_negative_cartesian_weight():
+    dbt = _stub_proposer("a")
+    with pytest.raises(ValueError, match="weights must be non-negative"):
+        make_default_mcmm_composite(dbt, cartesian_weight=-0.1)
+
+
+def test_default_mcmm_composite_validation_negative_dihedral_weight():
+    dbt = _stub_proposer("a")
+    with pytest.raises(ValueError, match="weights must be non-negative"):
+        make_default_mcmm_composite(dbt, dihedral_weight=-0.5)
+
+
+def test_default_mcmm_composite_validation_weights_exceed_one():
+    """cartesian_weight + dihedral_weight > 1 would leave a negative DBT
+    residual; the helper must reject before constructing anything."""
+    dbt = _stub_proposer("a")
+    cart = _stub_proposer("b")
+    dih = _stub_proposer("c")
+    with pytest.raises(ValueError, match="DBT residual weight would be negative"):
+        make_default_mcmm_composite(
+            dbt,
+            cart_proposer=cart,
+            dihedral_proposer=dih,
+            cartesian_weight=0.6,
+            dihedral_weight=0.5,
+        )
+
+
+def test_default_mcmm_composite_validation_cartesian_weight_without_proposer():
+    """cartesian_weight > 0 with cart_proposer=None is a contract violation:
+    the caller must build the sub-proposer if it has weight."""
+    dbt = _stub_proposer("a")
+    with pytest.raises(ValueError, match="weight > 0 iff proposer not None"):
+        make_default_mcmm_composite(dbt, cartesian_weight=0.3)
+
+
+def test_default_mcmm_composite_validation_cart_proposer_without_weight():
+    """cart_proposer not None but cartesian_weight=0 means the caller paid
+    the MMFF/MACE setup cost for a proposer that will never route — reject
+    so the wasted construction is loud, not silent."""
+    dbt = _stub_proposer("a")
+    cart = _stub_proposer("b")
+    with pytest.raises(ValueError, match="weight > 0 iff proposer not None"):
+        make_default_mcmm_composite(dbt, cart_proposer=cart, cartesian_weight=0.0)
+
+
+def test_default_mcmm_composite_validation_dihedral_weight_without_proposer():
+    dbt = _stub_proposer("a")
+    with pytest.raises(ValueError, match="weight > 0 iff proposer not None"):
+        make_default_mcmm_composite(dbt, dihedral_weight=0.3)
+
+
+def test_default_mcmm_composite_validation_dihedral_proposer_without_weight():
+    dbt = _stub_proposer("a")
+    dih = _stub_proposer("c")
+    with pytest.raises(ValueError, match="weight > 0 iff proposer not None"):
+        make_default_mcmm_composite(dbt, dihedral_proposer=dih, dihedral_weight=0.0)
+
+
+def test_default_mcmm_composite_pure_dbt_short_circuits_to_dbt_proposer():
+    """When both kick weights are 0, the helper must return the DBT
+    proposer object directly — zero composite-routing overhead. Identity
+    check ensures we did not silently wrap it in a 1-element composite."""
+    dbt = _stub_proposer("a")
+    out = make_default_mcmm_composite(dbt)
+    assert out is dbt
+
+
+def test_default_mcmm_composite_pure_cartesian_short_circuits():
+    """cartesian_weight=1.0 (DBT residual = 0) returns the cart proposer
+    directly — DBT factory should never be invoked."""
+    dbt = _stub_proposer("a")
+    cart = _stub_proposer("b")
+    out = make_default_mcmm_composite(dbt, cart_proposer=cart, cartesian_weight=1.0)
+    assert out is cart
+    coords = [torch.zeros(_TEST_N_ATOMS, 3, dtype=torch.float64) for _ in range(5)]
+    out(coords)
+    # DBT must have received exactly zero walkers — its factory is not
+    # in the route at all.
+    assert dbt.stats["n_walkers"] == 0
+    assert cart.stats["n_walkers"] == 5
+
+
+def test_default_mcmm_composite_pure_dihedral_short_circuits():
+    """dihedral_weight=1.0 (DBT residual = 0) returns the dihedral
+    proposer directly."""
+    dbt = _stub_proposer("a")
+    dih = _stub_proposer("c")
+    out = make_default_mcmm_composite(dbt, dihedral_proposer=dih, dihedral_weight=1.0)
+    assert out is dih
+
+
+def test_default_mcmm_composite_two_way_dbt_plus_cart_backcompat():
+    """Existing 2-way (DBT + cart) callers — the issue-#10 path — must
+    keep producing a composite with weights [1 - cw, cw]."""
+    dbt = _stub_proposer("a")
+    cart = _stub_proposer("b")
+    composite = make_default_mcmm_composite(
+        dbt, cart_proposer=cart, cartesian_weight=0.5, seed=42
+    )
+    # Should be a composite (not the identity short-circuit), so it has
+    # a list-shaped .stats with 2 entries.
+    assert isinstance(composite.stats, list)
+    assert len(composite.stats) == 2
+    coords = [torch.zeros(_TEST_N_ATOMS, 3, dtype=torch.float64) for _ in range(1000)]
+    composite(coords)
+    n_a = dbt.stats["n_walkers"]
+    n_b = cart.stats["n_walkers"]
+    assert n_a + n_b == 1000
+    assert 400 < n_a < 600  # 50/50 ± 10% slack at N=1000
+
+
+def test_default_mcmm_composite_two_way_dbt_plus_dihedral():
+    """The new 2-way combination — DBT + dihedral without Cartesian —
+    must route 50/50 at equal weight without dragging a cart_proposer in."""
+    dbt = _stub_proposer("a")
+    dih = _stub_proposer("c")
+    composite = make_default_mcmm_composite(
+        dbt, dihedral_proposer=dih, dihedral_weight=0.5, seed=42
+    )
+    assert isinstance(composite.stats, list)
+    assert len(composite.stats) == 2
+    coords = [torch.zeros(_TEST_N_ATOMS, 3, dtype=torch.float64) for _ in range(1000)]
+    composite(coords)
+    n_a = dbt.stats["n_walkers"]
+    n_c = dih.stats["n_walkers"]
+    assert n_a + n_c == 1000
+    assert 400 < n_a < 600
+
+
+def test_default_mcmm_composite_three_way_distribution():
+    """DBT residual = 0.4, cart = 0.3, dihedral = 0.3 across 3000 walkers
+    → each route gets ~its share, with ±10% slack."""
+    dbt = _stub_proposer("a")
+    cart = _stub_proposer("b")
+    dih = _stub_proposer("c")
+    composite = make_default_mcmm_composite(
+        dbt,
+        cart_proposer=cart,
+        dihedral_proposer=dih,
+        cartesian_weight=0.3,
+        dihedral_weight=0.3,
+        seed=123,
+    )
+    assert isinstance(composite.stats, list)
+    assert len(composite.stats) == 3
+    n_walkers = 3000
+    coords = [
+        torch.zeros(_TEST_N_ATOMS, 3, dtype=torch.float64) for _ in range(n_walkers)
+    ]
+    composite(coords)
+    n_a = dbt.stats["n_walkers"]
+    n_b = cart.stats["n_walkers"]
+    n_c = dih.stats["n_walkers"]
+    assert n_a + n_b + n_c == n_walkers
+    # DBT 40%, Cart 30%, Dihedral 30%; ±10% slack of n_walkers each.
+    assert 0.30 * n_walkers < n_a < 0.50 * n_walkers
+    assert 0.20 * n_walkers < n_b < 0.40 * n_walkers
+    assert 0.20 * n_walkers < n_c < 0.40 * n_walkers
+
+
+def test_default_mcmm_composite_three_way_walker_order_preserved():
+    """For each walker i, output[i] must come from whichever sub-proposer
+    handled walker i — verified by reading the per-stub sentinel value."""
+    dbt = _stub_proposer("a")  # sentinel 1.0
+    cart = _stub_proposer("b")  # sentinel 2.0
+    dih = _stub_proposer("c")  # sentinel 3.0
+    composite = make_default_mcmm_composite(
+        dbt,
+        cart_proposer=cart,
+        dihedral_proposer=dih,
+        cartesian_weight=0.4,
+        dihedral_weight=0.4,
+        seed=7,
+    )
+    coords = [torch.zeros(_TEST_N_ATOMS, 3, dtype=torch.float64) for _ in range(30)]
+    out = composite(coords)
+    assert len(out) == 30
+    for c, _, _, _ in out:
+        sentinel = float(c[0, 0])
+        assert sentinel in (1.0, 2.0, 3.0)
+
+
+def test_default_mcmm_composite_three_way_substats_reachable():
+    """The composite's .stats must expose all three sub-proposer stats
+    dicts in route order (DBT, cart, dihedral)."""
+    dbt = _stub_proposer("a")
+    cart = _stub_proposer("b")
+    dih = _stub_proposer("c")
+    composite = make_default_mcmm_composite(
+        dbt,
+        cart_proposer=cart,
+        dihedral_proposer=dih,
+        cartesian_weight=0.25,
+        dihedral_weight=0.25,
+    )
+    assert composite.stats == [dbt.stats, cart.stats, dih.stats]
+
+
+def test_default_mcmm_composite_short_circuit_preserves_dict_stats_shape():
+    """The dict/list aggregation block at confsweeper.py:1383-1393 keys
+    off the .stats shape (dict vs list). When the helper short-circuits
+    to a single sub-proposer, that sub-proposer's dict-shaped .stats must
+    survive — wrapping it in a 1-element list would silently change the
+    aggregation path."""
+    dbt = _stub_proposer("a")
+    out = make_default_mcmm_composite(dbt)
+    assert isinstance(out.stats, dict)
+    assert "n_walkers" in out.stats

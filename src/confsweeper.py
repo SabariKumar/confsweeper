@@ -1337,11 +1337,10 @@ def get_mol_PE_mcmm(
         mmff_backend=mmff_backend,
         seed=seed + 7_777_777,
     )
-    if cartesian_weight == 0.0:
-        batch_propose_fn = dbt_proposer
-    else:
-        from mcmm import make_cartesian_kick_proposer, make_composite_proposer
+    from proposers import make_cartesian_kick_proposer, make_default_mcmm_composite
 
+    cart_proposer = None
+    if cartesian_weight > 0.0:
         cart_proposer = make_cartesian_kick_proposer(
             mol,
             hardware_opts=hardware_opts,
@@ -1351,11 +1350,14 @@ def get_mol_PE_mcmm(
             mmff_backend=mmff_backend,
             seed=seed + 8_888_888,
         )
-        batch_propose_fn = make_composite_proposer(
-            [dbt_proposer, cart_proposer],
-            weights=[1.0 - cartesian_weight, cartesian_weight],
-            seed=seed + 6_666_666,
-        )
+    batch_propose_fn = make_default_mcmm_composite(
+        dbt_proposer,
+        cart_proposer=cart_proposer,
+        dihedral_proposer=None,
+        cartesian_weight=cartesian_weight,
+        dihedral_weight=0.0,
+        seed=seed + 6_666_666,
+    )
 
     # 5. Build the replica-exchange driver and run.
     swap_rng = np.random.default_rng(seed + 9_999_999)

@@ -525,7 +525,7 @@ def test_mcmm_cartesian_weight_zero_skips_kick_proposer():
             return_value=[[]],
         ),
         patch("confsweeper.make_mcmm_proposer", side_effect=_stub_proposer_factory),
-        patch("mcmm.make_cartesian_kick_proposer", side_effect=_spy_cart_factory),
+        patch("proposers.make_cartesian_kick_proposer", side_effect=_spy_cart_factory),
     ):
         get_mol_PE_mcmm(
             TEST_SMILES,
@@ -567,7 +567,7 @@ def test_mcmm_cartesian_weight_positive_builds_composite():
             return_value=[[]],
         ),
         patch("confsweeper.make_mcmm_proposer", side_effect=_spy_dbt_factory),
-        patch("mcmm.make_cartesian_kick_proposer", side_effect=_spy_cart_factory),
+        patch("proposers.make_cartesian_kick_proposer", side_effect=_spy_cart_factory),
     ):
         get_mol_PE_mcmm(
             TEST_SMILES,

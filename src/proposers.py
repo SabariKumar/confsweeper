@@ -984,3 +984,102 @@ def make_composite_proposer(
 
     batch_propose_fn.stats = [p.stats for p in proposers if hasattr(p, "stats")]
     return batch_propose_fn
+
+
+# ---------------------------------------------------------------------------
+# Default 3-way MCMM composite — DBT + optional Cartesian + optional dihedral
+# ---------------------------------------------------------------------------
+
+
+def make_default_mcmm_composite(
+    dbt_proposer,
+    cart_proposer=None,
+    dihedral_proposer=None,
+    *,
+    cartesian_weight: float = 0.0,
+    dihedral_weight: float = 0.0,
+    seed: int = 0,
+):
+    """
+    Assemble the canonical (DBT, Cartesian-kick, dihedral-kick) composite
+    used by `get_mol_PE_mcmm`. DBT residual weight is
+    `1 - cartesian_weight - dihedral_weight`; the helper validates the
+    sum and the (weight > 0 ↔ proposer not None) contract, then
+    short-circuits to the lone active proposer when only one weight is
+    positive (zero composite-routing overhead — matches the existing
+    "if cartesian_weight == 0: batch_propose_fn = dbt_proposer" path
+    the issue-#10 routing relied on).
+
+    The caller is responsible for NOT building a sub-proposer whose
+    weight is zero; the helper enforces this so a `cart_proposer` is
+    never silently constructed and then ignored, which would waste the
+    MMFF + MACE setup cost.
+
+    Params:
+        dbt_proposer: callable : the DBT (`make_mcmm_proposer`) batch
+            propose function — always present (no API to disable DBT).
+        cart_proposer: callable | None : Cartesian-kick
+            (`make_cartesian_kick_proposer`) batch propose function.
+            Must be None iff `cartesian_weight == 0.0`.
+        dihedral_proposer: callable | None : dihedral-kick
+            (`make_dihedral_kick_proposer`) batch propose function.
+            Must be None iff `dihedral_weight == 0.0`.
+        cartesian_weight: float : routing weight for the Cartesian kick,
+            in [0, 1]. Default 0.0.
+        dihedral_weight: float : routing weight for the dihedral kick,
+            in [0, 1]. Default 0.0.
+        seed: int : routing RNG seed; threaded into `make_composite_proposer`
+            when a composite is needed.
+    Returns:
+        callable : a `batch_propose_fn(coords_list) -> list[tuple]`. When
+            only one weight is positive, the corresponding sub-proposer
+            is returned directly (its own `.stats` shape is preserved —
+            a dict, not a list — and the existing dict/list aggregation
+            in `get_mol_PE_mcmm` handles both shapes).
+    Raises:
+        ValueError: any weight is negative; `cartesian_weight + dihedral_weight > 1`;
+            or the (weight > 0 ↔ proposer not None) contract is violated
+            for either sub-proposer.
+    """
+    if cartesian_weight < 0.0 or dihedral_weight < 0.0:
+        raise ValueError(
+            f"weights must be non-negative, got cartesian_weight={cartesian_weight}, "
+            f"dihedral_weight={dihedral_weight}"
+        )
+    total_non_dbt = cartesian_weight + dihedral_weight
+    if total_non_dbt > 1.0 + 1e-12:
+        raise ValueError(
+            f"cartesian_weight + dihedral_weight = {total_non_dbt} > 1.0; "
+            "DBT residual weight would be negative"
+        )
+    if (cartesian_weight > 0.0) != (cart_proposer is not None):
+        raise ValueError(
+            f"cartesian_weight={cartesian_weight} but cart_proposer is "
+            f"{'None' if cart_proposer is None else 'not None'}; "
+            "weight > 0 iff proposer not None"
+        )
+    if (dihedral_weight > 0.0) != (dihedral_proposer is not None):
+        raise ValueError(
+            f"dihedral_weight={dihedral_weight} but dihedral_proposer is "
+            f"{'None' if dihedral_proposer is None else 'not None'}; "
+            "weight > 0 iff proposer not None"
+        )
+
+    dbt_weight = 1.0 - total_non_dbt
+
+    active: list = []
+    if dbt_weight > 0.0:
+        active.append((dbt_weight, dbt_proposer))
+    if cart_proposer is not None:
+        active.append((cartesian_weight, cart_proposer))
+    if dihedral_proposer is not None:
+        active.append((dihedral_weight, dihedral_proposer))
+
+    if len(active) == 1:
+        return active[0][1]
+
+    return make_composite_proposer(
+        [p for _, p in active],
+        weights=[w for w, _ in active],
+        seed=seed,
+    )
