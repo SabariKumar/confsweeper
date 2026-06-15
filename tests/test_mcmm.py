@@ -30,6 +30,7 @@ from mcmm import (
     make_composite_proposer,
     make_mcmm_proposer,
 )
+from proposers import _enumerate_side_chain_dihedrals, make_default_mcmm_composite
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -173,6 +174,89 @@ def test_ordered_residues_within_residue_bonds():
     for n_idx, ca_idx, c_idx in residues:
         assert mol.GetBondBetweenAtoms(n_idx, ca_idx) is not None
         assert mol.GetBondBetweenAtoms(ca_idx, c_idx) is not None
+
+
+# ---------------------------------------------------------------------------
+# _enumerate_side_chain_dihedrals
+# ---------------------------------------------------------------------------
+
+# cremp_sharp = head-to-tail cyclic 6-mer Ser-Ser-Asn-NMeTrp-NMeAla-NMeAsn —
+# the headline failure case from the 2026-05-21 Boltzmann-coverage Finding
+# (`docs/mcmm_plan.md`) that motivates the dihedral-kick proposer. The
+# SMILES below is the canonical form recorded in
+# `results/cremp_ceiling_sdfs/S.S.N.MeW.MeA.MeN.sdf`.
+_CREMP_SHARP_SMILES = (
+    "C[C@H]1C(=O)N(C)[C@@H](CC(N)=O)C(=O)N[C@@H](CO)C(=O)N[C@@H](CO)"
+    "C(=O)N[C@@H](CC(N)=O)C(=O)N(C)[C@@H](Cc2c[nH]c3ccccc23)C(=O)N1C"
+)
+
+
+def _cremp_sharp_mol() -> Chem.Mol:
+    """Build the cremp_sharp test mol with explicit Hs."""
+    return Chem.AddHs(Chem.MolFromSmiles(_CREMP_SHARP_SMILES))
+
+
+def test_enumerate_side_chain_dihedrals_empty_for_all_methyl_peptide():
+    """Cyclic L-alanine homopolymers have only methyl side chains, so every
+    rotatable-bond match is either a backbone bond (excluded) or a methyl
+    rotation (one endpoint has heavy-atom degree 1, also excluded)."""
+    for n_residues in (4, 6):
+        mol = _cycloala_mol(n_residues)
+        result = _enumerate_side_chain_dihedrals(mol)
+        assert result == [], (
+            f"expected empty side-chain enumeration for cyclo(Ala){n_residues}, "
+            f"got {result}"
+        )
+
+
+def test_enumerate_side_chain_dihedrals_contains_trp_chi1():
+    """The χ₁ dihedral of Trp (Cα-Cβ-Cγ_aromatic axis) must appear so the
+    dihedral-kick proposer can perturb it. cremp_sharp's NMe-Trp is the
+    headline target from `docs/dihedral_kick_plan.md`."""
+    mol = _cremp_sharp_mol()
+    result = _enumerate_side_chain_dihedrals(mol)
+    # Trp χ₁: sp3 Cα → sp3 Cβ → aromatic Cγ of the indole. cremp_sharp's
+    # only aromatic residue is Trp, so this SMARTS uniquely identifies the
+    # Cα-Cβ bond of the NMe-Trp side chain.
+    chi1_pattern = Chem.MolFromSmarts("[CX4][CX4][c]")
+    matches = mol.GetSubstructMatches(chi1_pattern)
+    assert matches, "expected sp3-sp3-aromatic substructure match for Trp χ₁"
+    ca, cb, _ = matches[0]
+    # The χ₁ axis is the (Cα, Cβ) bond. Some enumerated tuple must have
+    # (b, c) ∈ {(Cα, Cβ), (Cβ, Cα)} — order depends on SMARTS iteration.
+    chi1_present = any(
+        (b == ca and c == cb) or (b == cb and c == ca) for _, b, c, _ in result
+    )
+    assert (
+        chi1_present
+    ), f"Trp χ₁ axis (Cα={ca}, Cβ={cb}) not in enumeration; got {result}"
+
+
+def test_enumerate_side_chain_dihedrals_excludes_backbone():
+    """Strict separation from DBT: no backbone bond may leak into the
+    side-chain enumeration. Sentinel: for every returned (a, b, c, d),
+    NOT both b and c lie on the macrocycle backbone."""
+    mol = _cremp_sharp_mol()
+    result = _enumerate_side_chain_dihedrals(mol)
+    assert result, "expected non-empty side-chain enumeration for cremp_sharp"
+    backbone_atoms = _backbone_atom_set(mol)
+    for a, b, c, d in result:
+        assert not (
+            b in backbone_atoms and c in backbone_atoms
+        ), f"backbone bond ({b}, {c}) leaked into side-chain enumeration"
+
+
+def test_enumerate_side_chain_dihedrals_returns_int_quadruples():
+    """Output type contract: list of `(int, int, int, int)` tuples; each
+    entry is ready to hand to `Chem.rdMolTransforms.SetDihedralDeg`."""
+    mol = _cremp_sharp_mol()
+    result = _enumerate_side_chain_dihedrals(mol)
+    assert isinstance(result, list)
+    for entry in result:
+        assert isinstance(entry, tuple)
+        assert len(entry) == 4
+        for x in entry:
+            assert isinstance(x, int)
 
 
 # ---------------------------------------------------------------------------
@@ -2177,8 +2261,258 @@ def test_cartesian_kick_proposer_perturbs_coords():
 
 
 # ---------------------------------------------------------------------------
-# make_composite_proposer
+# make_dihedral_kick_proposer
 # ---------------------------------------------------------------------------
+
+# Small head-to-tail cyclic 4-mer Ala-Ser-Ala-Ala — used as the test mol for
+# the dihedral-kick proposer. Has exactly one side-chain rotatable dihedral
+# (Ser χ₁ = Cα-Cβ; Cβ-Oγ is excluded because Oγ has heavy-atom degree 1).
+# Small enough to embed cleanly with default ETKDG via `_seed_full_mol_coords`.
+_CYCLIC_ALA_SER_SMILES = "C[C@@H]1NC(=O)[C@@H](CO)NC(=O)[C@@H](C)NC(=O)[C@@H](C)NC1=O"
+
+
+def _cyclic_ala_ser_mol() -> Chem.Mol:
+    return Chem.AddHs(Chem.MolFromSmiles(_CYCLIC_ALA_SER_SMILES))
+
+
+def _make_dihedral_kick_with_mocks(mol, **kwargs):
+    """Build a real `make_dihedral_kick_proposer` callable while patching the
+    GPU stages — same pattern as `_make_cart_kick_with_mocks`."""
+    from contextlib import contextmanager
+    from unittest.mock import patch as _patch
+
+    from proposers import make_dihedral_kick_proposer
+
+    proposer = make_dihedral_kick_proposer(
+        mol,
+        hardware_opts=None,
+        calc=None,
+        **kwargs,
+    )
+
+    counter = [0]
+
+    def _mock_mace(_calc, ase_mols):
+        out = [(counter[0] + i) * 0.01 for i in range(len(ase_mols))]
+        counter[0] += len(ase_mols)
+        return out
+
+    @contextmanager
+    def patched():
+        with (
+            _patch("confsweeper._mace_batch_energies", side_effect=_mock_mace),
+            _patch(
+                "nvmolkit.mmffOptimization.MMFFOptimizeMoleculesConfs",
+                return_value=[[]],
+            ),
+        ):
+            yield
+
+    return proposer, patched
+
+
+def test_dihedral_kick_proposer_invalid_mmff_backend_raises():
+    from proposers import make_dihedral_kick_proposer
+
+    mol = _cyclic_ala_ser_mol()
+    with pytest.raises(ValueError, match="unknown mmff_backend"):
+        make_dihedral_kick_proposer(
+            mol, hardware_opts=None, calc=None, mmff_backend="bogus"
+        )
+
+
+def test_dihedral_kick_proposer_invalid_p_rotamer_jump_raises():
+    """`p_rotamer_jump` must be a probability in [0, 1]."""
+    from proposers import make_dihedral_kick_proposer
+
+    mol = _cyclic_ala_ser_mol()
+    for bad in (1.5, -0.1):
+        with pytest.raises(ValueError, match="p_rotamer_jump"):
+            make_dihedral_kick_proposer(
+                mol, hardware_opts=None, calc=None, p_rotamer_jump=bad
+            )
+
+
+def test_dihedral_kick_proposer_non_positive_sigma_chi_rad_raises():
+    from proposers import make_dihedral_kick_proposer
+
+    mol = _cyclic_ala_ser_mol()
+    with pytest.raises(ValueError, match="sigma_chi_rad"):
+        make_dihedral_kick_proposer(
+            mol, hardware_opts=None, calc=None, sigma_chi_rad=0.0
+        )
+
+
+def test_dihedral_kick_proposer_empty_rotamer_wells_raises():
+    """When `p_rotamer_jump > 0`, `rotamer_wells_deg` must be non-empty."""
+    from proposers import make_dihedral_kick_proposer
+
+    mol = _cyclic_ala_ser_mol()
+    with pytest.raises(ValueError, match="rotamer_wells_deg"):
+        make_dihedral_kick_proposer(
+            mol,
+            hardware_opts=None,
+            calc=None,
+            p_rotamer_jump=0.5,
+            rotamer_wells_deg=(),
+        )
+
+
+def test_dihedral_kick_proposer_no_side_chains_raises():
+    """cyclo(Ala) has only methyl side chains → no enumerable side-chain
+    dihedrals → factory raises so callers learn at build time, not at
+    step time. Strict separation from DBT also means we can't fall back
+    to a backbone dihedral here."""
+    from proposers import make_dihedral_kick_proposer
+
+    mol = _cycloala_mol(4)
+    with pytest.raises(
+        ValueError, match="no enumerable side-chain rotatable dihedrals"
+    ):
+        make_dihedral_kick_proposer(mol, hardware_opts=None, calc=None)
+
+
+def test_dihedral_kick_proposer_atom_count_weight_not_implemented():
+    """v0 only ships uniform selection; the bulky-side-chain weighting
+    branch is plumbed but raises `NotImplementedError` if turned on so we
+    don't silently ship a stub."""
+    from proposers import make_dihedral_kick_proposer
+
+    mol = _cyclic_ala_ser_mol()
+    with pytest.raises(NotImplementedError, match="dihedral_weight_by_atom_count"):
+        make_dihedral_kick_proposer(
+            mol,
+            hardware_opts=None,
+            calc=None,
+            dihedral_weight_by_atom_count=True,
+        )
+
+
+def test_dihedral_kick_proposer_returns_proposal_per_walker():
+    mol = _cyclic_ala_ser_mol()
+    proposer, patched = _make_dihedral_kick_with_mocks(mol, seed=42)
+    seed_coords = _seed_full_mol_coords(mol)
+    for n in [1, 3, 8]:
+        coords_list = [seed_coords.clone() for _ in range(n)]
+        with patched():
+            proposals = proposer(coords_list)
+        assert len(proposals) == n
+        for p in proposals:
+            assert len(p) == 4
+            new_coords, _, _, _ = p
+            assert isinstance(new_coords, torch.Tensor)
+            assert new_coords.shape == seed_coords.shape
+
+
+def test_dihedral_kick_proposer_empty_input():
+    """Empty coords list returns empty proposal list — locks the
+    short-circuit so no MMFF/MACE work runs on zero walkers."""
+    mol = _cyclic_ala_ser_mol()
+    proposer, _ = _make_dihedral_kick_with_mocks(mol, seed=0)
+    assert proposer([]) == []
+
+
+def test_dihedral_kick_proposer_det_j_is_one_for_success():
+    """A single open-tree dihedral rotation is volume-preserving in
+    dihedral space → no Wu-Deem correction → every successful proposal
+    carries det_j = 1.0. Locks the contract that distinguishes side-chain
+    kicks from DBT's closed-loop concerted rotation."""
+    mol = _cyclic_ala_ser_mol()
+    proposer, patched = _make_dihedral_kick_with_mocks(mol, seed=0)
+    seed_coords = _seed_full_mol_coords(mol)
+    coords_list = [seed_coords.clone() for _ in range(8)]
+    with patched():
+        proposals = proposer(coords_list)
+    successful = [p for p in proposals if p[3]]
+    assert successful, "no successful proposals — mock pipeline is broken"
+    for _, _, det_j, _ in successful:
+        assert det_j == 1.0
+
+
+def test_dihedral_kick_proposer_stats_initialised_and_increment():
+    """Stats start at zero across all five counters and increment correctly:
+    every step is either a Gaussian or a rotamer jump (the two sum to
+    n_proposed); every step is either a relax success or failure (also
+    sums to n_proposed)."""
+    mol = _cyclic_ala_ser_mol()
+    proposer, patched = _make_dihedral_kick_with_mocks(mol, seed=7)
+    seed_coords = _seed_full_mol_coords(mol)
+    assert proposer.stats == {
+        "n_proposed": 0,
+        "n_gaussian_steps": 0,
+        "n_rotamer_jumps": 0,
+        "n_relax_failures": 0,
+        "n_relax_successes": 0,
+    }
+    with patched():
+        proposer([seed_coords.clone() for _ in range(5)])
+        proposer([seed_coords.clone() for _ in range(3)])
+    assert proposer.stats["n_proposed"] == 8
+    assert (
+        proposer.stats["n_gaussian_steps"] + proposer.stats["n_rotamer_jumps"]
+        == proposer.stats["n_proposed"]
+    )
+    assert (
+        proposer.stats["n_relax_successes"] + proposer.stats["n_relax_failures"]
+        == proposer.stats["n_proposed"]
+    )
+
+
+def test_dihedral_kick_proposer_pure_gaussian_when_p_zero():
+    """`p_rotamer_jump=0` → every step is a Gaussian, zero rotamer jumps."""
+    mol = _cyclic_ala_ser_mol()
+    proposer, patched = _make_dihedral_kick_with_mocks(mol, seed=1, p_rotamer_jump=0.0)
+    seed_coords = _seed_full_mol_coords(mol)
+    with patched():
+        proposer([seed_coords.clone() for _ in range(10)])
+    assert proposer.stats["n_rotamer_jumps"] == 0
+    assert proposer.stats["n_gaussian_steps"] == 10
+
+
+def test_dihedral_kick_proposer_pure_rotamer_when_p_one():
+    """`p_rotamer_jump=1` → every step is a rotamer jump, zero Gaussian."""
+    mol = _cyclic_ala_ser_mol()
+    proposer, patched = _make_dihedral_kick_with_mocks(mol, seed=2, p_rotamer_jump=1.0)
+    seed_coords = _seed_full_mol_coords(mol)
+    with patched():
+        proposer([seed_coords.clone() for _ in range(10)])
+    assert proposer.stats["n_rotamer_jumps"] == 10
+    assert proposer.stats["n_gaussian_steps"] == 0
+
+
+def test_dihedral_kick_proposer_does_not_mutate_input_coords():
+    """Walker input coords must be unchanged after a call — the proposer
+    writes to throwaway-mol conformers, never to walker tensors."""
+    mol = _cyclic_ala_ser_mol()
+    proposer, patched = _make_dihedral_kick_with_mocks(mol, seed=3)
+    seed_coords = _seed_full_mol_coords(mol)
+    coords_list = [seed_coords.clone() for _ in range(4)]
+    coords_snapshot = [c.clone() for c in coords_list]
+    with patched():
+        proposer(coords_list)
+    for original, after in zip(coords_snapshot, coords_list):
+        assert torch.equal(original, after), "proposer mutated input coords"
+
+
+def test_dihedral_kick_proposer_preserves_backbone_atoms():
+    """Strict separation from DBT: rotating a side-chain dihedral must not
+    move any backbone atom. With MMFF mocked as a no-op (the throwaway
+    mol's conformers are not touched by the mock), the post-rotation
+    backbone coords must equal the input backbone coords bit-for-bit."""
+    mol = _cyclic_ala_ser_mol()
+    proposer, patched = _make_dihedral_kick_with_mocks(mol, seed=0, p_rotamer_jump=1.0)
+    seed_coords = _seed_full_mol_coords(mol)
+    backbone_atoms = sorted(_backbone_atom_set(mol))
+    coords_list = [seed_coords.clone() for _ in range(4)]
+    with patched():
+        proposals = proposer(coords_list)
+    for new_coords, _, _, success in proposals:
+        if not success:
+            continue
+        for a_idx in backbone_atoms:
+            assert torch.allclose(
+                new_coords[a_idx], seed_coords[a_idx], atol=1e-10
+            ), f"backbone atom {a_idx} moved during a side-chain dihedral kick"
 
 
 def _stub_proposer(tag: str, n_atoms: int = _TEST_N_ATOMS):
@@ -2281,3 +2615,219 @@ def test_composite_proposer_exposes_substats():
     b = _stub_proposer("b")
     composite = make_composite_proposer([a, b])
     assert composite.stats == [a.stats, b.stats]
+
+
+# ---------------------------------------------------------------------------
+# make_default_mcmm_composite — n-way routing helper (DBT + cart + dihedral)
+# ---------------------------------------------------------------------------
+
+
+def test_default_mcmm_composite_validation_negative_cartesian_weight():
+    dbt = _stub_proposer("a")
+    with pytest.raises(ValueError, match="weights must be non-negative"):
+        make_default_mcmm_composite(dbt, cartesian_weight=-0.1)
+
+
+def test_default_mcmm_composite_validation_negative_dihedral_weight():
+    dbt = _stub_proposer("a")
+    with pytest.raises(ValueError, match="weights must be non-negative"):
+        make_default_mcmm_composite(dbt, dihedral_weight=-0.5)
+
+
+def test_default_mcmm_composite_validation_weights_exceed_one():
+    """cartesian_weight + dihedral_weight > 1 would leave a negative DBT
+    residual; the helper must reject before constructing anything."""
+    dbt = _stub_proposer("a")
+    cart = _stub_proposer("b")
+    dih = _stub_proposer("c")
+    with pytest.raises(ValueError, match="DBT residual weight would be negative"):
+        make_default_mcmm_composite(
+            dbt,
+            cart_proposer=cart,
+            dihedral_proposer=dih,
+            cartesian_weight=0.6,
+            dihedral_weight=0.5,
+        )
+
+
+def test_default_mcmm_composite_validation_cartesian_weight_without_proposer():
+    """cartesian_weight > 0 with cart_proposer=None is a contract violation:
+    the caller must build the sub-proposer if it has weight."""
+    dbt = _stub_proposer("a")
+    with pytest.raises(ValueError, match="weight > 0 iff proposer not None"):
+        make_default_mcmm_composite(dbt, cartesian_weight=0.3)
+
+
+def test_default_mcmm_composite_validation_cart_proposer_without_weight():
+    """cart_proposer not None but cartesian_weight=0 means the caller paid
+    the MMFF/MACE setup cost for a proposer that will never route — reject
+    so the wasted construction is loud, not silent."""
+    dbt = _stub_proposer("a")
+    cart = _stub_proposer("b")
+    with pytest.raises(ValueError, match="weight > 0 iff proposer not None"):
+        make_default_mcmm_composite(dbt, cart_proposer=cart, cartesian_weight=0.0)
+
+
+def test_default_mcmm_composite_validation_dihedral_weight_without_proposer():
+    dbt = _stub_proposer("a")
+    with pytest.raises(ValueError, match="weight > 0 iff proposer not None"):
+        make_default_mcmm_composite(dbt, dihedral_weight=0.3)
+
+
+def test_default_mcmm_composite_validation_dihedral_proposer_without_weight():
+    dbt = _stub_proposer("a")
+    dih = _stub_proposer("c")
+    with pytest.raises(ValueError, match="weight > 0 iff proposer not None"):
+        make_default_mcmm_composite(dbt, dihedral_proposer=dih, dihedral_weight=0.0)
+
+
+def test_default_mcmm_composite_pure_dbt_short_circuits_to_dbt_proposer():
+    """When both kick weights are 0, the helper must return the DBT
+    proposer object directly — zero composite-routing overhead. Identity
+    check ensures we did not silently wrap it in a 1-element composite."""
+    dbt = _stub_proposer("a")
+    out = make_default_mcmm_composite(dbt)
+    assert out is dbt
+
+
+def test_default_mcmm_composite_pure_cartesian_short_circuits():
+    """cartesian_weight=1.0 (DBT residual = 0) returns the cart proposer
+    directly — DBT factory should never be invoked."""
+    dbt = _stub_proposer("a")
+    cart = _stub_proposer("b")
+    out = make_default_mcmm_composite(dbt, cart_proposer=cart, cartesian_weight=1.0)
+    assert out is cart
+    coords = [torch.zeros(_TEST_N_ATOMS, 3, dtype=torch.float64) for _ in range(5)]
+    out(coords)
+    # DBT must have received exactly zero walkers — its factory is not
+    # in the route at all.
+    assert dbt.stats["n_walkers"] == 0
+    assert cart.stats["n_walkers"] == 5
+
+
+def test_default_mcmm_composite_pure_dihedral_short_circuits():
+    """dihedral_weight=1.0 (DBT residual = 0) returns the dihedral
+    proposer directly."""
+    dbt = _stub_proposer("a")
+    dih = _stub_proposer("c")
+    out = make_default_mcmm_composite(dbt, dihedral_proposer=dih, dihedral_weight=1.0)
+    assert out is dih
+
+
+def test_default_mcmm_composite_two_way_dbt_plus_cart_backcompat():
+    """Existing 2-way (DBT + cart) callers — the issue-#10 path — must
+    keep producing a composite with weights [1 - cw, cw]."""
+    dbt = _stub_proposer("a")
+    cart = _stub_proposer("b")
+    composite = make_default_mcmm_composite(
+        dbt, cart_proposer=cart, cartesian_weight=0.5, seed=42
+    )
+    # Should be a composite (not the identity short-circuit), so it has
+    # a list-shaped .stats with 2 entries.
+    assert isinstance(composite.stats, list)
+    assert len(composite.stats) == 2
+    coords = [torch.zeros(_TEST_N_ATOMS, 3, dtype=torch.float64) for _ in range(1000)]
+    composite(coords)
+    n_a = dbt.stats["n_walkers"]
+    n_b = cart.stats["n_walkers"]
+    assert n_a + n_b == 1000
+    assert 400 < n_a < 600  # 50/50 ± 10% slack at N=1000
+
+
+def test_default_mcmm_composite_two_way_dbt_plus_dihedral():
+    """The new 2-way combination — DBT + dihedral without Cartesian —
+    must route 50/50 at equal weight without dragging a cart_proposer in."""
+    dbt = _stub_proposer("a")
+    dih = _stub_proposer("c")
+    composite = make_default_mcmm_composite(
+        dbt, dihedral_proposer=dih, dihedral_weight=0.5, seed=42
+    )
+    assert isinstance(composite.stats, list)
+    assert len(composite.stats) == 2
+    coords = [torch.zeros(_TEST_N_ATOMS, 3, dtype=torch.float64) for _ in range(1000)]
+    composite(coords)
+    n_a = dbt.stats["n_walkers"]
+    n_c = dih.stats["n_walkers"]
+    assert n_a + n_c == 1000
+    assert 400 < n_a < 600
+
+
+def test_default_mcmm_composite_three_way_distribution():
+    """DBT residual = 0.4, cart = 0.3, dihedral = 0.3 across 3000 walkers
+    → each route gets ~its share, with ±10% slack."""
+    dbt = _stub_proposer("a")
+    cart = _stub_proposer("b")
+    dih = _stub_proposer("c")
+    composite = make_default_mcmm_composite(
+        dbt,
+        cart_proposer=cart,
+        dihedral_proposer=dih,
+        cartesian_weight=0.3,
+        dihedral_weight=0.3,
+        seed=123,
+    )
+    assert isinstance(composite.stats, list)
+    assert len(composite.stats) == 3
+    n_walkers = 3000
+    coords = [
+        torch.zeros(_TEST_N_ATOMS, 3, dtype=torch.float64) for _ in range(n_walkers)
+    ]
+    composite(coords)
+    n_a = dbt.stats["n_walkers"]
+    n_b = cart.stats["n_walkers"]
+    n_c = dih.stats["n_walkers"]
+    assert n_a + n_b + n_c == n_walkers
+    # DBT 40%, Cart 30%, Dihedral 30%; ±10% slack of n_walkers each.
+    assert 0.30 * n_walkers < n_a < 0.50 * n_walkers
+    assert 0.20 * n_walkers < n_b < 0.40 * n_walkers
+    assert 0.20 * n_walkers < n_c < 0.40 * n_walkers
+
+
+def test_default_mcmm_composite_three_way_walker_order_preserved():
+    """For each walker i, output[i] must come from whichever sub-proposer
+    handled walker i — verified by reading the per-stub sentinel value."""
+    dbt = _stub_proposer("a")  # sentinel 1.0
+    cart = _stub_proposer("b")  # sentinel 2.0
+    dih = _stub_proposer("c")  # sentinel 3.0
+    composite = make_default_mcmm_composite(
+        dbt,
+        cart_proposer=cart,
+        dihedral_proposer=dih,
+        cartesian_weight=0.4,
+        dihedral_weight=0.4,
+        seed=7,
+    )
+    coords = [torch.zeros(_TEST_N_ATOMS, 3, dtype=torch.float64) for _ in range(30)]
+    out = composite(coords)
+    assert len(out) == 30
+    for c, _, _, _ in out:
+        sentinel = float(c[0, 0])
+        assert sentinel in (1.0, 2.0, 3.0)
+
+
+def test_default_mcmm_composite_three_way_substats_reachable():
+    """The composite's .stats must expose all three sub-proposer stats
+    dicts in route order (DBT, cart, dihedral)."""
+    dbt = _stub_proposer("a")
+    cart = _stub_proposer("b")
+    dih = _stub_proposer("c")
+    composite = make_default_mcmm_composite(
+        dbt,
+        cart_proposer=cart,
+        dihedral_proposer=dih,
+        cartesian_weight=0.25,
+        dihedral_weight=0.25,
+    )
+    assert composite.stats == [dbt.stats, cart.stats, dih.stats]
+
+
+def test_default_mcmm_composite_short_circuit_preserves_dict_stats_shape():
+    """The dict/list aggregation block at confsweeper.py:1383-1393 keys
+    off the .stats shape (dict vs list). When the helper short-circuits
+    to a single sub-proposer, that sub-proposer's dict-shaped .stats must
+    survive — wrapping it in a 1-element list would silently change the
+    aggregation path."""
+    dbt = _stub_proposer("a")
+    out = make_default_mcmm_composite(dbt)
+    assert isinstance(out.stats, dict)
+    assert "n_walkers" in out.stats

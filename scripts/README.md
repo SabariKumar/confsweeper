@@ -78,9 +78,9 @@ list of MACE energies for the basin centroids. Currently:
   defaults (the production baseline).
 - `pool_b` — `get_mol_PE_pool_b` with `strategy='inverse'` and
   `n_attempts=1` (matched-budget default).
-- `mcmm` — `get_mol_PE_mcmm` (MCMM-REMD with DBT + Cartesian composite
-  proposer, basin memory, replica exchange). The adapter maps the
-  benchmark's `n_seeds` knob onto MCMM step count via
+- `mcmm` — `get_mol_PE_mcmm` (MCMM-REMD with DBT + Cartesian + side-chain
+  dihedral composite proposer, basin memory, replica exchange). The
+  adapter maps the benchmark's `n_seeds` knob onto MCMM step count via
   `n_steps = max(1, n_seeds // 64)`, keeping total MMFF work
   proportional across the three samplers at the same `--n_seeds`. The
   adapter also locks the production tuning from
@@ -89,6 +89,38 @@ list of MACE energies for the basin centroids. Currently:
   n_init_confs=8, cartesian_weight=0.5, e_window_kT=10,
   saunders_exponent=1.0`); the in-code function defaults preserve the
   original Saunders 1990 / 5 kT conventions.
+
+**MCMM proposer-mix CLI flags (issue #12).** Three knobs exposed at the
+CLI for the dihedral-kick proposer; each defaults to "off / locked" so
+existing benchmark commands keep their issue-#10 behaviour:
+
+- `--cartesian_weight FLOAT` (default `0.0`) — routing weight for the
+  GOAT-style Cartesian kick alongside DBT. Step 12 of
+  `docs/mcmm_plan.md`.
+- `--dihedral_weight FLOAT` (default `0.0`) — routing weight for the
+  side-chain dihedral kick. DBT residual weight =
+  `1 − cartesian_weight − dihedral_weight`; the sum must be `≤ 1`.
+  Issue #12 / `docs/dihedral_kick_plan.md`.
+- `--p_rotamer_jump FLOAT` (default `0.3`) — probability per walker per
+  step of the dihedral kick taking a discrete rotamer-jump
+  (sampled uniformly from `rotamer_wells_deg`) instead of a Gaussian
+  Δχ. Exposed for the Step-7 snap-back diagnostic; ignored when
+  `--dihedral_weight=0`.
+
+**Production tuning lock (issue #12 closes, 2026-06-15).** The 4-cell
+phase-1 sweep at n_seeds=5000 + 2-run phase-2 sweep at n_seeds=10000
+(driver scripts `scripts/sweep_step7.sh`, `scripts/sweep_step7_phase2.sh`)
+identified `--cartesian_weight=0.33 --dihedral_weight=0.33
+--p_rotamer_jump=0.30` as the production mix. On `cremp_typical`
+(`t.I.G.N`) this lifts Boltzmann coverage from `0.83` (DBT + Cart at the
+same budget) to **`0.991`** — 20/22 ceiling basins covered, `max_missed_bw
+= 0.006`. Raising `--p_rotamer_jump` to `0.70` *regresses* cremp_typical
+to `0.971` (too few Gaussian refinement steps), so the lock is precise.
+On `cremp_sharp` (`S.S.N.MeW.MeA.MeN`) the mix does NOT recover the
+dominant ceiling basin at any tested setting; the residual is documented
+as a v0.2 follow-up (issue #13: aromatic-aware rotamer wells, no-MMFF
+ablation). See `docs/dihedral_kick_plan.md` Step-7 Findings for the
+full empirical record.
 
 Future entries (CREST-fast, independent-T MCMM) plug in as a new adapter
 function plus a single dispatch-table key. The benchmark protocol stays
