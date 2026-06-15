@@ -462,20 +462,60 @@ preserving detailed balance via `_swap_walker_configs`. `enable_swaps=False`
 recovers the independent-T-worker variant for ablations (Step 13).
 
 **`make_mcmm_proposer`, `make_cartesian_kick_proposer`,
-`make_composite_proposer`** — proposer factories. The DBT proposer enumerates
-backbone windows (8 atoms each = 4-residue window), samples a drive-angle
-perturbation, solves the closure problem numerically (Coutsias 2004 reformulation
-in `concerted_rotation.py`), couples side chains to the rotated backbone via
-rigid-body transport, MMFF-relaxes the result, and batches MACE scoring across
-all walkers' proposals in one forward pass. The Cartesian-kick proposer
-applies an isotropic Gaussian perturbation (σ = `sigma_kick_a`) to every atom
-and MMFF-relaxes — MMFF's bond-stretch / angle-bend gradients pull bonds and
-ring sp² angles back to equilibrium for `sigma_kick_a ≤ 0.3 Å` without
-explicit SHAKE-style constraints. `make_composite_proposer` routes each
-walker per step between the two via configurable weights and reassembles
-results in walker order. All three proposers expose `.stats` dicts
-(`n_proposed`, `n_relax_failures`, `n_relax_successes`, etc.) for diagnostic
-logging.
+`make_dihedral_kick_proposer`, `make_composite_proposer`,
+`make_default_mcmm_composite`** — proposer factories, all of which live in
+`src/proposers.py` (re-exported from `mcmm.py` for back-compat). The DBT
+proposer enumerates backbone windows (8 atoms each = 4-residue window),
+samples a drive-angle perturbation, solves the closure problem numerically
+(Coutsias 2004 reformulation in `concerted_rotation.py`), couples side chains
+to the rotated backbone via rigid-body transport, MMFF-relaxes the result,
+and batches MACE scoring across all walkers' proposals in one forward pass.
+The Cartesian-kick proposer applies an isotropic Gaussian perturbation
+(σ = `sigma_kick_a`) to every atom and MMFF-relaxes — MMFF's bond-stretch /
+angle-bend gradients pull bonds and ring sp² angles back to equilibrium for
+`sigma_kick_a ≤ 0.3 Å` without explicit SHAKE-style constraints. The
+dihedral-kick proposer (issue #12, `docs/dihedral_kick_plan.md`) rotates a
+single side-chain rotatable bond per walker per step: the **hybrid move
+shape** picks a Gaussian Δχ with probability `1 − p_rotamer_jump` (refines
+within the current rotameric well) or a discrete rotamer-jump to one of
+`rotamer_wells_deg` with probability `p_rotamer_jump` (crosses the barrier
+geometrically before MMFF starts relaxing). Strict separation from DBT —
+the bond enumeration excludes backbone atoms and methyl rotations
+(`_enumerate_side_chain_dihedrals`), so the dihedral kick never touches what
+DBT touches. `det_j = 1.0` for every successful proposal (open-tree
+rotation, volume-preserving in dihedral space), so no Wu-Deem-style
+correction is needed. `make_composite_proposer` accepts any list of
+sub-proposers + weights and routes per walker per step;
+`make_default_mcmm_composite` is the canonical 3-way wrapper for (DBT,
+Cartesian, dihedral) that enforces `cartesian_weight + dihedral_weight ≤ 1`,
+short-circuits to the lone active sub-proposer when only one weight is
+positive (no composite-routing overhead, preserves dict-shaped `.stats`),
+and enforces a `weight > 0 ↔ proposer not None` contract so a caller cannot
+silently build an MMFF + MACE-warmed sub-proposer that never routes. All
+proposers expose `.stats` dicts (`n_proposed`, `n_relax_failures`,
+`n_relax_successes`, plus dihedral-specific `n_gaussian_steps`,
+`n_rotamer_jumps`) for diagnostic logging.
+
+> **Known limitation.** The dihedral kick's `rotamer_wells_deg` defaults to
+> sp3-χ₁ wells `(-60, 60, 180)`. NMe-Trp χ₂ (aromatic) sits near {-90, +90};
+> on peptides where the dominant Boltzmann basin requires aromatic χ₂
+> rotamer states (e.g. cremp_sharp / `S.S.N.MeW.MeA.MeN`), the v0 proposer
+> does not recover the basin at any tested mix — `coverage_bw_ceiling = 0`
+> across the full sweep. Two v0.2 candidates are queued in issue #13:
+> per-bond aromatic-aware well sets, and a no-MMFF ablation that bypasses
+> the Stage-2 MMFF94 relax which may be dragging rotamer jumps back across
+> the barrier before MACE sees them. See `docs/dihedral_kick_plan.md` Step-7
+> phase 2 Findings (2026-06-15) for the empirical record.
+
+**Production-default proposer mix (issue #12 closes).** The locked v0
+defaults on `get_mol_PE_mcmm` are: `cartesian_weight=0.0`,
+`dihedral_weight=0.0` (pure-DBT, legacy behaviour preserved). The
+benchmark-validated 3-way mix that beats the prior `0.83` Boltzmann coverage
+on cremp_typical (lifting it to **`0.991`**) is `cartesian_weight=0.33`,
+`dihedral_weight=0.33`, `p_rotamer_jump=0.30`, `sigma_chi_rad=0.5`,
+`rotamer_wells_deg=(-60, 60, 180)`. Set these at the call site (or via
+`scripts/sampler_benchmark.py`'s `--cartesian_weight`, `--dihedral_weight`,
+`--p_rotamer_jump` flags) to engage the 3-way composite.
 
 ### Kabsch and inertia helpers
 

@@ -281,6 +281,7 @@ def _run_mcmm(
     dedup_mode: str = "kabsch",
     cartesian_weight: float = 0.0,
     dihedral_weight: float = 0.0,
+    p_rotamer_jump: float = 0.3,
     e_window_kT: float = 5.0,
     saunders_exponent: float = 0.5,
 ) -> list[float]:
@@ -356,6 +357,7 @@ def _run_mcmm(
         dedup_mode=dedup_mode,
         cartesian_weight=cartesian_weight,
         dihedral_weight=dihedral_weight,
+        p_rotamer_jump=p_rotamer_jump,
         e_window_kT=e_window_kT,
         saunders_exponent=saunders_exponent,
     )
@@ -521,6 +523,7 @@ def run_one(
     dedup_mode: str = "kabsch",
     cartesian_weight: float = 0.0,
     dihedral_weight: float = 0.0,
+    p_rotamer_jump: float = 0.3,
     e_window_kT: float = 5.0,
     saunders_exponent: float = 0.5,
 ) -> dict:
@@ -557,6 +560,7 @@ def run_one(
     if sampler == "mcmm":
         runner_kwargs["cartesian_weight"] = cartesian_weight
         runner_kwargs["dihedral_weight"] = dihedral_weight
+        runner_kwargs["p_rotamer_jump"] = p_rotamer_jump
         runner_kwargs["e_window_kT"] = e_window_kT
         runner_kwargs["saunders_exponent"] = saunders_exponent
     energies_eV = runner(
@@ -681,6 +685,18 @@ def run_one(
     "#12 / docs/dihedral_kick_plan.md.",
 )
 @click.option(
+    "--p_rotamer_jump",
+    type=float,
+    default=0.3,
+    show_default=True,
+    help="Dihedral-kick proposer knob: probability per walker per "
+    "step of taking a discrete rotamer jump (sampled uniformly "
+    "from rotamer_wells_deg) instead of a Gaussian Delta-chi. "
+    "Exposed for the Step-7 snap-back diagnostic per the locked "
+    "follow-up trigger in docs/dihedral_kick_plan.md. Ignored "
+    "when --dihedral_weight=0.",
+)
+@click.option(
     "--e_window_kT",
     "e_window_kT",
     type=float,
@@ -715,6 +731,7 @@ def main(
     dedup_mode: str,
     cartesian_weight: float,
     dihedral_weight: float,
+    p_rotamer_jump: float,
     e_window_kT: float,
     saunders_exponent: float,
 ) -> None:
@@ -773,12 +790,14 @@ def main(
         )
     logger.info(
         "samplers=%s  n_seeds=%d  dedup_modes=%s  cartesian_weight=%.2f  "
-        "dihedral_weight=%.2f  e_window_kT=%.2f  saunders_exponent=%.2f",
+        "dihedral_weight=%.2f  p_rotamer_jump=%.2f  e_window_kT=%.2f  "
+        "saunders_exponent=%.2f",
         sampler_list,
         n_seeds,
         mode_list,
         cartesian_weight,
         dihedral_weight,
+        p_rotamer_jump,
         e_window_kT,
         saunders_exponent,
     )
@@ -834,6 +853,7 @@ def main(
                         dedup_mode=mode,
                         cartesian_weight=cartesian_weight,
                         dihedral_weight=dihedral_weight,
+                        p_rotamer_jump=p_rotamer_jump,
                         e_window_kT=e_window_kT,
                         saunders_exponent=saunders_exponent,
                     )

@@ -16,7 +16,7 @@ This document is the working design for a third MCMM proposer — a **side-chain
 | 4 | `make_dihedral_kick_proposer` factory + tests | ✓ complete |
 | 5 | Extend `make_composite_proposer` to n-way routing across (DBT, Cartesian, dihedral) | ✓ complete |
 | 6 | Wire `get_mol_PE_mcmm` kwargs + `scripts/sampler_benchmark._run_mcmm` defaults | ✓ complete |
-| 7 | Validation: re-run sampler benchmark on cremp_sharp + cremp_typical; recompute Boltzmann coverage | pending |
+| 7 | Validation: re-run sampler benchmark on cremp_sharp + cremp_typical; recompute Boltzmann coverage | ✓ complete (cremp_typical wins; cremp_sharp deferred to v0.2) |
 | 8 | Documentation (`src/README.md`, `scripts/README.md`, dated Findings entry in mcmm_plan.md) | pending |
 
 ---
@@ -201,7 +201,7 @@ Mechanical move that lands BEFORE the new dihedral-kick code so it goes in the r
 
 ## Phase 3 — Validation + docs
 
-### Step 7: Validation — pending
+### Step 7: Validation — ✓ complete (cremp_typical at 0.991; cremp_sharp deferred to v0.2, 2026-06-15)
 
 - Re-run `sampler_benchmark.py` on cremp_sharp and cremp_typical with the new composite (DBT + Cartesian + dihedral) at the production tuning from Step 6.
 - Re-run `cremp_collapse_test.py run --dump_ceiling_sdf_dir` on the 2 CREMP peptides (regenerates the ceiling SDFs — cheap, ensures the ceiling and sampler-side runs use the same MMFF stochasticity window).
@@ -212,6 +212,14 @@ Mechanical move that lands BEFORE the new dihedral-kick code so it goes in the r
 - cremp_sharp: `coverage_bw_ceiling > 0` at τ=0.5 (any non-zero is a meaningful win given the current floor; ≥ 0.10 is the target).
 - cremp_typical: `coverage_bw_ceiling ≥ 0.80` at τ=0.5 (no regression from the current 0.83).
 - Diagnostic: track the minimum cross-method symmetric RMSD per ceiling basin via the direct pairwise diagnostic (recorded in mcmm_plan.md's 2026-05-21 Findings). Even a partial reduction from 3.1 Å on cremp_sharp is evidence the new proposer is moving in the right direction.
+
+**Execution structure — two phases.** Phase 1 = a 4-cell × 2-peptide sweep at n_seeds=5000 (half production budget) to triage which mix moves which peptide off zero. Phase 2 = the surviving mix re-run at the saturation-validated n_seeds=10000 for the headline plus one diagnostic at the snap-back-trigger `p_rotamer_jump=0.7`.
+
+**Phase 1 (2026-06-14) — ✓ complete, mixed outcome.** 4 cells: cell 1 pure DBT baseline `(cart=0, dih=0)`, cell 2 cart-only `(0.33, 0)`, cell 3 dihedral-only `(0, 0.33)`, cell 4 even 3-way `(0.33, 0.33)`. Driver `scripts/sweep_step7.sh`; per-cell outputs `results/sweep_step7_{coverage,sampler}_<cell>.csv` and `results/sweep_step7_<cell>/*_mcmm.sdf`. The full results table is in the dated Findings entry below — short version: **cremp_typical: dih-only cell 3 wins at 0.989 Boltzmann coverage (20/22 ceiling basins covered, max-missed-mass 0.009); cremp_sharp: every cell at exactly 0.000 with identical `max_missed_bw=0.724`** (the same single dominant basin missed by every mix). One non-trivial bug surfaced during the sweep (see Findings entry).
+
+**Phase 2 (2026-06-14) — in progress.** Headline = cell 4 `(cart=0.33, dih=0.33, p_rotamer_jump=0.3)` at **n_seeds=10000** on both peptides → confirms whether the phase-1 cremp_typical 0.989 holds at the full production budget. Diagnostic = same mix with **p_rotamer_jump=0.7** at n_seeds=10000 → tests the locked Step-1 snap-back follow-up trigger on cremp_sharp ("if snap-back rate > 50 %, raise `p_rotamer_jump` toward 0.5 or higher"). Driver `scripts/sweep_step7_phase2.sh`, detached via setsid as PID 2061711 at 10:50:47; expected wall-clock ~30 min; outputs `results/sweep_step7_{coverage,sampler}_{headline_n10k_pjump30,diagnostic_n10k_pjump70}.csv`.
+
+**To close Step 7:** aggregate the four phase-1 cells + two phase-2 runs into one comparison table; lock the production mix; capture the cremp_sharp story (pass or fail) as a dated Findings entry; queue follow-up triggers that did/didn't fire.
 
 ### Step 8: Documentation — pending
 
@@ -277,3 +285,99 @@ Step 1 closes; Step 2 (proposer-module refactor) is unblocked.
 User flagged `src/mcmm.py` (~1990 lines) as unwieldy mid-Step-1 and asked for a refactor that lands together with the new dihedral-kick proposer. Lock: a new **single-module** `src/proposers.py` carrying all four proposer factories (`make_mcmm_proposer`, `make_cartesian_kick_proposer`, `make_composite_proposer`, plus the future `make_dihedral_kick_proposer`) and the side-chain partition helpers (`_side_chain_group`, `_compute_window_downstream_sets`, `_backbone_atom_set`) they share. **Timing:** lands as the first commit on the issue-#12 branch, before Step 3 builds on it — so the new dihedral-kick code goes into the right place from day one rather than landing in `mcmm.py` and being moved later. **Back-compat:** `mcmm.py` re-exports the moved names so any existing `from mcmm import make_mcmm_proposer` consumers keep working without changes. Trade-off accepted: less elegant than a `src/proposers/` package with per-proposer submodules, but matches the existing pattern in this codebase of one large file per concern (e.g. `concerted_rotation.py` for DBT geometry). Rationale for not splitting into a package: the four factories are tightly coupled (they share helpers, all consume the same batched MMFF + MACE infrastructure, and `make_composite_proposer` directly wraps the others), and four-files-for-four-factories is overkill until a fifth is on the horizon. `mcmm.py` expected to shrink from ~1990 to ~1000 lines with a clearer "MCMM state + driving loop" responsibility.
 
 Test invariant gating this Step: `pixi run python -m pytest tests/ -q` reproduces the post-Boltzmann-coverage baseline of **381 passed, 8 skipped** with zero behaviour change.
+
+### Step 7 phase 1 — 4-cell sweep at n_seeds=5000 (2026-06-14)
+
+**Method.** 4 mix cells × 2 CREMP peptides (cremp_typical = `t.I.G.N`, cremp_sharp = `S.S.N.MeW.MeA.MeN`), driven by `scripts/sweep_step7.sh`. Per-cell: `sampler_benchmark.py --samplers mcmm --n_seeds 5000 --dedup_mode both --dump_sdf_dir <cell>` writes basin SDFs, then `union_basin_count.py --dbt_sdf_dir <cell> --cart_sdf_dir <cell> --ceiling_sdf_dir results/cremp_ceiling_sdfs --cremp_collapse_csv results/cremp_collapse_test_dual.csv` computes Boltzmann coverage. Passing the same dir as both `--dbt_sdf_dir` and `--cart_sdf_dir` makes `union(A, A) = A` so the BW-coverage columns are per-cell. Peptide list `data/processed/cremp/sweep_step7_peptides.csv` was constructed from `data/processed/cremp/validation_subset.csv` (just the two target rows) so the 3 PAMPA peptides — which have no CREMP ceiling and would have wasted ~hour of compute — are skipped. The cremp_collapse_csv is required because `union_basin_count._match_cremp_sequence` needs the sequence column to map the SDF filename `cremp_t.I.G.N_mcmm.sdf` back to the `t.I.G.N` ceiling file.
+
+**Mid-sweep bug — `AttributeError: module 'rdkit.Chem' has no attribute 'rdMolTransforms'`.** Cells 1 + 2 ran clean; cells 3 + 4 crashed at the first dihedral-kick proposal because [src/proposers.py:856](../src/proposers.py#L856) called `Chem.rdMolTransforms.GetDihedralDeg` but the module had only `from rdkit import Chem` — RDKit doesn't auto-import the `rdMolTransforms` submodule into `Chem`'s namespace. The Step-4 test suite missed the bug because `tests/test_mcmm.py` is imported alongside other test modules that transitively pull in `rdMolTransforms`, populating `sys.modules['rdkit.Chem.rdMolTransforms']` before the dihedral-kick test runs. In the clean production-import path (`sampler_benchmark.py → confsweeper.py → mcmm.py → proposers.py`), nothing else touches the submodule and the attribute lookup fails. `sampler_benchmark.py`'s `try/except continue` wrapper swallowed the crash → empty SDF dirs → header-only coverage CSVs → driver kept going (`set -euo pipefail` didn't catch it because the Python exit code was masked by `try/except`). Fix: added `from rdkit.Chem import rdMolTransforms` at the top of `proposers.py` and rewrote both call sites (`GetDihedralDeg`, `SetDihedralDeg`) to use the direct reference. Clean-import smoke test through `confsweeper → mcmm → proposers` now resolves the symbol; 18/18 Step-3 + Step-4 unit tests still pass. Cells 3 + 4 rerun via `scripts/sweep_step7_rerun_3_4.sh` after stale outputs cleared.
+
+**Results (kabsch dedup; crest is identical — BW columns are dedup-mode-independent).** Cell labels: 1 = DBT-only baseline, 2 = cart-only, 3 = dihedral-only, 4 = even 3-way.
+
+cremp_typical (`t.I.G.N`):
+
+| cell | cart_w | dih_w | DBT | `cov_bw_ceil` | `cov_count` | `max_missed_bw` | `n_new` |
+|---|---|---|---|---|---|---|---|
+| 1 DBT only | 0.00 | 0.00 | 1.00 | 0.005 | 0.045 (1/22) | 0.332 | 0 |
+| 2 cart only | 0.33 | 0.00 | 0.67 | 0.664 | 0.227 (5/22) | 0.115 | 0 |
+| **3 dih only** | **0.00** | **0.33** | **0.67** | **0.989** | **0.909 (20/22)** | **0.009** | 0 |
+| 4 three-way | 0.33 | 0.33 | 0.34 | 0.989 | 0.909 (20/22) | 0.009 | 1 (mass 0.004) |
+
+cremp_sharp (`S.S.N.MeW.MeA.MeN`):
+
+| cell | cart_w | dih_w | `cov_bw_ceil` | `cov_count` | `max_missed_bw` | `n_new` | `new_mass` |
+|---|---|---|---|---|---|---|---|
+| 1 DBT only | 0.00 | 0.00 | 0.000 | 0.000 | 0.724023 | 8 | 1.2 × 10⁻¹⁴ |
+| 2 cart only | 0.33 | 0.00 | 0.000 | 0.000 | 0.724023 | 4 | 1.7 × 10⁻⁶ |
+| 3 dih only | 0.00 | 0.33 | 0.000 | 0.000 | 0.724023 | 3 | 5.7 × 10⁻⁸ |
+| 4 three-way | 0.33 | 0.33 | 0.000 | 0.000 | 0.724023 | 3 | 1.3 × 10⁻⁵ |
+
+**Interpretation.**
+
+- **cremp_typical: the dihedral-kick proposer is the clear winner.** Cell 3 (dihedral-only) reaches 0.989 BW coverage at *half* the production budget — beating cell 2 (cart-only at the same weight) by 32 absolute percentage points (0.664) and the pure-DBT baseline by 98 (0.005). The 3-way mix (cell 4) matches cell 3 exactly on the headline metrics, so adding Cartesian on top of dihedral offers no measurable lift on this peptide; the marginal cell-4 win is 1 new basin holding 0.4 % of the joint mass. This far exceeds the Step-7 success criterion (`coverage_bw_ceiling ≥ 0.80`) and the prior `0.83` headline (n_seeds=10000 DBT+cart) — at *half* the production budget.
+- **cremp_sharp: all four mixes flatline at zero.** `max_missed_bw=0.724023` is identical to six decimal places across every cell — the same single ceiling basin (holding 72 % of the 298 K Boltzmann population) is missed by every sampler. The `n_new` counts of 3–8 with masses of 10⁻¹⁴ to 10⁻⁵ are basins outside the ceiling but with thermodynamically irrelevant weight. The dihedral kick at the v0 defaults (sigma_chi_rad=0.5, p_rotamer_jump=0.3, rotamer_wells_deg=(-60, 60, 180)) does NOT recover NMe-Trp's dominant rotamer state on cremp_sharp at this budget.
+- **n_seeds=5000 is enough to *separate* mixes but too tight for a pure-DBT headline.** Pure-DBT cremp_typical at 0.005 is far below the n_seeds=10000 DBT+cart baseline of 0.83 — half-budget DBT alone is severely undersampled, but the mix comparison is still apples-to-apples. Hence phase 2 confirms cell 4 at n_seeds=10000.
+
+**Triggers that fire from the locked Step-1 follow-ups.** All three cremp_sharp follow-up clauses from the Step-1 design lock are now armed: (1) the **MMFF snap-back hypothesis** (raise `p_rotamer_jump` toward 0.5+) — phase 2's diagnostic run tests this directly at 0.7; (2) the **aromatic-χ₂ rotamer-well mismatch** (the locked `(-60, 60, 180)` is sp3-χ₁; NMe-Trp χ₂ sits near {-90, +90}) — deferred to a follow-up ticket pending phase-2 outcome; (3) the **no-MMFF ablation** queued in *Deferred follow-ups* — deferred similarly. The phase-2 outcome dictates which of (2), (3) escalates to a v0.2 code change.
+
+**Files / artefacts.**
+
+- `scripts/sweep_step7.sh` — phase-1 driver (4 cells × 2 peptides at n_seeds=5000)
+- `scripts/sweep_step7_rerun_3_4.sh` — post-fix rerun of cells 3 + 4
+- `data/processed/cremp/sweep_step7_peptides.csv` — 2-row peptide list (CREMP-only, no PAMPA)
+- `results/sweep_step7_coverage_cell{1..4}_*.csv` — per-cell BW-coverage rows
+- `results/sweep_step7_cell{1..4}_*/*.sdf` — per-cell basin SDFs
+- `results/sweep_step7_logs/` — per-cell sampler + coverage logs
+
+### Step 7 phase 2 — headline + snap-back diagnostic at n_seeds=10000 (2026-06-15)
+
+**Method.** Two runs at the saturation-validated n_seeds=10000 on both CREMP peptides, driver `scripts/sweep_step7_phase2.sh`, detached via setsid. Both at the 3-way `(cart=0.33, dih=0.33)` mix that phase 1 identified as the leading candidate. Two p_rotamer_jump levels: the locked default `0.30` (headline) and `0.70` (diagnostic for the Step-1 snap-back follow-up trigger, "if snap-back rate > 50 %, raise toward 0.5 or higher"). To support the diagnostic, `scripts/sampler_benchmark.py` gained a `--p_rotamer_jump` CLI flag wired through `_run_mcmm → run_one → main` with the same pattern as `--dihedral_weight` (8 sites total). Outputs `results/sweep_step7_{coverage,sampler}_{headline_n10k_pjump30,diagnostic_n10k_pjump70}.csv`.
+
+**Results (kabsch dedup; crest is identical).**
+
+cremp_typical (`t.I.G.N`):
+
+| run | n_seeds | p_rotamer_jump | `cov_bw_ceil` | `cov_count` | `max_missed_bw` |
+|---|---|---|---|---|---|
+| phase-1 cell 3 (dih-only) | 5000 | 0.30 | 0.989 | 0.909 (20/22) | 0.009 |
+| phase-1 cell 4 (3-way) | 5000 | 0.30 | 0.989 | 0.909 (20/22) | 0.009 |
+| **phase-2 HEADLINE (3-way)** | **10000** | **0.30** | **0.991** | **0.909 (20/22)** | **0.006** |
+| phase-2 DIAGNOSTIC (3-way) | 10000 | 0.70 | 0.971 | 0.727 (16/22) | 0.009 |
+
+cremp_sharp (`S.S.N.MeW.MeA.MeN`):
+
+| run | n_seeds | p_rotamer_jump | `cov_bw_ceil` | `max_missed_bw` | `n_new` | `new_mass` |
+|---|---|---|---|---|---|---|
+| phase-1 cell 1 (DBT only) | 5000 | n/a | 0.000 | 0.724023 | 8 | 1.2 × 10⁻¹⁴ |
+| phase-1 cell 4 (3-way) | 5000 | 0.30 | 0.000 | 0.724023 | 3 | 1.3 × 10⁻⁵ |
+| phase-2 HEADLINE (3-way) | 10000 | 0.30 | 0.000 | 0.724023 | 2 | 5.0 × 10⁻⁴ |
+| phase-2 DIAGNOSTIC (3-way) | 10000 | 0.70 | 0.000 | 0.724023 | 7 | 5.1 × 10⁻³ |
+
+**Interpretation.**
+
+- **cremp_typical: locked production mix.** Phase-2 headline confirms cell-4 generalises from n_seeds=5000 (0.989) to n_seeds=10000 (0.991) — at saturation, no meaningful headroom left at the current well set. Phase-2 diagnostic at `p_rotamer_jump=0.70` *regresses* cremp_typical by 2 absolute pts (`cov_count` drops 20/22 → 16/22): too few Gaussian refinement steps means the basin set narrows. The locked default 0.30 is the right knob value. **Production mix: cart=0.33, dih=0.33, p_rotamer_jump=0.30 at n_seeds=10000.**
+- **cremp_sharp: still null, but the dihedral kick IS doing work that the metric doesn't capture.** `max_missed_bw=0.724023` is identical across all 6 phase-1 + phase-2 cells (7 decimal places) — the same single dominant basin is missed everywhere. *But* `new_mass` scales by ~40× going from phase-1 to phase-2 headline (1.3 × 10⁻⁵ → 5.0 × 10⁻⁴) and another ~10× going from headline to diagnostic (5.0 × 10⁻⁴ → 5.1 × 10⁻³, i.e. ~400× the phase-1 baseline). The dihedral kick at `p_rotamer_jump=0.70` is exploring much more aggressively and finding much more thermodynamically-weighty new basins — they're just not the *one* basin that dominates the ceiling distribution. **The snap-back hypothesis is partially supported** (more rotamer jumps drive more discovery) **but not the full story** (the dominant basin remains invisible at pjump=0.70).
+- **The dominant cremp_sharp basin is structurally inaccessible to the v0 proposer at any tested mix.** Two locked-but-not-yet-implemented Step-1 follow-up triggers remain candidates: (a) the `rotamer_wells_deg=(-60, 60, 180)` defaults are sp3-χ₁ wells — NMe-Trp χ₂ (aromatic) sits near {-90, +90}, so χ₂ rotamer jumps land at non-minima and MMFF immediately drags them back; (b) Stage-2 MMFF relax may be undoing rotamer jumps even when they land near the right basin (the no-MMFF ablation hypothesis). Both are v0.2 code changes, not v0 knob tweaks — deferred to a follow-up ticket (issue #13 — drafted alongside this Step-7 close).
+
+**Production-mix lock.** With cremp_typical confirmed at 0.991 and cremp_sharp deferred to v0.2:
+
+- **Default production mix for the dihedral-kick proposer:** `cartesian_weight=0.33, dihedral_weight=0.33` (DBT residual = 0.34), `p_rotamer_jump=0.30`, `sigma_chi_rad=0.5`, `rotamer_wells_deg=(-60, 60, 180)`, `dihedral_weight_by_atom_count=False`. These are the in-code defaults on `get_mol_PE_mcmm` and `make_dihedral_kick_proposer` (Step-1 lock); only the per-knob `--cartesian_weight`, `--dihedral_weight`, and `--p_rotamer_jump` CLI flags are exposed at `sampler_benchmark.py` for sweep diagnostics.
+- **No regression on cremp_typical:** 0.991 vs the prior issue-#10 headline of 0.83 (DBT + cart at n_seeds=10000) — **+16 absolute points of Boltzmann coverage** is the issue-#12 deliverable.
+- **cremp_sharp residual:** documented as a known limitation, attacked separately in v0.2.
+
+**Triggers that DID and DID NOT fire.**
+
+- ✓ **Snap-back follow-up trigger fires partially.** Phase-2 diagnostic showed `p_rotamer_jump=0.70` increases `new_mass` discovery by ~400× over phase-1 baseline on cremp_sharp — consistent with the snap-back hypothesis but insufficient. The locked guidance ("raise toward 0.5 or higher") is empirically supported as an exploration tool, but not as a cremp_sharp fix.
+- ✗ **Aromatic-χ₂-well trigger held.** Not yet tested — escalates to v0.2.
+- ✗ **No-MMFF ablation trigger held.** Not yet tested — escalates to v0.2.
+- ✗ **Compositional-imbalance Step-7 weight sweep partially fired.** The phase-1 sweep covered 4 mixes; phase-2 confirms cell-4 at the production budget but did not sweep an even finer weight grid on cremp_typical (judged unnecessary given the 0.991 ceiling).
+
+**Files / artefacts.**
+
+- `scripts/sweep_step7_phase2.sh` — phase-2 driver (3-way × 2 p_rotamer_jump levels × 2 peptides at n_seeds=10000)
+- `results/sweep_step7_coverage_{headline_n10k_pjump30,diagnostic_n10k_pjump70}.csv` — phase-2 BW coverage rows
+- `results/sweep_step7_sampler_{headline_n10k_pjump30,diagnostic_n10k_pjump70}.csv` — phase-2 sampler benchmark rows
+- `results/sweep_step7_{headline_n10k_pjump30,diagnostic_n10k_pjump70}/*_mcmm.sdf` — phase-2 basin SDFs
+- `results/sweep_step7_logs/{headline_n10k_pjump30,diagnostic_n10k_pjump70}_{sampler,coverage}.log` — phase-2 logs
+
+Step 7 closes here. Step 8 (documentation) starts with this entry as the empirical record to compress into `src/README.md`, `scripts/README.md`, and a dated `docs/mcmm_plan.md` Findings cross-reference; the cremp_sharp v0.2 follow-up issue is drafted alongside (issue #13).

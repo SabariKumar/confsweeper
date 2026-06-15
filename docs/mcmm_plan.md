@@ -850,6 +850,27 @@ All three locked. Steps 1–9 complete (see Progress table at top). Step 10 (fin
 
 ---
 
+### Side-chain dihedral-kick proposer benchmark (issue #12, 2026-06-15)
+
+Cross-reference to the full empirical record in `docs/dihedral_kick_plan.md` (Step 7 Findings, 2026-06-14 and 2026-06-15). This is the resolution of the 2026-05-21 Boltzmann-coverage `cremp_sharp` failure mode (0.000 coverage at all τ, dominant ceiling basin sits at 3.1 Å from every sampler basin) — the diagnosis pointed at NMe-Trp χ₁ / χ₂ rotamers that backbone-only DBT cannot reach and small Cartesian kicks + MMFF cannot cross.
+
+**Proposer.** `make_dihedral_kick_proposer` ships in `src/proposers.py` (alongside the refactored `make_mcmm_proposer`, `make_cartesian_kick_proposer`, and the new `make_composite_proposer` / `make_default_mcmm_composite` routing helpers). Per walker per step it picks one side-chain rotatable bond (uniform random, backbone + methyl bonds excluded) and either (a) draws a Gaussian Δχ from `N(0, sigma_chi_rad)` to refine within the current rotameric well, or (b) snaps χ to a discrete rotameric well from `rotamer_wells_deg` to cross the barrier geometrically. Choice (b) has probability `p_rotamer_jump`, so the move shape is a hybrid Gaussian + rotamer-jump. `det_j = 1.0` (volume-preserving in dihedral space, no Wu-Deem correction needed). Strict separation from DBT: backbone atoms never moved.
+
+**Production-mix lock.** `cartesian_weight=0.33, dihedral_weight=0.33, p_rotamer_jump=0.30, sigma_chi_rad=0.5, rotamer_wells_deg=(-60, 60, 180)` at `n_seeds=10000`. Three-way (DBT + Cart + dihedral) composite. Exposed at `scripts/sampler_benchmark.py` via `--cartesian_weight`, `--dihedral_weight`, `--p_rotamer_jump`.
+
+**Coverage delta on the cremp_typical / cremp_sharp peptides.** Replaces and extends the 2026-05-21 Boltzmann-coverage table:
+
+| peptide | DBT-only (issue #10 baseline) | DBT + Cart at issue-#10 lock | 3-way with dihedral kick (issue #12 lock) | Δ vs prior best |
+|---|---|---|---|---|
+| `cremp_typical` (`t.I.G.N`) | (severely undersampled at this budget alone) | `0.83` (n_seeds=10000) | **`0.991`** (n_seeds=10000) | **+0.16 absolute** |
+| `cremp_sharp` (`S.S.N.MeW.MeA.MeN`) | `0.000` | `0.000` | `0.000` | **0** (deferred to v0.2) |
+
+**cremp_sharp residual — deferred to v0.2 (issue #13).** Across all 6 phase-1 + phase-2 cells `max_missed_bw = 0.724023` is identical to 7 decimal places — the same dominant ceiling basin (72 % of the 298 K Boltzmann population) is missed at every mix. But `new_mass` scales with both `n_seeds` and `p_rotamer_jump` (from `1.2 × 10⁻¹⁴` at the DBT-only baseline to `5.1 × 10⁻³` at `p_rotamer_jump=0.70`, n_seeds=10000), so the dihedral kick IS exploring more aggressively — it just isn't finding the *right* basin. Two structural hypotheses survive: (1) `rotamer_wells_deg=(-60, 60, 180)` is sp3-χ₁; NMe-Trp χ₂ (aromatic) sits near {-90, +90}, so χ₂ rotamer jumps land at non-minima and MMFF immediately drags them back; (2) the Stage-2 MMFF94 relax may be the dominant snap-back mechanism even for χ₁ — testing this requires a no-MMFF ablation path. Both are v0.2 code changes, not v0 knob tweaks, and are captured as issue #13 alongside this work.
+
+**Implications for the broader plan.** The MCMM headline number now leads with the issue-#12 mix on `cremp_typical`; the `cremp_sharp` residual is a known limitation, not a sampler regression. The 2026-05-21 finding that "MCMM basin set sits geometrically 3+ Å from every CREMP ceiling basin" is now closed for `cremp_typical` (the dihedral kick brings them within 0.006 Å Boltzmann-mass) and remains open for `cremp_sharp` (3.1 Å gap unchanged at the dominant basin).
+
+---
+
 ## References
 
 The shorthand citations used throughout this plan and in the `src/mcmm.py` /

@@ -21,6 +21,7 @@ import ase
 import numpy as np
 import torch
 from rdkit import Chem
+from rdkit.Chem import rdMolTransforms
 
 # Helpers consumed by the proposers but kept in mcmm.py because BasinMemory,
 # walkers, and drivers depend on them too. Imported at module load: mcmm.py's
@@ -853,10 +854,10 @@ def make_dihedral_kick_proposer(
                 new_chi_deg = float(rotamer_wells_arr[rng.integers(n_wells)])
             else:
                 stats["n_gaussian_steps"] += 1
-                current = Chem.rdMolTransforms.GetDihedralDeg(conf, a, b, c, d)
+                current = rdMolTransforms.GetDihedralDeg(conf, a, b, c, d)
                 delta_deg = float(rng.normal(0.0, sigma_chi_deg))
                 new_chi_deg = current + delta_deg
-            Chem.rdMolTransforms.SetDihedralDeg(conf, a, b, c, d, new_chi_deg)
+            rdMolTransforms.SetDihedralDeg(conf, a, b, c, d, new_chi_deg)
 
         # Stage 2: batched MMFF on the throwaway mol.
         if mmff_backend == "gpu":
