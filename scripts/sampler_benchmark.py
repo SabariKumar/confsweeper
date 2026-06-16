@@ -282,6 +282,7 @@ def _run_mcmm(
     cartesian_weight: float = 0.0,
     dihedral_weight: float = 0.0,
     p_rotamer_jump: float = 0.3,
+    aromatic_wells_deg: tuple | None = None,
     e_window_kT: float = 5.0,
     saunders_exponent: float = 0.5,
 ) -> list[float]:
@@ -358,6 +359,7 @@ def _run_mcmm(
         cartesian_weight=cartesian_weight,
         dihedral_weight=dihedral_weight,
         p_rotamer_jump=p_rotamer_jump,
+        aromatic_wells_deg=aromatic_wells_deg,
         e_window_kT=e_window_kT,
         saunders_exponent=saunders_exponent,
     )
@@ -524,6 +526,7 @@ def run_one(
     cartesian_weight: float = 0.0,
     dihedral_weight: float = 0.0,
     p_rotamer_jump: float = 0.3,
+    aromatic_wells_deg: tuple | None = None,
     e_window_kT: float = 5.0,
     saunders_exponent: float = 0.5,
 ) -> dict:
@@ -561,6 +564,7 @@ def run_one(
         runner_kwargs["cartesian_weight"] = cartesian_weight
         runner_kwargs["dihedral_weight"] = dihedral_weight
         runner_kwargs["p_rotamer_jump"] = p_rotamer_jump
+        runner_kwargs["aromatic_wells_deg"] = aromatic_wells_deg
         runner_kwargs["e_window_kT"] = e_window_kT
         runner_kwargs["saunders_exponent"] = saunders_exponent
     energies_eV = runner(
@@ -697,6 +701,18 @@ def run_one(
     "when --dihedral_weight=0.",
 )
 @click.option(
+    "--aromatic_wells/--no-aromatic_wells",
+    "aromatic_wells",
+    default=False,
+    show_default=True,
+    help="Dihedral-kick proposer toggle (issue #15 / v0.2): when on, "
+    "side-chain rotatable bonds whose downstream endpoint is "
+    "aromatic (e.g. NMe-Trp chi2) get rotamer-jump wells at "
+    "(-90, 0, 90, 180) degrees instead of the sp3 chi1 default "
+    "(-60, 60, 180). Defaults off so issue-#12 callers are "
+    "unchanged. Ignored when --dihedral_weight=0.",
+)
+@click.option(
     "--e_window_kT",
     "e_window_kT",
     type=float,
@@ -732,6 +748,7 @@ def main(
     cartesian_weight: float,
     dihedral_weight: float,
     p_rotamer_jump: float,
+    aromatic_wells: bool,
     e_window_kT: float,
     saunders_exponent: float,
 ) -> None:
@@ -759,6 +776,13 @@ def main(
             f"unknown sampler(s) {unknown!r}; available: {list(SAMPLERS)}"
         )
     mode_list = ["kabsch", "crest"] if dedup_mode == "both" else [dedup_mode]
+
+    # Issue #15 / v0.2: the --aromatic_wells boolean flag toggles the
+    # locked four-well aromatic set on / off. Internally everything below
+    # threads as `aromatic_wells_deg: tuple | None`, matching the
+    # signature of get_mol_PE_mcmm and make_dihedral_kick_proposer; None
+    # is the legacy issue-#12 behaviour (every bond uses sp3 wells).
+    aromatic_wells_deg = (-90.0, 0.0, 90.0, 180.0) if aromatic_wells else None
 
     # Two peptide-source modes:
     #   - default (5-peptide test set): --cremp_csv + --pampa_csv with the
@@ -790,14 +814,15 @@ def main(
         )
     logger.info(
         "samplers=%s  n_seeds=%d  dedup_modes=%s  cartesian_weight=%.2f  "
-        "dihedral_weight=%.2f  p_rotamer_jump=%.2f  e_window_kT=%.2f  "
-        "saunders_exponent=%.2f",
+        "dihedral_weight=%.2f  p_rotamer_jump=%.2f  aromatic_wells=%s  "
+        "e_window_kT=%.2f  saunders_exponent=%.2f",
         sampler_list,
         n_seeds,
         mode_list,
         cartesian_weight,
         dihedral_weight,
         p_rotamer_jump,
+        "on" if aromatic_wells else "off",
         e_window_kT,
         saunders_exponent,
     )
@@ -854,6 +879,7 @@ def main(
                         cartesian_weight=cartesian_weight,
                         dihedral_weight=dihedral_weight,
                         p_rotamer_jump=p_rotamer_jump,
+                        aromatic_wells_deg=aromatic_wells_deg,
                         e_window_kT=e_window_kT,
                         saunders_exponent=saunders_exponent,
                     )

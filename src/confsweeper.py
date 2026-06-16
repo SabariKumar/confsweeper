@@ -1119,6 +1119,7 @@ def get_mol_PE_mcmm(
     sigma_chi_rad: float = 0.5,
     p_rotamer_jump: float = 0.3,
     rotamer_wells_deg: tuple = (-60.0, 60.0, 180.0),
+    aromatic_wells_deg: tuple | None = None,
     dihedral_weight_by_atom_count: bool = False,
     score_chunk_size: int = 500,
     e_window_kT: float = 5.0,
@@ -1217,10 +1218,21 @@ def get_mol_PE_mcmm(
             dihedral-kick taking a discrete rotamer jump (sampled
             uniformly from `rotamer_wells_deg`) instead of a Gaussian
             Δχ. Default 0.3. Only consulted when `dihedral_weight > 0`.
-        rotamer_wells_deg: tuple[float, ...] : rotameric well centres
-            in degrees, sampled uniformly when the dihedral kick takes a
-            rotamer jump. Default `(-60.0, 60.0, 180.0)` (standard sp3
-            χ₁ wells). Only consulted when `dihedral_weight > 0`.
+        rotamer_wells_deg: tuple[float, ...] : sp3 rotameric well
+            centres in degrees, sampled uniformly when the dihedral
+            kick takes a rotamer jump on a non-aromatic bond (and on
+            ALL bonds when `aromatic_wells_deg is None`). Default
+            `(-60.0, 60.0, 180.0)` (standard sp3 χ₁ wells). Only
+            consulted when `dihedral_weight > 0`.
+        aromatic_wells_deg: tuple[float, ...] | None : aromatic
+            rotameric well centres in degrees, sampled uniformly when
+            the dihedral kick takes a rotamer jump on a bond whose
+            downstream endpoint is aromatic (e.g. NMe-Trp χ₂). Default
+            `None` preserves the v0.1 (issue #12) behaviour where every
+            bond uses `rotamer_wells_deg`. Set to
+            `(-90.0, 0.0, 90.0, 180.0)` to engage the issue-#15 v0.2
+            aromatic-aware path. Only consulted when
+            `dihedral_weight > 0`.
         dihedral_weight_by_atom_count: bool : v0 stub — when False
             (default) the dihedral kick uniformly samples side-chain
             rotatable bonds; True is a deferred follow-up
@@ -1400,6 +1412,7 @@ def get_mol_PE_mcmm(
             sigma_chi_rad=sigma_chi_rad,
             p_rotamer_jump=p_rotamer_jump,
             rotamer_wells_deg=rotamer_wells_deg,
+            aromatic_wells_deg=aromatic_wells_deg,
             score_chunk_size=score_chunk_size,
             mmff_backend=mmff_backend,
             dihedral_weight_by_atom_count=dihedral_weight_by_atom_count,

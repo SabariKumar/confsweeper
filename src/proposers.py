@@ -263,6 +263,63 @@ def _enumerate_side_chain_dihedrals(
     return result
 
 
+def _classify_rotamer_wells(
+    mol: Chem.Mol,
+    dihedrals,
+    aromatic_wells_deg,
+    sp3_wells_deg,
+):
+    """
+    Build the per-bond rotamer-well lookup consumed by the dihedral-kick
+    proposer's rotamer-jump branch. For each rotatable bond
+    `(a, b, c, d)` produced by `_enumerate_side_chain_dihedrals`, check
+    whether the downstream endpoint `c` is aromatic. Aromatic-anchored
+    bonds get the `aromatic_wells_deg` well set (e.g. NMe-Trp χ₂ —
+    indole-edge rotamers near ±90°); all others get `sp3_wells_deg`
+    (standard sp3-χ₁ wells near ±60°, 180°).
+
+    When `aromatic_wells_deg is None`, every bond gets `sp3_wells_deg`
+    — the v0.1 (issue #12) behaviour, preserved as the default of
+    `make_dihedral_kick_proposer` so existing callers see no change.
+
+    Why atom c (not b)? Atom c is the "downstream" endpoint of the
+    rotated bond — the atom that anchors the side-chain subtree being
+    swung around. For NMe-Trp χ₂ this is the indole Cγ; for sp3-χ₁ on
+    Ser / Thr / Asn / Asp / etc. this is the side-chain sp3 carbon
+    bound to the rotated β atom. The aromaticity of `c` is the cleanest
+    structural signal distinguishing the two regimes (locked Step-1
+    design choice A, see docs/dihedral_kick_v0_2_plan.md Findings
+    2026-06-15).
+
+    Params:
+        mol: Chem.Mol : the cyclic peptide with explicit Hs.
+        dihedrals: list[tuple[int, int, int, int]] : output of
+            `_enumerate_side_chain_dihedrals(mol)`.
+        aromatic_wells_deg: tuple[float, ...] | None : well centres in
+            degrees for aromatic-anchored bonds. None disables per-bond
+            classification entirely (every bond gets `sp3_wells_deg`).
+        sp3_wells_deg: tuple[float, ...] : well centres in degrees for
+            non-aromatic (sp3) bonds. Default sp3-χ₁ wells `(-60, 60,
+            180)` come from the make_dihedral_kick_proposer caller.
+    Returns:
+        list[np.ndarray] : one np.float64 array per dihedral, in the
+            same order as `dihedrals`. Each entry is the well-set
+            array the rotamer-jump branch should sample uniformly from
+            for the corresponding bond.
+    """
+    sp3_arr = np.asarray(sp3_wells_deg, dtype=np.float64)
+    if aromatic_wells_deg is None:
+        return [sp3_arr] * len(dihedrals)
+    aromatic_arr = np.asarray(aromatic_wells_deg, dtype=np.float64)
+    wells_per_bond = []
+    for (_, _, c, _) in dihedrals:
+        if mol.GetAtomWithIdx(int(c)).GetIsAromatic():
+            wells_per_bond.append(aromatic_arr)
+        else:
+            wells_per_bond.append(sp3_arr)
+    return wells_per_bond
+
+
 # ---------------------------------------------------------------------------
 # Real-mol proposer factory — DBT concerted rotation
 # ---------------------------------------------------------------------------
@@ -660,6 +717,7 @@ def make_dihedral_kick_proposer(
     sigma_chi_rad: float = 0.5,
     p_rotamer_jump: float = 0.3,
     rotamer_wells_deg: tuple = (-60.0, 60.0, 180.0),
+    aromatic_wells_deg: tuple | None = None,
     score_chunk_size: int = 500,
     mmff_backend: str = "gpu",
     dihedral_weight_by_atom_count: bool = False,
@@ -746,11 +804,21 @@ def make_dihedral_kick_proposer(
             to 1 for pure rotameric jumps. The jump path provides
             barrier-crossing — without it MMFF tends to undo small Δχ
             and the proposer can't escape its starting rotamer.
-        rotamer_wells_deg: tuple[float, ...] : rotameric well centres
-            in degrees (default `(-60.0, 60.0, 180.0)` — standard sp3
-            χ₁ wells; applied uniformly to all rotatable side-chain
-            bonds in v0). Aromatic χ₂ has `{-90, +90}` wells in
-            principle; the uniform 3-well set is a v0 simplification.
+        rotamer_wells_deg: tuple[float, ...] : sp3 rotameric well
+            centres in degrees (default `(-60.0, 60.0, 180.0)` —
+            standard sp3 χ₁ wells). Used for any side-chain rotatable
+            bond whose downstream endpoint `c` is non-aromatic, AND for
+            all bonds when `aromatic_wells_deg is None` (the v0.1
+            issue-#12 behaviour).
+        aromatic_wells_deg: tuple[float, ...] | None : rotameric well
+            centres in degrees applied to side-chain rotatable bonds
+            whose downstream endpoint `c` is aromatic (e.g. NMe-Trp χ₂
+            — indole-edge / face-on states near ±90°). Default `None`
+            preserves v0.1 behaviour (every bond uses
+            `rotamer_wells_deg`). The v0.2 locked aromatic well set
+            (issue #15) is `(-90.0, 0.0, 90.0, 180.0)` — see
+            `docs/dihedral_kick_v0_2_plan.md` Findings 2026-06-15 for
+            the rationale.
         score_chunk_size: int : MACE per-batch forward pass cap
             (default 500).
         mmff_backend: str : 'gpu' (nvmolkit batched CUDA, default) or
@@ -769,10 +837,12 @@ def make_dihedral_kick_proposer(
     Raises:
         ValueError: on unknown `mmff_backend`, `p_rotamer_jump` not in
             [0, 1], non-positive `sigma_chi_rad`, empty
-            `rotamer_wells_deg` when `p_rotamer_jump > 0`, or when
-            `mol` has no enumerable side-chain rotatable dihedrals
-            (e.g., cyclic homo-alanine — every side chain is a methyl,
-            every rotatable-bond match is filtered).
+            `rotamer_wells_deg` when `p_rotamer_jump > 0`, empty
+            `aromatic_wells_deg` (when not None) when
+            `p_rotamer_jump > 0`, or when `mol` has no enumerable
+            side-chain rotatable dihedrals (e.g., cyclic homo-alanine
+            — every side chain is a methyl, every rotatable-bond match
+            is filtered).
         NotImplementedError: if `dihedral_weight_by_atom_count=True`
             (v0 only ships uniform selection).
     """
@@ -786,6 +856,15 @@ def make_dihedral_kick_proposer(
         raise ValueError(f"sigma_chi_rad must be positive, got {sigma_chi_rad}")
     if p_rotamer_jump > 0.0 and len(rotamer_wells_deg) == 0:
         raise ValueError("rotamer_wells_deg must be non-empty when p_rotamer_jump > 0")
+    if (
+        p_rotamer_jump > 0.0
+        and aromatic_wells_deg is not None
+        and len(aromatic_wells_deg) == 0
+    ):
+        raise ValueError(
+            "aromatic_wells_deg must be non-empty when p_rotamer_jump > 0 "
+            "and aromatic_wells_deg is provided (pass None to disable per-bond classification)"
+        )
     if dihedral_weight_by_atom_count:
         raise NotImplementedError(
             "dihedral_weight_by_atom_count=True is a v0 deferred branch; "
@@ -808,8 +887,9 @@ def make_dihedral_kick_proposer(
     template_mol = Chem.Mol(mol)
     template_mol.RemoveAllConformers()
 
-    rotamer_wells_arr = np.asarray(rotamer_wells_deg, dtype=np.float64)
-    n_wells = len(rotamer_wells_arr)
+    rotamer_wells_per_bond = _classify_rotamer_wells(
+        mol, dihedrals, aromatic_wells_deg, rotamer_wells_deg
+    )
     sigma_chi_deg = math.degrees(sigma_chi_rad)
 
     rng = np.random.default_rng(seed)
@@ -851,7 +931,8 @@ def make_dihedral_kick_proposer(
             a, b, c, d = dihedrals[dihedral_idx]
             if rng.uniform() < p_rotamer_jump:
                 stats["n_rotamer_jumps"] += 1
-                new_chi_deg = float(rotamer_wells_arr[rng.integers(n_wells)])
+                wells = rotamer_wells_per_bond[dihedral_idx]
+                new_chi_deg = float(wells[rng.integers(len(wells))])
             else:
                 stats["n_gaussian_steps"] += 1
                 current = rdMolTransforms.GetDihedralDeg(conf, a, b, c, d)

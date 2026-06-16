@@ -11,8 +11,8 @@ This document is the working design for v0.2 of the side-chain dihedral-kick pro
 | Step | Description | Status |
 |------|-------------|--------|
 | 1 | Lock four design forks | ✓ complete |
-| 2 | Per-bond aromatic-aware rotamer-well helper + factory plumbing + tests | pending |
-| 3 | Thread `aromatic_wells` kwarg through `get_mol_PE_mcmm` + `scripts/sampler_benchmark.py` CLI | pending |
+| 2 | Per-bond aromatic-aware rotamer-well helper + factory plumbing + tests | ✓ complete |
+| 3 | Thread `aromatic_wells` kwarg through `get_mol_PE_mcmm` + `scripts/sampler_benchmark.py` CLI | ✓ complete |
 | 4 | Validation A: aromatic wells alone on cremp_sharp + cremp_typical at n_seeds=10000 | pending |
 | 5 | `skip_mmff_relax` ablation kwarg on `make_dihedral_kick_proposer` + tests | pending |
 | 6 | Thread `skip_mmff_relax` through `get_mol_PE_mcmm` + CLI | pending |
@@ -95,7 +95,7 @@ All four forks locked at the choices above. The conversation is captured under t
 
 ## Phase 2 — Aromatic-aware rotamer wells
 
-### Step 2: Per-bond aromatic-aware rotamer-well helper + factory plumbing + tests — pending
+### Step 2: Per-bond aromatic-aware rotamer-well helper + factory plumbing + tests — ✓ complete
 
 - New helper `_classify_rotamer_wells(mol, dihedrals, aromatic_wells_deg, sp3_wells_deg) -> list[np.ndarray]` in `src/proposers.py`, called once at `make_dihedral_kick_proposer` construction time. Returns one well-set array per rotatable bond, in the same order as `_enumerate_side_chain_dihedrals(mol)`.
 - Aromatic detection: for each `(a, b, c, d)`, check `mol.GetAtomWithIdx(c).GetIsAromatic()`. If True → use `aromatic_wells_deg`; else → use `sp3_wells_deg`.
@@ -107,12 +107,16 @@ All four forks locked at the choices above. The conversation is captured under t
   - `test_aromatic_wells_factory_uses_per_bond_wells_at_proposal_time` — patch the rng to force a rotamer jump; assert that the jumped-to χ value is in the bond-appropriate well set, not the other one.
   - `test_aromatic_wells_factory_default_off_preserves_v0_behaviour` — with `aromatic_wells_deg=None` (or matching `sp3_wells_deg`), the proposer behaves identically to v0.
 
-### Step 3: Thread `aromatic_wells_deg` through `get_mol_PE_mcmm` + `scripts/sampler_benchmark.py` CLI — pending
+**Outcome (2026-06-15).** Helper `_classify_rotamer_wells(mol, dihedrals, aromatic_wells_deg, sp3_wells_deg)` shipped in [src/proposers.py:266](../src/proposers.py#L266) just after `_enumerate_side_chain_dihedrals`. For each rotatable bond it inspects `mol.GetAtomWithIdx(c).GetIsAromatic()` and returns either the aromatic well-set array or the sp3 fallback; when `aromatic_wells_deg is None` every bond gets sp3 (preserves issue-#12 behaviour byte-for-byte). The factory `make_dihedral_kick_proposer` gained `aromatic_wells_deg: tuple | None = None` as a new kwarg; the construction-time path now stores a `rotamer_wells_per_bond: list[np.ndarray]` indexed by `dihedral_idx`, and the call-time rotamer-jump branch looks up the well set for the chosen bond instead of using a single shared array. New validation: empty `aromatic_wells_deg` (when not None) with `p_rotamer_jump > 0` raises at factory time, mirroring the existing sp3 case. Docstring extended with the new kwarg + the v0.1-default behaviour note. 6 new tests in `tests/test_mcmm.py`: 3 unit tests on `_classify_rotamer_wells` (None → all sp3; cremp_sharp aromatic-c detection asserts ≥1 aromatic and ≥1 sp3 bond returned with the right well set each; empty-dihedrals edge case), 3 factory-level tests (default `aromatic_wells_deg=None` preserves stats shape; explicit empty + `p_rotamer_jump > 0` raises; empty `aromatic_wells_deg` is benign at `p_rotamer_jump=0`). Targeted run: 6/6 in 1.95 s; the wider dihedral test family (`enumerate_side_chain_dihedrals`, `dihedral_kick`, plus the new `classify_rotamer`) is 24/24 in 2.81 s. Full-suite run kicked off; predicted **426 passed, 8 skipped** (+6 over the v0 baseline of 420/8).
+
+### Step 3: Thread `aromatic_wells_deg` through `get_mol_PE_mcmm` + `scripts/sampler_benchmark.py` CLI — ✓ complete
 
 - New kwarg on `get_mol_PE_mcmm` ([src/confsweeper.py](../src/confsweeper.py)): `aromatic_wells_deg: tuple = (-90.0, 0.0, 90.0, 180.0)`. Passed to `make_dihedral_kick_proposer` only when `dihedral_weight > 0`.
 - Threaded through `scripts/sampler_benchmark.py:_run_mcmm` adapter (5 thread-through sites following the Step-6 `dihedral_weight` pattern).
 - CLI: `--aromatic_wells` (bool flag) at `main()`. Defaults to off — the v0 sp3-only behaviour. When on, the v0.2 four-well set is used for aromatic bonds.
 - Optional escape hatch: `--aromatic_wells_deg "-90,0,90,180"` for explicit override; deferred to v0.3 unless v0.2 sweep shows the well set itself wants tuning.
+
+**Outcome (2026-06-15).** `get_mol_PE_mcmm` gained `aromatic_wells_deg: tuple | None = None` ([src/confsweeper.py:1122](../src/confsweeper.py#L1122)); the existing v0.1 default `None` preserves issue-#12 behaviour byte-for-byte. Threaded into the `make_dihedral_kick_proposer` call site (kwarg added, builds only when `dihedral_weight > 0` per the existing short-circuit). Docstring extended with both `rotamer_wells_deg` (sp3 fallback semantics clarified) and the new `aromatic_wells_deg` block pointing to the issue-#15 lock. `scripts/sampler_benchmark.py` threaded through end-to-end with 8 sites following the Step-6 / `p_rotamer_jump` pattern: `_run_mcmm` signature + body pass to `get_mol_PE_mcmm`, `run_one` signature + dispatcher, `--aromatic_wells/--no-aromatic_wells` click bool flag, `main()` signature, start-of-run log line (`aromatic_wells=on/off`), and `run_one(...)` call. The bool→tuple mapping happens in `main()` (`(-90.0, 0.0, 90.0, 180.0) if aromatic_wells else None`) so the boundary stays at the CLI; everything below threads as `aromatic_wells_deg: tuple | None` matching the `get_mol_PE_mcmm` / `make_dihedral_kick_proposer` signature. 3 new tests in `tests/test_get_mol_PE_mcmm.py` cover the integration thread-through: `test_mcmm_aromatic_wells_deg_default_none_passes_through_to_dihedral_factory` (spies the factory call, asserts `aromatic_wells_deg=None` is in the captured kwargs — regression guard against the kwarg silently dropping), `test_mcmm_aromatic_wells_deg_explicit_tuple_forwards_intact` (explicit `(-90, 0, 90, 180)` reaches the factory unchanged), `test_mcmm_aromatic_wells_deg_unused_when_dihedral_weight_zero` (zero-overhead short-circuit preserved — factory not called even when `aromatic_wells_deg` is set). Targeted run: 3/3 in 2.56 s. Full suite kicked off; predicted **429 passed, 8 skipped** (+3 over Step 2's 426/8).
 
 ### Step 4: Validation A — aromatic wells alone — pending
 
