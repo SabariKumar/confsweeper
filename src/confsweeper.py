@@ -1120,6 +1120,7 @@ def get_mol_PE_mcmm(
     p_rotamer_jump: float = 0.3,
     rotamer_wells_deg: tuple = (-60.0, 60.0, 180.0),
     aromatic_wells_deg: tuple | None = None,
+    skip_mmff_relax: bool = False,
     dihedral_weight_by_atom_count: bool = False,
     score_chunk_size: int = 500,
     e_window_kT: float = 5.0,
@@ -1233,6 +1234,15 @@ def get_mol_PE_mcmm(
             `(-90.0, 0.0, 90.0, 180.0)` to engage the issue-#15 v0.2
             aromatic-aware path. Only consulted when
             `dihedral_weight > 0`.
+        skip_mmff_relax: bool : v0.2 ablation toggle (issue #15). When
+            True, the dihedral-kick proposer's Stage-2 MMFF94 batched
+            relax is bypassed — rotated coordinates pass directly to
+            the MACE batched scorer. Diagnostic-grade ablation for the
+            MMFF snap-back hypothesis: MMFF can drag rotamer jumps back
+            across their barriers before MACE sees them, collapsing
+            the dihedral-kick's intended diversity onto the MMFF94 PES
+            instead of MACE's. Default False preserves v0.1 behaviour.
+            Only consulted when `dihedral_weight > 0`.
         dihedral_weight_by_atom_count: bool : v0 stub — when False
             (default) the dihedral kick uniformly samples side-chain
             rotatable bonds; True is a deferred follow-up
@@ -1413,6 +1423,7 @@ def get_mol_PE_mcmm(
             p_rotamer_jump=p_rotamer_jump,
             rotamer_wells_deg=rotamer_wells_deg,
             aromatic_wells_deg=aromatic_wells_deg,
+            skip_mmff_relax=skip_mmff_relax,
             score_chunk_size=score_chunk_size,
             mmff_backend=mmff_backend,
             dihedral_weight_by_atom_count=dihedral_weight_by_atom_count,

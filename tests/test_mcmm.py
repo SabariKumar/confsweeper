@@ -352,6 +352,7 @@ def test_make_dihedral_kick_proposer_aromatic_wells_default_none_preserves_v0():
         "n_rotamer_jumps",
         "n_relax_failures",
         "n_relax_successes",
+        "n_mmff_skipped",
     }
     assert set(proposer.stats.keys()) == expected_keys
 
@@ -2562,6 +2563,7 @@ def test_dihedral_kick_proposer_stats_initialised_and_increment():
         "n_rotamer_jumps": 0,
         "n_relax_failures": 0,
         "n_relax_successes": 0,
+        "n_mmff_skipped": 0,
     }
     with patched():
         proposer([seed_coords.clone() for _ in range(5)])
@@ -2632,6 +2634,183 @@ def test_dihedral_kick_proposer_preserves_backbone_atoms():
             assert torch.allclose(
                 new_coords[a_idx], seed_coords[a_idx], atol=1e-10
             ), f"backbone atom {a_idx} moved during a side-chain dihedral kick"
+
+
+# ---------------------------------------------------------------------------
+# skip_mmff_relax ablation (Step 5 / issue #15 v0.2)
+# ---------------------------------------------------------------------------
+
+
+def _make_dihedral_kick_with_mmff_spies(mol, **kwargs):
+    """Variant of `_make_dihedral_kick_with_mocks` that returns spy
+    MagicMocks for both MMFF backends so callers can assert on their
+    call counts. Same MACE mock pattern (returns sequential energies)."""
+    from contextlib import contextmanager
+    from unittest.mock import MagicMock
+    from unittest.mock import patch as _patch
+
+    from proposers import make_dihedral_kick_proposer
+
+    proposer = make_dihedral_kick_proposer(
+        mol,
+        hardware_opts=None,
+        calc=None,
+        **kwargs,
+    )
+
+    counter = [0]
+
+    def _mock_mace(_calc, ase_mols):
+        out = [(counter[0] + i) * 0.01 for i in range(len(ase_mols))]
+        counter[0] += len(ase_mols)
+        return out
+
+    gpu_spy = MagicMock(return_value=[[]])
+    cpu_spy = MagicMock()
+
+    @contextmanager
+    def patched():
+        with (
+            _patch("confsweeper._mace_batch_energies", side_effect=_mock_mace),
+            _patch(
+                "nvmolkit.mmffOptimization.MMFFOptimizeMoleculesConfs",
+                gpu_spy,
+            ),
+            _patch("rdkit.Chem.AllChem.MMFFOptimizeMolecule", cpu_spy),
+        ):
+            yield
+
+    return proposer, patched, gpu_spy, cpu_spy
+
+
+def test_dihedral_kick_skip_mmff_relax_default_false_calls_mmff_gpu():
+    """Default `skip_mmff_relax=False` must call the GPU MMFF backend
+    once per batched proposal step (issue-#12 / v0.1 behaviour
+    preserved)."""
+    mol = _cyclic_ala_ser_mol()
+    proposer, patched, gpu_spy, cpu_spy = _make_dihedral_kick_with_mmff_spies(
+        mol, seed=0
+    )
+    coords_list = [_seed_full_mol_coords(mol) for _ in range(3)]
+    with patched():
+        proposer(coords_list)
+    assert gpu_spy.call_count == 1, (
+        f"GPU MMFF must be called once per proposal step with default "
+        f"skip_mmff_relax=False; got {gpu_spy.call_count} calls"
+    )
+    assert cpu_spy.call_count == 0, "CPU MMFF should not be called on the gpu backend"
+
+
+def test_dihedral_kick_skip_mmff_relax_true_bypasses_mmff_gpu():
+    """With `skip_mmff_relax=True`, the Stage-2 MMFF GPU call MUST be
+    bypassed entirely — no MMFF, raw rotated coords pass to MACE
+    directly. This is the v0.2 ablation contract."""
+    mol = _cyclic_ala_ser_mol()
+    proposer, patched, gpu_spy, cpu_spy = _make_dihedral_kick_with_mmff_spies(
+        mol, seed=0, skip_mmff_relax=True
+    )
+    coords_list = [_seed_full_mol_coords(mol) for _ in range(3)]
+    with patched():
+        proposer(coords_list)
+    assert gpu_spy.call_count == 0, (
+        f"GPU MMFF must NOT be called with skip_mmff_relax=True; "
+        f"got {gpu_spy.call_count} calls"
+    )
+    assert cpu_spy.call_count == 0
+
+
+def test_dihedral_kick_skip_mmff_relax_true_bypasses_mmff_cpu():
+    """Parallel to the GPU bypass test: when `mmff_backend='cpu'` and
+    `skip_mmff_relax=True`, the per-conformer CPU MMFF loop must not run."""
+    mol = _cyclic_ala_ser_mol()
+    proposer, patched, gpu_spy, cpu_spy = _make_dihedral_kick_with_mmff_spies(
+        mol, seed=0, mmff_backend="cpu", skip_mmff_relax=True
+    )
+    coords_list = [_seed_full_mol_coords(mol) for _ in range(3)]
+    with patched():
+        proposer(coords_list)
+    assert gpu_spy.call_count == 0
+    assert cpu_spy.call_count == 0, (
+        f"CPU MMFF must NOT be called with skip_mmff_relax=True; "
+        f"got {cpu_spy.call_count} calls"
+    )
+
+
+def test_dihedral_kick_skip_mmff_relax_n_mmff_skipped_stat_increments():
+    """`stats['n_mmff_skipped']` must increment by `n_walkers` per batch
+    when the flag is on — used for diagnostic logging in Step 7's 2×2
+    ablation matrix to confirm the ablation actually fired."""
+    mol = _cyclic_ala_ser_mol()
+    proposer, patched, _, _ = _make_dihedral_kick_with_mmff_spies(
+        mol, seed=0, skip_mmff_relax=True
+    )
+    coords_list = [_seed_full_mol_coords(mol) for _ in range(4)]
+    with patched():
+        proposer(coords_list)
+    assert proposer.stats["n_mmff_skipped"] == 4, (
+        f"n_mmff_skipped should increment by n_walkers per batch; "
+        f"expected 4, got {proposer.stats['n_mmff_skipped']}"
+    )
+    with patched():
+        proposer(coords_list)
+    assert (
+        proposer.stats["n_mmff_skipped"] == 8
+    ), "n_mmff_skipped should accumulate across batches"
+
+
+def test_dihedral_kick_skip_mmff_relax_default_n_mmff_skipped_stays_zero():
+    """With the default `skip_mmff_relax=False`, the `n_mmff_skipped`
+    counter must remain at zero — the stat exists in the dict (so v0.1
+    callers reading .stats don't KeyError) but is never incremented."""
+    mol = _cyclic_ala_ser_mol()
+    proposer, patched, _, _ = _make_dihedral_kick_with_mmff_spies(mol, seed=0)
+    assert (
+        "n_mmff_skipped" in proposer.stats
+    ), "n_mmff_skipped key must always be present in stats dict, even when off"
+    coords_list = [_seed_full_mol_coords(mol) for _ in range(3)]
+    with patched():
+        proposer(coords_list)
+    assert (
+        proposer.stats["n_mmff_skipped"] == 0
+    ), "n_mmff_skipped must stay at 0 when skip_mmff_relax=False"
+
+
+def test_dihedral_kick_skip_mmff_relax_still_rejects_non_finite_mace():
+    """When MACE returns non-finite energies on the raw rotated geometry
+    (which can happen since unrelaxed rotations may carry minor strain),
+    the proposer must reject via `success=False` exactly as the
+    MMFF-on path does. Regression guard against the bypass branch
+    silently accepting NaN energies."""
+    from contextlib import contextmanager
+    from unittest.mock import patch as _patch
+
+    from proposers import make_dihedral_kick_proposer
+
+    mol = _cyclic_ala_ser_mol()
+    proposer = make_dihedral_kick_proposer(
+        mol, hardware_opts=None, calc=None, seed=0, skip_mmff_relax=True
+    )
+
+    def _nan_mace(_calc, ase_mols):
+        return [float("nan")] * len(ase_mols)
+
+    @contextmanager
+    def patched():
+        with _patch("confsweeper._mace_batch_energies", side_effect=_nan_mace):
+            yield
+
+    coords_list = [_seed_full_mol_coords(mol) for _ in range(3)]
+    with patched():
+        proposals = proposer(coords_list)
+    assert len(proposals) == 3
+    for new_coords, energy, det_j, success in proposals:
+        assert success is False, (
+            "Non-finite MACE energy must produce success=False even on "
+            "the skip_mmff_relax=True path"
+        )
+        assert det_j == 0.0
+    assert proposer.stats["n_relax_failures"] == 3
+    assert proposer.stats["n_relax_successes"] == 0
 
 
 def _stub_proposer(tag: str, n_atoms: int = _TEST_N_ATOMS):

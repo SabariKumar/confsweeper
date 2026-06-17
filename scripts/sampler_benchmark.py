@@ -151,6 +151,29 @@ def _maybe_dump_sdf(
     """
     if dump_sdf_dir is None:
         return
+    # Zero-basin runs (e.g. a sampler that crashed mid-run and the
+    # run_one try/except continue path returned an empty energies list)
+    # used to silently write a 0-byte SDF here — opening Chem.SDWriter
+    # and immediately closing it produces an empty file that
+    # downstream tools cannot read (e.g.
+    # `union_basin_count._load_basin_sdf` calls
+    # `Chem.SDMolSupplier(..., removeHs=False)` which raises
+    # `OSError: File error: Invalid input file` on the empty file).
+    # Surfaced by the v0.2 Step-4 sweep when a CUDA-OOM-killed
+    # cremp_sharp sample wrote two empty SDFs that then crashed the
+    # downstream union_basin_count.py step. Fix: skip the write
+    # entirely, log a warning so the no-basins state is visible, and
+    # let downstream tools (which all glob by filename) simply miss
+    # the file rather than crash on a malformed one.
+    if not conf_ids:
+        logger.warning(
+            "  → skipping SDF dump for %s sampler=%s — zero basins (likely "
+            "a crashed or empty sampler run); writing a 0-byte SDF would "
+            "crash downstream loaders",
+            peptide_id,
+            sampler,
+        )
+        return
     dump_sdf_dir = Path(dump_sdf_dir)
     dump_sdf_dir.mkdir(parents=True, exist_ok=True)
     safe_id = peptide_id.replace(":", "_").replace("/", "_")
@@ -283,6 +306,7 @@ def _run_mcmm(
     dihedral_weight: float = 0.0,
     p_rotamer_jump: float = 0.3,
     aromatic_wells_deg: tuple | None = None,
+    skip_mmff_relax: bool = False,
     e_window_kT: float = 5.0,
     saunders_exponent: float = 0.5,
 ) -> list[float]:
@@ -360,6 +384,7 @@ def _run_mcmm(
         dihedral_weight=dihedral_weight,
         p_rotamer_jump=p_rotamer_jump,
         aromatic_wells_deg=aromatic_wells_deg,
+        skip_mmff_relax=skip_mmff_relax,
         e_window_kT=e_window_kT,
         saunders_exponent=saunders_exponent,
     )
@@ -527,6 +552,7 @@ def run_one(
     dihedral_weight: float = 0.0,
     p_rotamer_jump: float = 0.3,
     aromatic_wells_deg: tuple | None = None,
+    skip_mmff_relax: bool = False,
     e_window_kT: float = 5.0,
     saunders_exponent: float = 0.5,
 ) -> dict:
@@ -565,6 +591,7 @@ def run_one(
         runner_kwargs["dihedral_weight"] = dihedral_weight
         runner_kwargs["p_rotamer_jump"] = p_rotamer_jump
         runner_kwargs["aromatic_wells_deg"] = aromatic_wells_deg
+        runner_kwargs["skip_mmff_relax"] = skip_mmff_relax
         runner_kwargs["e_window_kT"] = e_window_kT
         runner_kwargs["saunders_exponent"] = saunders_exponent
     energies_eV = runner(
@@ -713,6 +740,19 @@ def run_one(
     "unchanged. Ignored when --dihedral_weight=0.",
 )
 @click.option(
+    "--skip_mmff_relax/--no-skip_mmff_relax",
+    "skip_mmff_relax",
+    default=False,
+    show_default=True,
+    help="Dihedral-kick proposer ablation toggle (issue #15 / v0.2): "
+    "when on, the Stage-2 MMFF94 batched relax is bypassed and "
+    "rotated coordinates pass directly to the MACE scorer. "
+    "Diagnostic-grade ablation for the MMFF snap-back hypothesis "
+    "documented in docs/dihedral_kick_v0_2_plan.md. Defaults off "
+    "so issue-#12 callers are unchanged. Ignored when "
+    "--dihedral_weight=0.",
+)
+@click.option(
     "--e_window_kT",
     "e_window_kT",
     type=float,
@@ -749,6 +789,7 @@ def main(
     dihedral_weight: float,
     p_rotamer_jump: float,
     aromatic_wells: bool,
+    skip_mmff_relax: bool,
     e_window_kT: float,
     saunders_exponent: float,
 ) -> None:
@@ -815,7 +856,7 @@ def main(
     logger.info(
         "samplers=%s  n_seeds=%d  dedup_modes=%s  cartesian_weight=%.2f  "
         "dihedral_weight=%.2f  p_rotamer_jump=%.2f  aromatic_wells=%s  "
-        "e_window_kT=%.2f  saunders_exponent=%.2f",
+        "skip_mmff_relax=%s  e_window_kT=%.2f  saunders_exponent=%.2f",
         sampler_list,
         n_seeds,
         mode_list,
@@ -823,6 +864,7 @@ def main(
         dihedral_weight,
         p_rotamer_jump,
         "on" if aromatic_wells else "off",
+        "on" if skip_mmff_relax else "off",
         e_window_kT,
         saunders_exponent,
     )
@@ -880,6 +922,7 @@ def main(
                         dihedral_weight=dihedral_weight,
                         p_rotamer_jump=p_rotamer_jump,
                         aromatic_wells_deg=aromatic_wells_deg,
+                        skip_mmff_relax=skip_mmff_relax,
                         e_window_kT=e_window_kT,
                         saunders_exponent=saunders_exponent,
                     )

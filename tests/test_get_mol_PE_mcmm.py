@@ -960,3 +960,141 @@ def test_mcmm_aromatic_wells_deg_unused_when_dihedral_weight_zero():
         "make_dihedral_kick_proposer was constructed despite "
         "dihedral_weight=0.0 — the zero-overhead short-circuit is broken"
     )
+
+
+# ---------------------------------------------------------------------------
+# skip_mmff_relax kwarg threading (Step 6 / issue #15 v0.2)
+# ---------------------------------------------------------------------------
+
+
+def test_mcmm_skip_mmff_relax_default_false_passes_through_to_dihedral_factory():
+    """Default `skip_mmff_relax=False` on get_mol_PE_mcmm must forward
+    as `skip_mmff_relax=False` to make_dihedral_kick_proposer. Issue-#12
+    (v0.1) byte-for-byte compatibility check."""
+    captured_kwargs = {}
+
+    def _spy_dihedral_factory(mol, **kwargs):
+        del mol
+        captured_kwargs.update(kwargs)
+        return _stub_proposer_factory(None, None, None)
+
+    mock_mace = _make_seq_mock_mace()
+    with (
+        patch("confsweeper.embed.EmbedMolecules", side_effect=_mock_etkdg_embed),
+        patch("confsweeper._mace_batch_energies", side_effect=mock_mace),
+        patch(
+            "nvmolkit.mmffOptimization.MMFFOptimizeMoleculesConfs",
+            return_value=[[]],
+        ),
+        patch("confsweeper.make_mcmm_proposer", side_effect=_stub_proposer_factory),
+        patch(
+            "proposers.make_dihedral_kick_proposer",
+            side_effect=_spy_dihedral_factory,
+        ),
+    ):
+        get_mol_PE_mcmm(
+            TEST_SMILES,
+            get_embed_params(),
+            hardware_opts=None,
+            calc=MagicMock(),
+            n_walkers_per_temp=1,
+            n_temperatures=2,
+            n_steps=1,
+            dihedral_weight=0.5,
+            rmsd_threshold=0.0,
+        )
+    assert "skip_mmff_relax" in captured_kwargs, (
+        "make_dihedral_kick_proposer did not receive skip_mmff_relax kwarg; "
+        "Step-6 thread-through at confsweeper.py is broken"
+    )
+    assert captured_kwargs["skip_mmff_relax"] is False, (
+        f"default skip_mmff_relax should forward as False; got "
+        f"{captured_kwargs['skip_mmff_relax']!r}"
+    )
+
+
+def test_mcmm_skip_mmff_relax_true_forwards_intact():
+    """Explicit `skip_mmff_relax=True` on get_mol_PE_mcmm must reach
+    make_dihedral_kick_proposer unchanged. Regression guard for the
+    Step-6 wiring."""
+    captured_kwargs = {}
+
+    def _spy_dihedral_factory(mol, **kwargs):
+        del mol
+        captured_kwargs.update(kwargs)
+        return _stub_proposer_factory(None, None, None)
+
+    mock_mace = _make_seq_mock_mace()
+    with (
+        patch("confsweeper.embed.EmbedMolecules", side_effect=_mock_etkdg_embed),
+        patch("confsweeper._mace_batch_energies", side_effect=mock_mace),
+        patch(
+            "nvmolkit.mmffOptimization.MMFFOptimizeMoleculesConfs",
+            return_value=[[]],
+        ),
+        patch("confsweeper.make_mcmm_proposer", side_effect=_stub_proposer_factory),
+        patch(
+            "proposers.make_dihedral_kick_proposer",
+            side_effect=_spy_dihedral_factory,
+        ),
+    ):
+        get_mol_PE_mcmm(
+            TEST_SMILES,
+            get_embed_params(),
+            hardware_opts=None,
+            calc=MagicMock(),
+            n_walkers_per_temp=1,
+            n_temperatures=2,
+            n_steps=1,
+            dihedral_weight=0.5,
+            skip_mmff_relax=True,
+            rmsd_threshold=0.0,
+        )
+    assert captured_kwargs.get("skip_mmff_relax") is True, (
+        "Step-6 thread-through dropped or mutated skip_mmff_relax; "
+        f"got {captured_kwargs.get('skip_mmff_relax')!r}"
+    )
+
+
+def test_mcmm_skip_mmff_relax_unused_when_dihedral_weight_zero():
+    """When `dihedral_weight=0.0`, make_dihedral_kick_proposer must not
+    be constructed at all (zero-overhead path). The skip_mmff_relax
+    value should therefore be irrelevant — the factory simply isn't
+    called regardless of what skip_mmff_relax is set to."""
+    dihedral_factory_calls = {"n": 0}
+
+    def _spy_dihedral_factory(mol, **kwargs):
+        del mol, kwargs
+        dihedral_factory_calls["n"] += 1
+        return _stub_proposer_factory(None, None, None)
+
+    mock_mace = _make_seq_mock_mace()
+    with (
+        patch("confsweeper.embed.EmbedMolecules", side_effect=_mock_etkdg_embed),
+        patch("confsweeper._mace_batch_energies", side_effect=mock_mace),
+        patch(
+            "nvmolkit.mmffOptimization.MMFFOptimizeMoleculesConfs",
+            return_value=[[]],
+        ),
+        patch("confsweeper.make_mcmm_proposer", side_effect=_stub_proposer_factory),
+        patch(
+            "proposers.make_dihedral_kick_proposer",
+            side_effect=_spy_dihedral_factory,
+        ),
+    ):
+        get_mol_PE_mcmm(
+            TEST_SMILES,
+            get_embed_params(),
+            hardware_opts=None,
+            calc=MagicMock(),
+            n_walkers_per_temp=1,
+            n_temperatures=2,
+            n_steps=1,
+            dihedral_weight=0.0,
+            skip_mmff_relax=True,
+            rmsd_threshold=0.0,
+        )
+    assert dihedral_factory_calls["n"] == 0, (
+        "make_dihedral_kick_proposer was constructed despite "
+        "dihedral_weight=0.0 — the zero-overhead short-circuit is broken"
+    )

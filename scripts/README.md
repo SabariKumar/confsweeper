@@ -90,9 +90,10 @@ list of MACE energies for the basin centroids. Currently:
   saunders_exponent=1.0`); the in-code function defaults preserve the
   original Saunders 1990 / 5 kT conventions.
 
-**MCMM proposer-mix CLI flags (issue #12).** Three knobs exposed at the
-CLI for the dihedral-kick proposer; each defaults to "off / locked" so
-existing benchmark commands keep their issue-#10 behaviour:
+**MCMM proposer-mix CLI flags (issue #12 + issue #15).** Five knobs
+exposed at the CLI for the dihedral-kick proposer; each defaults to
+"off / locked" so existing benchmark commands keep their issue-#10
+behaviour:
 
 - `--cartesian_weight FLOAT` (default `0.0`) — routing weight for the
   GOAT-style Cartesian kick alongside DBT. Step 12 of
@@ -104,23 +105,64 @@ existing benchmark commands keep their issue-#10 behaviour:
 - `--p_rotamer_jump FLOAT` (default `0.3`) — probability per walker per
   step of the dihedral kick taking a discrete rotamer-jump
   (sampled uniformly from `rotamer_wells_deg`) instead of a Gaussian
-  Δχ. Exposed for the Step-7 snap-back diagnostic; ignored when
+  Δχ. Exposed for the issue-#12 phase-2 snap-back diagnostic; ignored
+  when `--dihedral_weight=0`.
+- `--aromatic_wells / --no-aromatic_wells` (default off) — when on,
+  side-chain rotatable bonds whose downstream endpoint is aromatic
+  (e.g. NMe-Trp χ₂) get rotamer-jump wells at `(-90, 0, 90, 180)`
+  degrees instead of the sp3-χ₁ default `(-60, 60, 180)`. Issue #15.
+  Ignored when `--dihedral_weight=0`.
+- `--skip_mmff_relax / --no-skip_mmff_relax` (default off) — when on,
+  the dihedral-kick proposer's Stage-2 MMFF94 batched relax is
+  bypassed; rotated coordinates pass directly to MACE. Diagnostic-grade
+  ablation for the MMFF snap-back hypothesis. Issue #15. Ignored when
   `--dihedral_weight=0`.
 
-**Production tuning lock (issue #12 closes, 2026-06-15).** The 4-cell
-phase-1 sweep at n_seeds=5000 + 2-run phase-2 sweep at n_seeds=10000
-(driver scripts `scripts/sweep_step7.sh`, `scripts/sweep_step7_phase2.sh`)
+**Production tuning lock — issue #12 (2026-06-15).** The issue-#12
+phase-1 sweep at n_seeds=5000 (driver `scripts/sweep_step7.sh`) plus
+the phase-2 sweep at n_seeds=10000 (`scripts/sweep_step7_phase2.sh`)
 identified `--cartesian_weight=0.33 --dihedral_weight=0.33
---p_rotamer_jump=0.30` as the production mix. On `cremp_typical`
+--p_rotamer_jump=0.30` as the v0.1 production mix. On `cremp_typical`
 (`t.I.G.N`) this lifts Boltzmann coverage from `0.83` (DBT + Cart at the
 same budget) to **`0.991`** — 20/22 ceiling basins covered, `max_missed_bw
-= 0.006`. Raising `--p_rotamer_jump` to `0.70` *regresses* cremp_typical
-to `0.971` (too few Gaussian refinement steps), so the lock is precise.
-On `cremp_sharp` (`S.S.N.MeW.MeA.MeN`) the mix does NOT recover the
-dominant ceiling basin at any tested setting; the residual is documented
-as a v0.2 follow-up (issue #13: aromatic-aware rotamer wells, no-MMFF
-ablation). See `docs/dihedral_kick_plan.md` Step-7 Findings for the
-full empirical record.
+= 0.006`. On `cremp_sharp` (`S.S.N.MeW.MeA.MeN`) the v0.1 mix does NOT
+recover the dominant ceiling basin at any tested setting; that residual
+motivated issue #15 (v0.2).
+
+**Production tuning lock — issue #15 / v0.2 (2026-06-17).** The
+2×2 ablation matrix at n_seeds=10000 (driver `scripts/sweep_v0_2_step4.sh`
+for cells B.1/B.2 + `scripts/sweep_v0_2_step7.sh` for B.3/B.4) found a
+non-linear synergy: each fix alone regresses the v0.1 baseline of
+0.991 (aromatic_wells alone → 0.971, skip_mmff_relax alone → 0.966)
+but **together they synergize to a new record of `0.997` on
+cremp_typical** (21/22 basins, `max_missed_bw=0.003`). The v0.2 mix
+layers `--aromatic_wells --skip_mmff_relax` on top of the v0.1 flags.
+On `cremp_sharp` all four 2×2 cells still leave `coverage_bw_ceiling=
+0.000` with `max_missed_bw=0.724023` identical — but the v0.2 cell
+drove ~3000× more new-basin thermodynamic weight than the v0.1
+baseline (`new_mass` rose from 2.8 × 10⁻⁶ to 8.8 × 10⁻³), indicating
+the proposer is actively useful on cremp_sharp; the dominant basin is
+just structurally outside reach. Residual escalates to v0.3 (concerted
+χ₁ + χ₂ rotation). See `docs/dihedral_kick_v0_2_plan.md` Step 7
+Findings for the full empirical record.
+
+**Production-mix invocation:**
+
+```
+# v0.1 (issue #12) production mix:
+pixi run python scripts/sampler_benchmark.py \
+  --samplers mcmm --n_seeds 10000 \
+  --cartesian_weight 0.33 --dihedral_weight 0.33 --p_rotamer_jump 0.30 \
+  ...
+
+# v0.2 (issue #15) production mix — strict improvement on cremp_typical
+# (0.991 → 0.997), no regression on cremp_sharp:
+pixi run python scripts/sampler_benchmark.py \
+  --samplers mcmm --n_seeds 10000 \
+  --cartesian_weight 0.33 --dihedral_weight 0.33 --p_rotamer_jump 0.30 \
+  --aromatic_wells --skip_mmff_relax \
+  ...
+```
 
 Future entries (CREST-fast, independent-T MCMM) plug in as a new adapter
 function plus a single dispatch-table key. The benchmark protocol stays

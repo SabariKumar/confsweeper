@@ -720,6 +720,7 @@ def make_dihedral_kick_proposer(
     aromatic_wells_deg: tuple | None = None,
     score_chunk_size: int = 500,
     mmff_backend: str = "gpu",
+    skip_mmff_relax: bool = False,
     dihedral_weight_by_atom_count: bool = False,
     seed: int = 0,
 ):
@@ -755,7 +756,9 @@ def make_dihedral_kick_proposer(
       2. **Batched MMFF** (GPU, one call): every rotated candidate
          lives as a conformer on a shared throwaway mol; run
          `nvmolkit.mmffOptimization.MMFFOptimizeMoleculesConfs` for
-         in-place minimisation.
+         in-place minimisation. When `skip_mmff_relax=True` (issue
+         #15 / v0.2 no-MMFF ablation) this stage is bypassed entirely
+         and Stage 3 (MACE) scores the raw rotated geometry directly.
       3. **Batched MACE** (GPU, chunked) via `_mace_batch_energies`.
       4. **Return** `(coords_tensor, energy_float, det_j=1.0,
          success=True)` per walker. A single open-tree dihedral
@@ -823,6 +826,22 @@ def make_dihedral_kick_proposer(
             (default 500).
         mmff_backend: str : 'gpu' (nvmolkit batched CUDA, default) or
             'cpu' (RDKit serial).
+        skip_mmff_relax: bool : v0.2 ablation toggle (issue #15). When
+            True, the Stage-2 MMFF94 batched relax is bypassed entirely
+            — the rotated coordinates pass directly to the Stage-3
+            MACE batched scorer. Diagnostic-grade ablation for the
+            MMFF-snap-back hypothesis flagged in this docstring's
+            "Known risk" section: MMFF can drag rotamer jumps back
+            across their barriers before MACE sees them, collapsing
+            the dihedral-kick's intended diversity onto the MMFF94 PES
+            instead of MACE's. Default False preserves v0.1 / Step-2
+            behaviour. Note: skipping MMFF may leave neighbouring
+            atoms in mildly strained Cartesian positions on rotamer
+            jumps; if MACE-acceptance with `skip_mmff_relax=True`
+            drops below ~5 % the ablation is uninterpretable and a
+            v0.3 partial-MMFF candidate becomes next-up. See
+            `docs/dihedral_kick_v0_2_plan.md` Findings 2026-06-15 for
+            the rationale.
         dihedral_weight_by_atom_count: bool : v0 stub — when False
             (default, locked Step 1 choice), pick a side-chain dihedral
             uniformly at random. The True branch (bias toward bulky
@@ -899,6 +918,7 @@ def make_dihedral_kick_proposer(
         "n_rotamer_jumps": 0,
         "n_relax_failures": 0,
         "n_relax_successes": 0,
+        "n_mmff_skipped": 0,
     }
 
     def batch_propose_fn(coords_list):
@@ -940,8 +960,22 @@ def make_dihedral_kick_proposer(
                 new_chi_deg = current + delta_deg
             rdMolTransforms.SetDihedralDeg(conf, a, b, c, d, new_chi_deg)
 
-        # Stage 2: batched MMFF on the throwaway mol.
-        if mmff_backend == "gpu":
+        # Stage 2: batched MMFF on the throwaway mol. When
+        # `skip_mmff_relax=True` (issue #15 / v0.2 ablation), bypass the
+        # MMFF94 step entirely and let Stage 3 (MACE) score the raw
+        # rotated geometry directly. This is the no-MMFF ablation called
+        # for by the issue-#12 Step-7 phase 2 Findings: MMFF can drag
+        # rotamer jumps back across their barriers before MACE sees
+        # them, collapsing the dihedral-kick's intended diversity onto
+        # the MMFF94 PES instead of MACE's. Skipping MMFF is
+        # diagnostic-grade — raw-rotation geometries may carry minor
+        # bond-stretch strain MMFF would have fixed; if MACE-acceptance
+        # drops below ~5 % with the flag on, the ablation is
+        # uninterpretable for the wrong reason and the v0.3
+        # partial-MMFF candidate becomes next-up.
+        if skip_mmff_relax:
+            stats["n_mmff_skipped"] += len(pre_mmff_conf_ids)
+        elif mmff_backend == "gpu":
             from nvmolkit.mmffOptimization import MMFFOptimizeMoleculesConfs
 
             MMFFOptimizeMoleculesConfs([throwaway], hardwareOptions=hardware_opts)
