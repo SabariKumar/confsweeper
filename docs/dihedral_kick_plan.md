@@ -380,4 +380,23 @@ cremp_sharp (`S.S.N.MeW.MeA.MeN`):
 - `results/sweep_step7_{headline_n10k_pjump30,diagnostic_n10k_pjump70}/*_mcmm.sdf` — phase-2 basin SDFs
 - `results/sweep_step7_logs/{headline_n10k_pjump30,diagnostic_n10k_pjump70}_{sampler,coverage}.log` — phase-2 logs
 
-Step 7 closes here. Step 8 (documentation) starts with this entry as the empirical record to compress into `src/README.md`, `scripts/README.md`, and a dated `docs/mcmm_plan.md` Findings cross-reference; the cremp_sharp v0.2 follow-up issue is drafted alongside (issue #13).
+Step 7 closes here. Step 8 (documentation) starts with this entry as the empirical record to compress into `src/README.md`, `scripts/README.md`, and a dated `docs/mcmm_plan.md` Findings cross-reference; the cremp_sharp v0.2 follow-up issue is drafted alongside (filed as issue #15, not #13 as initially scoped).
+
+### Update: cremp_sharp v0.2 outcome (2026-06-17)
+
+Cross-reference to `docs/dihedral_kick_v0_2_plan.md` Step 7 Findings (2026-06-17). The v0.2 work (issue #15) added two `make_dihedral_kick_proposer` kwargs attacking the cremp_sharp residual flagged above: (a) per-bond aromatic-aware rotamer wells `(-90, 0, 90, 180)` for bonds whose downstream endpoint is aromatic (NMe-Trp χ₂); (b) `skip_mmff_relax: bool` ablation that bypasses Stage-2 MMFF94 batched relax.
+
+**Cremp_sharp residual status.** The strict reading of the v0.2 sweep is that the cremp_sharp residual is NOT closed — across all four cells of the 2×2 ablation matrix at n_seeds=10000, `coverage_bw_ceiling = 0.000` with `max_missed_bw = 0.724023` identical to 6 decimal places. The same single dominant ceiling basin (72 % of the 298 K Boltzmann population) is missed at every v0.2 setting. **Per the v0.2 plan's locked Step-1 decomposition logic, this fires the v0.3 trigger** ("if all four stay at zero, the cremp_sharp failure is structural beyond what v0.2 can fix; v0.3 escalates to e.g. concerted χ₁ + χ₂ rotation").
+
+**But v0.2 IS actively useful on cremp_sharp.** The same B.4 cell that delivers the cremp_typical headline drove `new_mass = 8.8 × 10⁻³` on cremp_sharp — ~3000× the v0.1 baseline (2.8 × 10⁻⁶) and 4 orders of magnitude above any prior cremp_sharp cell. The proposer is discovering thermodynamically-real basins; they just aren't *the* dominant ceiling basin.
+
+**Cremp_typical bonus.** As an unintended-but-welcome consequence, the v0.2 production mix `--aromatic_wells --skip_mmff_relax` lifts cremp_typical from `0.991` → `0.997` — a new branch record, +0.6 absolute pts over this v0.1 plan's headline. Each fix alone REGRESSES cremp_typical (B.2 = 0.971, B.3 = 0.966); the synergy is non-linear.
+
+**Updated v0.1 vs v0.2 status of every cremp_sharp follow-up trigger from this plan's Step-1 lock:**
+
+- ✓ **Aromatic-χ₂ rotamer-well mismatch** (this plan's Step-1 follow-up trigger C): SHIPPED in v0.2 Step 2 — `aromatic_wells_deg` per-bond well-set lookup. Implemented but NOT sufficient to close cremp_sharp alone.
+- ✓ **No-MMFF ablation** (this plan's Risk callout + Deferred follow-up): SHIPPED in v0.2 Step 5 — `skip_mmff_relax: bool` kwarg. Also not sufficient alone; synergizes with aromatic wells on cremp_typical.
+- ⏭ **Raise `p_rotamer_jump` to 0.5+** (this plan's Step-1 follow-up trigger A): no further work needed; the v0.2 sweep at the locked `p_rotamer_jump=0.30` is the production lock. The phase-2 diagnostic at `p=0.70` had already shown raising it regresses cremp_typical, and v0.2's synergy comes from the well + MMFF axes, not the p_rotamer_jump axis.
+- ⏭ **Concerted χ₁ + χ₂ rotation** (this plan's Deferred follow-up): escalates to v0.3 per the v0.2 trigger. Tracked in the v0.3 follow-up issue (drafted alongside the v0.2 PR).
+
+This plan stays the empirical record for issue #12 / v0.1. v0.2 results live in `docs/dihedral_kick_v0_2_plan.md`. v0.3 will live in its own plan doc when the new branch is cut.

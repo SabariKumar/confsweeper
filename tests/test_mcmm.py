@@ -30,7 +30,11 @@ from mcmm import (
     make_composite_proposer,
     make_mcmm_proposer,
 )
-from proposers import _enumerate_side_chain_dihedrals, make_default_mcmm_composite
+from proposers import (
+    _classify_rotamer_wells,
+    _enumerate_side_chain_dihedrals,
+    make_default_mcmm_composite,
+)
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -257,6 +261,122 @@ def test_enumerate_side_chain_dihedrals_returns_int_quadruples():
         assert len(entry) == 4
         for x in entry:
             assert isinstance(x, int)
+
+
+# ---------------------------------------------------------------------------
+# _classify_rotamer_wells (v0.2 — issue #15)
+# ---------------------------------------------------------------------------
+
+
+_SP3_WELLS = (-60.0, 60.0, 180.0)
+_AROMATIC_WELLS = (-90.0, 0.0, 90.0, 180.0)
+
+
+def test_classify_rotamer_wells_none_returns_all_sp3():
+    """`aromatic_wells_deg=None` is the v0.1 fallback — every bond gets
+    the sp3 well set regardless of atom-c aromaticity. This is what
+    `make_dihedral_kick_proposer` does by default, so existing issue-#12
+    callers see no change."""
+    mol = _cremp_sharp_mol()
+    dihedrals = _enumerate_side_chain_dihedrals(mol)
+    result = _classify_rotamer_wells(mol, dihedrals, None, _SP3_WELLS)
+    assert len(result) == len(dihedrals)
+    expected = np.asarray(_SP3_WELLS, dtype=np.float64)
+    for arr in result:
+        assert np.allclose(arr, expected)
+
+
+def test_classify_rotamer_wells_assigns_aromatic_wells_to_aromatic_c_atoms():
+    """For each bond, the well set MUST match the atom-c aromaticity flag
+    when `aromatic_wells_deg` is given. cremp_sharp contains exactly one
+    aromatic side chain (NMe-Trp's indole) so the test isn't vacuous:
+    at least one bond must get the aromatic well set."""
+    mol = _cremp_sharp_mol()
+    dihedrals = _enumerate_side_chain_dihedrals(mol)
+    result = _classify_rotamer_wells(mol, dihedrals, _AROMATIC_WELLS, _SP3_WELLS)
+    assert len(result) == len(dihedrals)
+    sp3_arr = np.asarray(_SP3_WELLS, dtype=np.float64)
+    arom_arr = np.asarray(_AROMATIC_WELLS, dtype=np.float64)
+    n_aromatic = 0
+    n_sp3 = 0
+    for (a, b, c, d), arr in zip(dihedrals, result):
+        if mol.GetAtomWithIdx(c).GetIsAromatic():
+            assert np.allclose(arr, arom_arr), (
+                f"bond ({a},{b},{c},{d}) has aromatic c={c} but got "
+                f"non-aromatic well set"
+            )
+            n_aromatic += 1
+        else:
+            assert np.allclose(arr, sp3_arr), (
+                f"bond ({a},{b},{c},{d}) has non-aromatic c={c} but got "
+                f"aromatic well set"
+            )
+            n_sp3 += 1
+    assert n_aromatic >= 1, (
+        "expected at least one aromatic-anchored bond on cremp_sharp "
+        "(NMe-Trp χ₂); got zero — the aromatic-detection path is "
+        "not being exercised"
+    )
+    assert n_sp3 >= 1, (
+        "expected at least one sp3 bond on cremp_sharp; got zero — the "
+        "test fixture may have lost its sp3 side chains"
+    )
+
+
+def test_classify_rotamer_wells_empty_dihedrals_returns_empty_list():
+    """Edge case: zero dihedrals (e.g. cyclo-Ala homopolymer) — the
+    classifier returns an empty list regardless of aromatic_wells_deg.
+    The factory rejects empty `dihedrals` upstream, but the helper
+    should still behave cleanly."""
+    mol = _cycloala_mol(4)
+    dihedrals = _enumerate_side_chain_dihedrals(mol)
+    assert dihedrals == [], "cyclo(Ala)4 should have no rotatable side chains"
+    result_off = _classify_rotamer_wells(mol, dihedrals, None, _SP3_WELLS)
+    result_on = _classify_rotamer_wells(mol, dihedrals, _AROMATIC_WELLS, _SP3_WELLS)
+    assert result_off == []
+    assert result_on == []
+
+
+def test_make_dihedral_kick_proposer_aromatic_wells_default_none_preserves_v0():
+    """Default `aromatic_wells_deg=None` produces a proposer that matches
+    the v0.1 behaviour: the rotamer-jump branch samples uniformly from
+    the sp3 `rotamer_wells_deg` regardless of bond aromaticity. We verify
+    this at the factory level by asserting construction succeeds with
+    the default and the proposer's stats shape matches v0.1."""
+    mol = _cyclic_ala_ser_mol()
+    proposer, _ = _make_dihedral_kick_with_mocks(mol, seed=0)
+    assert hasattr(proposer, "stats")
+    expected_keys = {
+        "n_proposed",
+        "n_gaussian_steps",
+        "n_rotamer_jumps",
+        "n_relax_failures",
+        "n_relax_successes",
+        "n_mmff_skipped",
+    }
+    assert set(proposer.stats.keys()) == expected_keys
+
+
+def test_make_dihedral_kick_proposer_aromatic_wells_empty_raises():
+    """Validation: explicit `aromatic_wells_deg=()` with
+    `p_rotamer_jump > 0` is a configuration error — there are no wells
+    to sample from on aromatic bonds, which would silently degrade to a
+    runtime IndexError. Raise at factory time."""
+    mol = _cyclic_ala_ser_mol()
+    with pytest.raises(ValueError, match="aromatic_wells_deg must be non-empty"):
+        _make_dihedral_kick_with_mocks(mol, seed=0, aromatic_wells_deg=())
+
+
+def test_make_dihedral_kick_proposer_aromatic_wells_empty_at_pjump_zero_ok():
+    """`p_rotamer_jump=0` means the rotamer-jump branch is never taken,
+    so empty `aromatic_wells_deg` is benign. Should construct without
+    error (parallel to the existing rotamer_wells_deg-empty-at-pjump-zero
+    contract)."""
+    mol = _cyclic_ala_ser_mol()
+    proposer, _ = _make_dihedral_kick_with_mocks(
+        mol, seed=0, p_rotamer_jump=0.0, aromatic_wells_deg=()
+    )
+    assert hasattr(proposer, "stats")
 
 
 # ---------------------------------------------------------------------------
@@ -2443,6 +2563,7 @@ def test_dihedral_kick_proposer_stats_initialised_and_increment():
         "n_rotamer_jumps": 0,
         "n_relax_failures": 0,
         "n_relax_successes": 0,
+        "n_mmff_skipped": 0,
     }
     with patched():
         proposer([seed_coords.clone() for _ in range(5)])
@@ -2513,6 +2634,183 @@ def test_dihedral_kick_proposer_preserves_backbone_atoms():
             assert torch.allclose(
                 new_coords[a_idx], seed_coords[a_idx], atol=1e-10
             ), f"backbone atom {a_idx} moved during a side-chain dihedral kick"
+
+
+# ---------------------------------------------------------------------------
+# skip_mmff_relax ablation (Step 5 / issue #15 v0.2)
+# ---------------------------------------------------------------------------
+
+
+def _make_dihedral_kick_with_mmff_spies(mol, **kwargs):
+    """Variant of `_make_dihedral_kick_with_mocks` that returns spy
+    MagicMocks for both MMFF backends so callers can assert on their
+    call counts. Same MACE mock pattern (returns sequential energies)."""
+    from contextlib import contextmanager
+    from unittest.mock import MagicMock
+    from unittest.mock import patch as _patch
+
+    from proposers import make_dihedral_kick_proposer
+
+    proposer = make_dihedral_kick_proposer(
+        mol,
+        hardware_opts=None,
+        calc=None,
+        **kwargs,
+    )
+
+    counter = [0]
+
+    def _mock_mace(_calc, ase_mols):
+        out = [(counter[0] + i) * 0.01 for i in range(len(ase_mols))]
+        counter[0] += len(ase_mols)
+        return out
+
+    gpu_spy = MagicMock(return_value=[[]])
+    cpu_spy = MagicMock()
+
+    @contextmanager
+    def patched():
+        with (
+            _patch("confsweeper._mace_batch_energies", side_effect=_mock_mace),
+            _patch(
+                "nvmolkit.mmffOptimization.MMFFOptimizeMoleculesConfs",
+                gpu_spy,
+            ),
+            _patch("rdkit.Chem.AllChem.MMFFOptimizeMolecule", cpu_spy),
+        ):
+            yield
+
+    return proposer, patched, gpu_spy, cpu_spy
+
+
+def test_dihedral_kick_skip_mmff_relax_default_false_calls_mmff_gpu():
+    """Default `skip_mmff_relax=False` must call the GPU MMFF backend
+    once per batched proposal step (issue-#12 / v0.1 behaviour
+    preserved)."""
+    mol = _cyclic_ala_ser_mol()
+    proposer, patched, gpu_spy, cpu_spy = _make_dihedral_kick_with_mmff_spies(
+        mol, seed=0
+    )
+    coords_list = [_seed_full_mol_coords(mol) for _ in range(3)]
+    with patched():
+        proposer(coords_list)
+    assert gpu_spy.call_count == 1, (
+        f"GPU MMFF must be called once per proposal step with default "
+        f"skip_mmff_relax=False; got {gpu_spy.call_count} calls"
+    )
+    assert cpu_spy.call_count == 0, "CPU MMFF should not be called on the gpu backend"
+
+
+def test_dihedral_kick_skip_mmff_relax_true_bypasses_mmff_gpu():
+    """With `skip_mmff_relax=True`, the Stage-2 MMFF GPU call MUST be
+    bypassed entirely — no MMFF, raw rotated coords pass to MACE
+    directly. This is the v0.2 ablation contract."""
+    mol = _cyclic_ala_ser_mol()
+    proposer, patched, gpu_spy, cpu_spy = _make_dihedral_kick_with_mmff_spies(
+        mol, seed=0, skip_mmff_relax=True
+    )
+    coords_list = [_seed_full_mol_coords(mol) for _ in range(3)]
+    with patched():
+        proposer(coords_list)
+    assert gpu_spy.call_count == 0, (
+        f"GPU MMFF must NOT be called with skip_mmff_relax=True; "
+        f"got {gpu_spy.call_count} calls"
+    )
+    assert cpu_spy.call_count == 0
+
+
+def test_dihedral_kick_skip_mmff_relax_true_bypasses_mmff_cpu():
+    """Parallel to the GPU bypass test: when `mmff_backend='cpu'` and
+    `skip_mmff_relax=True`, the per-conformer CPU MMFF loop must not run."""
+    mol = _cyclic_ala_ser_mol()
+    proposer, patched, gpu_spy, cpu_spy = _make_dihedral_kick_with_mmff_spies(
+        mol, seed=0, mmff_backend="cpu", skip_mmff_relax=True
+    )
+    coords_list = [_seed_full_mol_coords(mol) for _ in range(3)]
+    with patched():
+        proposer(coords_list)
+    assert gpu_spy.call_count == 0
+    assert cpu_spy.call_count == 0, (
+        f"CPU MMFF must NOT be called with skip_mmff_relax=True; "
+        f"got {cpu_spy.call_count} calls"
+    )
+
+
+def test_dihedral_kick_skip_mmff_relax_n_mmff_skipped_stat_increments():
+    """`stats['n_mmff_skipped']` must increment by `n_walkers` per batch
+    when the flag is on — used for diagnostic logging in Step 7's 2×2
+    ablation matrix to confirm the ablation actually fired."""
+    mol = _cyclic_ala_ser_mol()
+    proposer, patched, _, _ = _make_dihedral_kick_with_mmff_spies(
+        mol, seed=0, skip_mmff_relax=True
+    )
+    coords_list = [_seed_full_mol_coords(mol) for _ in range(4)]
+    with patched():
+        proposer(coords_list)
+    assert proposer.stats["n_mmff_skipped"] == 4, (
+        f"n_mmff_skipped should increment by n_walkers per batch; "
+        f"expected 4, got {proposer.stats['n_mmff_skipped']}"
+    )
+    with patched():
+        proposer(coords_list)
+    assert (
+        proposer.stats["n_mmff_skipped"] == 8
+    ), "n_mmff_skipped should accumulate across batches"
+
+
+def test_dihedral_kick_skip_mmff_relax_default_n_mmff_skipped_stays_zero():
+    """With the default `skip_mmff_relax=False`, the `n_mmff_skipped`
+    counter must remain at zero — the stat exists in the dict (so v0.1
+    callers reading .stats don't KeyError) but is never incremented."""
+    mol = _cyclic_ala_ser_mol()
+    proposer, patched, _, _ = _make_dihedral_kick_with_mmff_spies(mol, seed=0)
+    assert (
+        "n_mmff_skipped" in proposer.stats
+    ), "n_mmff_skipped key must always be present in stats dict, even when off"
+    coords_list = [_seed_full_mol_coords(mol) for _ in range(3)]
+    with patched():
+        proposer(coords_list)
+    assert (
+        proposer.stats["n_mmff_skipped"] == 0
+    ), "n_mmff_skipped must stay at 0 when skip_mmff_relax=False"
+
+
+def test_dihedral_kick_skip_mmff_relax_still_rejects_non_finite_mace():
+    """When MACE returns non-finite energies on the raw rotated geometry
+    (which can happen since unrelaxed rotations may carry minor strain),
+    the proposer must reject via `success=False` exactly as the
+    MMFF-on path does. Regression guard against the bypass branch
+    silently accepting NaN energies."""
+    from contextlib import contextmanager
+    from unittest.mock import patch as _patch
+
+    from proposers import make_dihedral_kick_proposer
+
+    mol = _cyclic_ala_ser_mol()
+    proposer = make_dihedral_kick_proposer(
+        mol, hardware_opts=None, calc=None, seed=0, skip_mmff_relax=True
+    )
+
+    def _nan_mace(_calc, ase_mols):
+        return [float("nan")] * len(ase_mols)
+
+    @contextmanager
+    def patched():
+        with _patch("confsweeper._mace_batch_energies", side_effect=_nan_mace):
+            yield
+
+    coords_list = [_seed_full_mol_coords(mol) for _ in range(3)]
+    with patched():
+        proposals = proposer(coords_list)
+    assert len(proposals) == 3
+    for new_coords, energy, det_j, success in proposals:
+        assert success is False, (
+            "Non-finite MACE energy must produce success=False even on "
+            "the skip_mmff_relax=True path"
+        )
+        assert det_j == 0.0
+    assert proposer.stats["n_relax_failures"] == 3
+    assert proposer.stats["n_relax_successes"] == 0
 
 
 def _stub_proposer(tag: str, n_atoms: int = _TEST_N_ATOMS):

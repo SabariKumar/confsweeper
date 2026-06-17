@@ -871,6 +871,45 @@ Cross-reference to the full empirical record in `docs/dihedral_kick_plan.md` (St
 
 ---
 
+### Side-chain dihedral-kick proposer v0.2 (issue #15, 2026-06-17)
+
+Cross-reference to `docs/dihedral_kick_v0_2_plan.md` Step 7 Findings (2026-06-17). v0.2 = the two issue-#15 fixes that attack the cremp_sharp residual flagged in the 2026-06-15 v0.1 entry above: (1) per-bond aromatic-aware rotamer wells `(-90, 0, 90, 180)` for bonds whose downstream endpoint is aromatic (NMe-Trp χ₂ in cremp_sharp); (2) `skip_mmff_relax` ablation that bypasses Stage-2 MMFF94 batched relax in the dihedral-kick proposer so MACE sees the raw rotated geometry.
+
+**2×2 ablation matrix at n_seeds=10000.** All four cells use the issue-#12 production mix `(cart=0.33, dih=0.33, p_rotamer_jump=0.30)` underneath.
+
+cremp_typical (`t.I.G.N`):
+
+| cell | aromatic_wells | skip_mmff_relax | `cov_bw_ceil` | `cov_count` | `max_missed_bw` |
+|---|---|---|---|---|---|
+| B.1 (v0.1 baseline) | off | off | 0.989 | 20/22 | 0.009 |
+| B.2 | on | off | 0.971 | 16/22 | 0.009 |
+| B.3 | off | on | 0.966 | 15/22 | 0.009 |
+| **B.4 (v0.2 production)** | **on** | **on** | **0.997** | **21/22** | **0.003** |
+
+cremp_sharp (`S.S.N.MeW.MeA.MeN`):
+
+| cell | aromatic_wells | skip_mmff_relax | `cov_bw_ceil` | `max_missed_bw` | `n_new` | `new_mass` |
+|---|---|---|---|---|---|---|
+| B.1 | off | off | 0.000 | 0.724023 | 2 | 2.8 × 10⁻⁶ |
+| B.2 | on | off | 0.000 | 0.724023 | 8 | 4.1 × 10⁻⁸ |
+| B.3 | off | on | 0.000 | 0.724023 | 6 | 7.8 × 10⁻⁷ |
+| **B.4** | **on** | **on** | **0.000** | **0.724023** | 3 | **8.8 × 10⁻³** |
+
+**Headline result: non-linear synergy on cremp_typical.** Each fix alone regresses the v0.1 baseline (B.2 = 0.971, B.3 = 0.966 — both worse than B.1 = 0.989), but together they synergize to a new branch record (B.4 = 0.997, +0.6 absolute pts over the issue-#12 headline, 21/22 basins covered, `max_missed_bw` 3× tighter). Diagnostic interpretation: aromatic wells without the MMFF-bypass let MMFF drag rotamer jumps back to sp3 χ₁; the MMFF-bypass without aromatic wells leaves the proposer jumping to sp3 wells on aromatic χ₂ where MACE drifts to non-equilibrium states. Only with both on does the proposer (a) propose geometrically-meaningful aromatic χ₂ states AND (b) skip the MMFF that would otherwise pull them back.
+
+**cremp_sharp: v0.3 trigger fires.** All four cells still leave `coverage_bw_ceiling=0.000` with `max_missed_bw=0.724023` identical to 6 decimal places — the same single dominant ceiling basin (72 % BW mass) is missed at every v0.2 setting. The locked Step-1 decomposition logic ("if all four stay at zero, the cremp_sharp failure is structural beyond what v0.2 can fix") fires → v0.3 escalates to e.g. concerted χ₁ + χ₂ rotation. **But the v0.2 cell IS actively useful:** `new_mass = 8.8 × 10⁻³` is ~3000× the v0.1 baseline (2.8 × 10⁻⁶) and 4 orders of magnitude above any prior cremp_sharp cell. The proposer is discovering thermodynamically-real basins on cremp_sharp; those basins just aren't *the* dominant ceiling basin.
+
+**Updated coverage delta table** (extends the 2026-06-15 v0.1 row):
+
+| peptide | issue-#12 v0.1 production (`B.1`) | issue-#15 v0.2 production (`B.4`) | Δ vs v0.1 |
+|---|---|---|---|
+| `cremp_typical` (`t.I.G.N`) | `0.989` | **`0.997`** | **+0.008 absolute** |
+| `cremp_sharp` (`S.S.N.MeW.MeA.MeN`) | `0.000` (max_missed 0.724) | `0.000` (max_missed 0.724; `new_mass` ~3000× up) | 0 on headline; v0.3 escalates |
+
+**Implications for the broader plan.** The MCMM headline number on `cremp_typical` is now **0.997** at the v0.2 production mix (issue #15). cremp_sharp remains a v0.3 candidate — the geometric structure of its dominant ceiling basin appears to require a concerted-dihedral move type beyond the v0.2 single-bond-per-step proposer.
+
+---
+
 ## References
 
 The shorthand citations used throughout this plan and in the `src/mcmm.py` /

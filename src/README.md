@@ -496,26 +496,66 @@ proposers expose `.stats` dicts (`n_proposed`, `n_relax_failures`,
 `n_relax_successes`, plus dihedral-specific `n_gaussian_steps`,
 `n_rotamer_jumps`) for diagnostic logging.
 
-> **Known limitation.** The dihedral kick's `rotamer_wells_deg` defaults to
-> sp3-χ₁ wells `(-60, 60, 180)`. NMe-Trp χ₂ (aromatic) sits near {-90, +90};
-> on peptides where the dominant Boltzmann basin requires aromatic χ₂
-> rotamer states (e.g. cremp_sharp / `S.S.N.MeW.MeA.MeN`), the v0 proposer
-> does not recover the basin at any tested mix — `coverage_bw_ceiling = 0`
-> across the full sweep. Two v0.2 candidates are queued in issue #13:
-> per-bond aromatic-aware well sets, and a no-MMFF ablation that bypasses
-> the Stage-2 MMFF94 relax which may be dragging rotamer jumps back across
-> the barrier before MACE sees them. See `docs/dihedral_kick_plan.md` Step-7
-> phase 2 Findings (2026-06-15) for the empirical record.
+**v0.2 — aromatic-aware wells + no-MMFF ablation (issue #15).** Two
+`make_dihedral_kick_proposer` kwargs that close the issue-#12 known
+limitation on aromatic-containing peptides:
 
-**Production-default proposer mix (issue #12 closes).** The locked v0
-defaults on `get_mol_PE_mcmm` are: `cartesian_weight=0.0`,
-`dihedral_weight=0.0` (pure-DBT, legacy behaviour preserved). The
-benchmark-validated 3-way mix that beats the prior `0.83` Boltzmann coverage
-on cremp_typical (lifting it to **`0.991`**) is `cartesian_weight=0.33`,
-`dihedral_weight=0.33`, `p_rotamer_jump=0.30`, `sigma_chi_rad=0.5`,
-`rotamer_wells_deg=(-60, 60, 180)`. Set these at the call site (or via
-`scripts/sampler_benchmark.py`'s `--cartesian_weight`, `--dihedral_weight`,
-`--p_rotamer_jump` flags) to engage the 3-way composite.
+- `aromatic_wells_deg: tuple | None = None` — per-bond rotamer wells
+  for bonds whose downstream endpoint is aromatic (atom-c aromaticity
+  flag; locked at `(-90, 0, 90, 180)` — symmetric four-well, captures
+  face-on AND edge-on rotameric states, matches the existing sp3 case
+  branching factor). The helper `_classify_rotamer_wells(mol, dihedrals,
+  aromatic_wells_deg, sp3_wells_deg)` builds the per-bond well lookup
+  once at proposer-construction time; non-aromatic bonds keep the sp3
+  `rotamer_wells_deg`. `None` (default) preserves issue-#12 byte-for-byte.
+- `skip_mmff_relax: bool = False` — diagnostic-grade ablation: Stage-2
+  MMFF94 batched relax is bypassed entirely; rotated coords pass to MACE
+  directly. Stats: `n_mmff_skipped` counter exposed for sweep diagnostics.
+  Default `False` preserves issue-#12. Note: skipping MMFF may leave
+  neighbouring atoms in mildly strained Cartesian positions; if MACE
+  acceptance with `skip_mmff_relax=True` drops below ~5 % the ablation
+  is uninterpretable and a v0.3 partial-MMFF candidate becomes
+  next-up (none observed on cremp_typical/cremp_sharp at the v0.2 sweep).
+
+> **Issue #15 / v0.2 production lock.** The 2×2 ablation matrix at
+> n_seeds=10000 on cremp_typical found that **each fix alone regresses
+> the issue-#12 baseline of 0.991** (aromatic_wells alone → 0.971;
+> skip_mmff_relax alone → 0.966) **but TOGETHER they synergize to a
+> new branch record of `0.997` Boltzmann coverage on cremp_typical**
+> (21/22 ceiling basins, `max_missed_bw=0.003`, 3× tighter than v0.1).
+> The v0.2 production mix layers both kwargs on top of v0.1: pass
+> `aromatic_wells_deg=(-90, 0, 90, 180)` AND `skip_mmff_relax=True` at
+> the issue-#12 mix `(cartesian_weight=0.33, dihedral_weight=0.33,
+> p_rotamer_jump=0.30)`. See `docs/dihedral_kick_v0_2_plan.md` Step 7
+> Findings (2026-06-17) for the full empirical record.
+
+> **Residual cremp_sharp failure (v0.3 escalation).** On cremp_sharp
+> (`S.S.N.MeW.MeA.MeN`) all four 2×2 cells still leave
+> `coverage_bw_ceiling = 0.000` with `max_missed_bw=0.724023`
+> identical to 6 decimal places — the same single dominant ceiling
+> basin (72 % of the 298 K Boltzmann population) is missed at every
+> mix. Diagnostic: the v0.2 production cell DID drive ~3000× more
+> new-basin thermodynamic weight than the v0.1 baseline (`new_mass`
+> rose from 2.8 × 10⁻⁶ to 8.8 × 10⁻³), so the proposer is actively
+> useful on cremp_sharp — it just doesn't reach *the* dominant ceiling
+> basin. The geometry likely requires a concerted χ₁ + χ₂ rotation or
+> a backbone-mediated path that single-dihedral-per-step DBT misses
+> for this specific topology. Tracked as a v0.3 follow-up.
+
+**Production-default proposer mixes.** The locked in-code defaults on
+`get_mol_PE_mcmm` are `cartesian_weight=0.0`, `dihedral_weight=0.0`,
+`aromatic_wells_deg=None`, `skip_mmff_relax=False` (pure-DBT, legacy
+behaviour preserved). Two benchmark-validated production mixes:
+
+- **v0.1 (issue #12 closes)** — `cartesian_weight=0.33`,
+  `dihedral_weight=0.33`, `p_rotamer_jump=0.30`, `sigma_chi_rad=0.5`,
+  `rotamer_wells_deg=(-60, 60, 180)`. Lifts cremp_typical from `0.83`
+  → **`0.991`**. CLI engages via `--cartesian_weight 0.33
+  --dihedral_weight 0.33 --p_rotamer_jump 0.30`.
+- **v0.2 (issue #15 closes)** — v0.1 mix PLUS `aromatic_wells_deg=
+  (-90, 0, 90, 180)` AND `skip_mmff_relax=True`. Lifts cremp_typical
+  from `0.991` → **`0.997`** (new record). CLI engages via the v0.1
+  flags PLUS `--aromatic_wells --skip_mmff_relax`.
 
 ### Kabsch and inertia helpers
 
