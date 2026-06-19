@@ -320,6 +320,53 @@ def _classify_rotamer_wells(
     return wells_per_bond
 
 
+def _enumerate_concerted_dihedral_pairs(mol: Chem.Mol):
+    """
+    Enumerate `(χ₁, χ₂)` rotatable-bond pairs on aromatic side chains.
+    Each pair is the input to `make_concerted_dihedral_kick_proposer`
+    (v0.3 Move A); rotating both dihedrals together is the concerted
+    move that v0.2's single-bond proposer cannot make.
+
+    Eligibility: for each rotatable side-chain dihedral
+    `(a₂, b₂, c₂, d₂)` from `_enumerate_side_chain_dihedrals` whose
+    downstream endpoint `c₂` is aromatic (the v0.2 atom-c aromaticity
+    flag), find the *upstream* dihedral `(a₁, b₁, c₁, d₁)` whose `c₁`
+    equals `b₂` — i.e., χ₁'s downstream Cβ is χ₂'s upstream Cβ. For
+    standard amino-acid topology this uniquely identifies the χ₁ that
+    rotates the side chain holding the χ₂ aromatic ring. NMe-Trp is the
+    canonical case on cremp_sharp: χ₁ = (Cα, Cβ), χ₂ = (Cβ, Cγ_indole).
+
+    Reuses the v0.2 atom-c aromaticity detection from
+    `_classify_rotamer_wells` (the locked Step-1 design choice A.2 of
+    v0.3 — see docs/concerted_moves_v0_3_plan.md Findings 2026-06-19).
+
+    Params:
+        mol: Chem.Mol : cyclic peptide with explicit Hs.
+    Returns:
+        list[tuple[tuple[int, int, int, int], tuple[int, int, int, int]]]
+            : pairs of (χ₁_quadruple, χ₂_quadruple). χ₂'s c atom is
+            guaranteed aromatic. Empty list if no aromatic side-chain
+            rotatable bonds exist on `mol` (e.g., cyclo-Ala, cremp_typical
+            — both pure-sp3 peptides), in which case
+            `make_concerted_dihedral_kick_proposer` will raise at factory
+            build time.
+    """
+    dihedrals = _enumerate_side_chain_dihedrals(mol)
+    # χ₂ candidates: bonds whose downstream atom c is aromatic.
+    chi2_bonds = [d for d in dihedrals if mol.GetAtomWithIdx(int(d[2])).GetIsAromatic()]
+    pairs = []
+    for chi2 in chi2_bonds:
+        _, b2, _, _ = chi2  # b2 is Cβ — the atom χ₁ rotates around with Cα.
+        for chi1 in dihedrals:
+            if chi1 == chi2:
+                continue
+            _, _, c1, _ = chi1
+            if c1 == b2:
+                pairs.append((chi1, chi2))
+                break  # one χ₁ per χ₂ — the unique upstream Cα-Cβ pair.
+    return pairs
+
+
 # ---------------------------------------------------------------------------
 # Real-mol proposer factory — DBT concerted rotation
 # ---------------------------------------------------------------------------
@@ -1001,6 +1048,281 @@ def make_dihedral_kick_proposer(
 
         # Stage 4: assemble per-walker proposals. det_j=1.0 (open-tree
         # rotation is volume-preserving). Non-finite energies → reject.
+        proposals: list = []
+        for slot, cid in enumerate(post_mmff_conf_ids):
+            new_coords = torch.tensor(
+                throwaway.GetConformer(cid).GetPositions(), dtype=torch.float64
+            )
+            e = float(energies[slot])
+            if not np.isfinite(e):
+                stats["n_relax_failures"] += 1
+                proposals.append((coords_list[slot], 0.0, 0.0, False))
+            else:
+                stats["n_relax_successes"] += 1
+                proposals.append((new_coords, e, 1.0, True))
+        return proposals
+
+    batch_propose_fn.stats = stats
+    return batch_propose_fn
+
+
+# ---------------------------------------------------------------------------
+# Concerted dihedral kick — v0.3 Move A (joint χ₁ + χ₂ on aromatic side chains)
+# ---------------------------------------------------------------------------
+
+
+def make_concerted_dihedral_kick_proposer(
+    mol: Chem.Mol,
+    hardware_opts,
+    calc,
+    sigma_concerted_chi_rad: float = 0.5,
+    p_concerted_jump: float = 0.3,
+    sp3_wells_deg: tuple = (-60.0, 60.0, 180.0),
+    aromatic_wells_deg: tuple = (-90.0, 0.0, 90.0, 180.0),
+    score_chunk_size: int = 500,
+    mmff_backend: str = "gpu",
+    skip_mmff_relax: bool = False,
+    seed: int = 0,
+):
+    """
+    Build a `batch_propose_fn` that rotates a `(χ₁, χ₂)` side-chain
+    dihedral pair *together* per walker per step (joint hybrid Gaussian
+    + joint rotamer-jump), MMFF-relaxes, and MACE-scores. v0.3 Move A
+    (issue #17). Attacks the cremp_sharp residual flagged in the v0.2
+    Step-7 Findings: single-bond moves cannot reach the dominant
+    ceiling basin because rotating χ₁ alone leaves χ₂ at the wrong
+    orientation (MMFF/MACE rejects), and rotating χ₂ alone leaves the
+    side-chain anchor (Cβ position) at the wrong location. Both bonds
+    must rotate together to reach the joint state. See
+    `docs/concerted_moves_v0_3_plan.md` Move A design lock (2026-06-19)
+    for the locked design choices and rationale.
+
+    Per-call pipeline (same shape as `make_dihedral_kick_proposer`):
+
+      1. **Per-walker joint rotation** (CPU, sequential): pick a
+         `(χ₁, χ₂)` pair uniformly at random from
+         `_enumerate_concerted_dihedral_pairs(mol)`; sample either
+         (a) joint Gaussian Δχ₁, Δχ₂ each from `N(0, σ_concerted_chi_rad)`
+         with probability `1 - p_concerted_jump`, or (b) joint rotamer
+         jump — `χ₁_target` sampled uniformly from `sp3_wells_deg`,
+         `χ₂_target` sampled uniformly from `aromatic_wells_deg` —
+         with probability `p_concerted_jump`. Apply via two successive
+         `Chem.rdMolTransforms.SetDihedralDeg` calls (χ₁ first because
+         the χ₂ rotation axis is downstream of χ₁ — rotating χ₁ moves
+         χ₂'s `b` and `c` atoms; the χ₂ rotation then operates on the
+         post-χ₁ geometry).
+      2. **Batched MMFF** (GPU, one call): every rotated candidate
+         lives as a conformer on a shared throwaway mol;
+         `nvmolkit.mmffOptimization.MMFFOptimizeMoleculesConfs`
+         minimises in place. When `skip_mmff_relax=True` (the v0.2
+         ablation toggle, plumbed through to this factory) Stage 2 is
+         bypassed entirely; Stage 3 scores the raw rotated geometry.
+      3. **Batched MACE** (GPU, chunked) via `_mace_batch_energies`.
+      4. **Return** `(coords_tensor, energy_float, det_j=1.0,
+         success=True)` per walker. A joint open-tree rotation in 2D
+         dihedral space is volume-preserving (the Jacobian of two
+         successive open-tree rotations is the product of two unit
+         Jacobians), so detailed balance needs no correction. Walkers
+         whose post-MMFF / post-MACE energy is non-finite get
+         `success=False` exactly as the single-bond path does.
+
+    Strict separation from DBT and from v0.2's single-bond
+    `make_dihedral_kick_proposer`: the eligibility helper
+    `_enumerate_concerted_dihedral_pairs` returns ONLY pairs whose χ₂'s
+    `c` atom is aromatic, so this factory will never touch a backbone
+    dihedral and never touch a sp3-only side chain. Calling this
+    factory on a peptide with no aromatic side chains (e.g.,
+    cremp_typical) raises `ValueError` at factory build time so the
+    caller learns immediately instead of silently producing a no-op
+    proposer at runtime.
+
+    Composition with the rest of the proposer family: this factory is
+    a new top-level proposer routed by `make_composite_proposer`
+    alongside DBT, Cartesian, and v0.2's single-bond dihedral kick. The
+    Step-3 v0.3 work extends `make_default_mcmm_composite` from 3
+    sub-proposers to 4 to include this one — the
+    `weight > 0 ↔ proposer not None` contract generalises naturally
+    (see locked Step-1 design choice A.3 in
+    `docs/concerted_moves_v0_3_plan.md`).
+
+    Lazy import of `_mace_batch_energies` from `confsweeper` avoids the
+    confsweeper → mcmm → proposers circular dependency at module load
+    time (same convention as the other proposer factories in this
+    module).
+
+    Params:
+        mol: Chem.Mol : reference cyclic peptide with explicit Hs.
+            Topology + `(χ₁, χ₂)` pair enumeration are captured at
+            factory build time; do not mutate the mol structurally
+            afterwards.
+        hardware_opts : nvmolkit hardware options for batched MMFF
+            (only used when `mmff_backend='gpu'`).
+        calc : MACECalculator from `get_mace_calc()`.
+        sigma_concerted_chi_rad: float : Gaussian standard deviation in
+            radians for each component of the joint Gaussian refinement
+            step (default 0.5 ≈ 28.6° — same magnitude as v0.2's
+            single-bond `sigma_chi_rad`).
+        p_concerted_jump: float : probability (per walker per step) of
+            a joint rotamer jump instead of a joint Gaussian
+            refinement step (default 0.3). Set to 0 for pure Gaussian;
+            set to 1 for pure joint rotamer jumps. Same locked default
+            as v0.2's single-bond `p_rotamer_jump`.
+        sp3_wells_deg: tuple[float, ...] : χ₁-component rotameric well
+            centres in degrees (default `(-60, 60, 180)` — standard
+            sp3 χ₁). Used for the χ₁ side of every joint rotamer jump.
+        aromatic_wells_deg: tuple[float, ...] : χ₂-component rotameric
+            well centres in degrees (default `(-90, 0, 90, 180)` —
+            v0.2's locked aromatic well set). Used for the χ₂ side of
+            every joint rotamer jump.
+        score_chunk_size: int : MACE per-batch forward pass cap
+            (default 500).
+        mmff_backend: str : 'gpu' (nvmolkit batched CUDA, default) or
+            'cpu' (RDKit serial).
+        skip_mmff_relax: bool : v0.2 ablation toggle (issue #15). When
+            True, Stage-2 MMFF94 is bypassed and Stage-3 MACE scores
+            the raw rotated geometry. Default False preserves the
+            v0.2-with-MMFF behaviour.
+        seed: int : RNG seed for the per-step pair pick + joint
+            Δχ-or-jump sample.
+    Returns:
+        callable : `batch_propose_fn(coords_list) -> list[tuple]`
+            matching the `ParallelMCMMDriver` /
+            `ReplicaExchangeMCMMDriver` proposer contract.
+    Raises:
+        ValueError: on unknown `mmff_backend`, `p_concerted_jump` not
+            in [0, 1], non-positive `sigma_concerted_chi_rad`, empty
+            `sp3_wells_deg` or `aromatic_wells_deg` when
+            `p_concerted_jump > 0`, or when `mol` has no enumerable
+            aromatic side-chain `(χ₁, χ₂)` pairs (e.g., cyclo-Ala,
+            cremp_typical — call the v0.2 single-bond factory instead
+            on those).
+    """
+    if mmff_backend not in ("gpu", "cpu"):
+        raise ValueError(
+            f"unknown mmff_backend {mmff_backend!r}; expected 'gpu' or 'cpu'"
+        )
+    if not 0.0 <= p_concerted_jump <= 1.0:
+        raise ValueError(f"p_concerted_jump must be in [0, 1], got {p_concerted_jump}")
+    if sigma_concerted_chi_rad <= 0.0:
+        raise ValueError(
+            f"sigma_concerted_chi_rad must be positive, got {sigma_concerted_chi_rad}"
+        )
+    if p_concerted_jump > 0.0 and len(sp3_wells_deg) == 0:
+        raise ValueError("sp3_wells_deg must be non-empty when p_concerted_jump > 0")
+    if p_concerted_jump > 0.0 and len(aromatic_wells_deg) == 0:
+        raise ValueError(
+            "aromatic_wells_deg must be non-empty when p_concerted_jump > 0"
+        )
+
+    pairs = _enumerate_concerted_dihedral_pairs(mol)
+    if not pairs:
+        raise ValueError(
+            "mol has no enumerable aromatic side-chain (χ₁, χ₂) pairs; "
+            "check that the input is a cyclic peptide with at least one "
+            "aromatic side chain (Trp / Phe / Tyr / His). For pure-sp3 "
+            "peptides use `make_dihedral_kick_proposer` (v0.2 single-bond) "
+            "instead."
+        )
+    n_pairs = len(pairs)
+    n_atoms = mol.GetNumAtoms()
+    atomic_nums = [a.GetAtomicNum() for a in mol.GetAtoms()]
+
+    template_mol = Chem.Mol(mol)
+    template_mol.RemoveAllConformers()
+
+    sp3_wells_arr = np.asarray(sp3_wells_deg, dtype=np.float64)
+    aromatic_wells_arr = np.asarray(aromatic_wells_deg, dtype=np.float64)
+    n_sp3_wells = len(sp3_wells_arr)
+    n_aromatic_wells = len(aromatic_wells_arr)
+    sigma_concerted_chi_deg = math.degrees(sigma_concerted_chi_rad)
+
+    rng = np.random.default_rng(seed)
+    stats = {
+        "n_proposed": 0,
+        "n_concerted_gaussian_steps": 0,
+        "n_concerted_rotamer_jumps": 0,
+        "n_relax_failures": 0,
+        "n_relax_successes": 0,
+        "n_mmff_skipped": 0,
+    }
+
+    def batch_propose_fn(coords_list):
+        from confsweeper import _mace_batch_energies
+
+        n_walkers = len(coords_list)
+        if n_walkers == 0:
+            return []
+        stats["n_proposed"] += n_walkers
+
+        # Stage 1: stage walker coords on a fresh throwaway mol, then
+        # apply the per-walker joint rotation in place.
+        throwaway = Chem.Mol(template_mol)
+        for coords in coords_list:
+            conf = Chem.Conformer(n_atoms)
+            coords_np = coords.detach().cpu().numpy().astype(np.float64)
+            for a_idx in range(n_atoms):
+                x, y, z = coords_np[a_idx]
+                conf.SetAtomPosition(a_idx, (float(x), float(y), float(z)))
+            throwaway.AddConformer(conf, assignId=True)
+        pre_mmff_conf_ids = [c.GetId() for c in throwaway.GetConformers()]
+        for cid in pre_mmff_conf_ids:
+            conf = throwaway.GetConformer(cid)
+            pair_idx = int(rng.integers(n_pairs))
+            chi1, chi2 = pairs[pair_idx]
+            a1, b1, c1, d1 = chi1
+            a2, b2, c2, d2 = chi2
+            if rng.uniform() < p_concerted_jump:
+                stats["n_concerted_rotamer_jumps"] += 1
+                new_chi1_deg = float(sp3_wells_arr[rng.integers(n_sp3_wells)])
+                new_chi2_deg = float(aromatic_wells_arr[rng.integers(n_aromatic_wells)])
+                rdMolTransforms.SetDihedralDeg(conf, a1, b1, c1, d1, new_chi1_deg)
+                rdMolTransforms.SetDihedralDeg(conf, a2, b2, c2, d2, new_chi2_deg)
+            else:
+                stats["n_concerted_gaussian_steps"] += 1
+                # Apply χ₁ first; its rotation moves χ₂'s b and c atoms.
+                # Read χ₂'s current angle AFTER applying χ₁ so the Δχ₂ is
+                # relative to the post-χ₁ geometry (the natural way joint
+                # dihedral perturbations compose).
+                current_chi1 = rdMolTransforms.GetDihedralDeg(conf, a1, b1, c1, d1)
+                new_chi1_deg = current_chi1 + float(
+                    rng.normal(0.0, sigma_concerted_chi_deg)
+                )
+                rdMolTransforms.SetDihedralDeg(conf, a1, b1, c1, d1, new_chi1_deg)
+                current_chi2 = rdMolTransforms.GetDihedralDeg(conf, a2, b2, c2, d2)
+                new_chi2_deg = current_chi2 + float(
+                    rng.normal(0.0, sigma_concerted_chi_deg)
+                )
+                rdMolTransforms.SetDihedralDeg(conf, a2, b2, c2, d2, new_chi2_deg)
+
+        # Stage 2: batched MMFF on the throwaway mol; skip when
+        # skip_mmff_relax=True (v0.2 ablation path, plumbed through).
+        if skip_mmff_relax:
+            stats["n_mmff_skipped"] += len(pre_mmff_conf_ids)
+        elif mmff_backend == "gpu":
+            from nvmolkit.mmffOptimization import MMFFOptimizeMoleculesConfs
+
+            MMFFOptimizeMoleculesConfs([throwaway], hardwareOptions=hardware_opts)
+        else:
+            from rdkit.Chem import AllChem as _AllChem
+
+            for cid in pre_mmff_conf_ids:
+                _AllChem.MMFFOptimizeMolecule(throwaway, confId=cid)
+
+        # Stage 3: batched MACE scoring, chunked.
+        post_mmff_conf_ids = [c.GetId() for c in throwaway.GetConformers()]
+        energies: list = []
+        for start in range(0, len(post_mmff_conf_ids), score_chunk_size):
+            chunk_ids = post_mmff_conf_ids[start : start + score_chunk_size]
+            ase_mols = [
+                ase.Atoms(
+                    positions=throwaway.GetConformer(cid).GetPositions(),
+                    numbers=atomic_nums,
+                )
+                for cid in chunk_ids
+            ]
+            energies.extend(_mace_batch_energies(calc, ase_mols))
+
+        # Stage 4: assemble per-walker proposals.
         proposals: list = []
         for slot, cid in enumerate(post_mmff_conf_ids):
             new_coords = torch.tensor(

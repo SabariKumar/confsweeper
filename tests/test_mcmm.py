@@ -32,6 +32,7 @@ from mcmm import (
 )
 from proposers import (
     _classify_rotamer_wells,
+    _enumerate_concerted_dihedral_pairs,
     _enumerate_side_chain_dihedrals,
     make_default_mcmm_composite,
 )
@@ -2811,6 +2812,186 @@ def test_dihedral_kick_skip_mmff_relax_still_rejects_non_finite_mace():
         assert det_j == 0.0
     assert proposer.stats["n_relax_failures"] == 3
     assert proposer.stats["n_relax_successes"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Concerted χ₁ + χ₂ dihedral kick (Step 2 / v0.3 Move A — issue #17)
+# ---------------------------------------------------------------------------
+
+
+def test_enumerate_concerted_dihedral_pairs_finds_trp_chi1_chi2_on_cremp_sharp():
+    """cremp_sharp has exactly one aromatic side chain (NMe-Trp at
+    position 4). The helper must return exactly one (χ₁, χ₂) pair, and
+    the pair must satisfy the v0.3 Move A invariants: χ₁'s c equals
+    χ₂'s b (the shared Cβ atom), and χ₂'s c is aromatic."""
+    mol = _cremp_sharp_mol()
+    pairs = _enumerate_concerted_dihedral_pairs(mol)
+    assert len(pairs) == 1, (
+        f"cremp_sharp has 1 aromatic residue (NMe-Trp) — expected 1 "
+        f"concerted pair, got {len(pairs)}"
+    )
+    chi1, chi2 = pairs[0]
+    _, _, c1, _ = chi1
+    _, b2, c2, _ = chi2
+    assert c1 == b2, (
+        f"χ₁'s c (Cβ) must equal χ₂'s b (also Cβ) — the shared atom "
+        f"that defines the (χ₁, χ₂) coupling. Got c1={c1}, b2={b2}"
+    )
+    assert mol.GetAtomWithIdx(c2).GetIsAromatic(), (
+        f"χ₂'s c atom must be aromatic by the helper's eligibility "
+        f"contract; got non-aromatic atom {c2}"
+    )
+
+
+def test_enumerate_concerted_dihedral_pairs_empty_on_pure_sp3_peptide():
+    """cyclic_ala_ser_mol (Ala-Ser-Ala-Ala, no aromatic side chains)
+    must return an empty list — the helper rules out non-aromatic
+    side chains by atom-c aromaticity inspection. Same contract as
+    `make_concerted_dihedral_kick_proposer` raising ValueError on this
+    mol at factory build time."""
+    mol = _cyclic_ala_ser_mol()
+    pairs = _enumerate_concerted_dihedral_pairs(mol)
+    assert (
+        pairs == []
+    ), f"pure-sp3 peptide should yield zero concerted pairs; got {pairs}"
+
+
+def test_make_concerted_dihedral_kick_proposer_raises_on_pure_sp3_peptide():
+    """Calling the factory with a mol that has no aromatic side chains
+    must raise ValueError at build time rather than silently producing
+    a no-op proposer."""
+    from proposers import make_concerted_dihedral_kick_proposer
+
+    mol = _cyclic_ala_ser_mol()
+    with pytest.raises(ValueError, match="no enumerable aromatic side-chain"):
+        make_concerted_dihedral_kick_proposer(mol, hardware_opts=None, calc=None)
+
+
+def test_make_concerted_dihedral_kick_proposer_validation_kwargs():
+    """Validation paths mirror v0.2 single-bond proposer: bad backend,
+    p_concerted_jump out of [0, 1], non-positive sigma, empty wells
+    when jumps are enabled. All raise at factory build time."""
+    from proposers import make_concerted_dihedral_kick_proposer
+
+    mol = _cremp_sharp_mol()  # has 1 aromatic pair — passes pair check.
+    with pytest.raises(ValueError, match="unknown mmff_backend"):
+        make_concerted_dihedral_kick_proposer(
+            mol, hardware_opts=None, calc=None, mmff_backend="bogus"
+        )
+    with pytest.raises(ValueError, match="p_concerted_jump must be in"):
+        make_concerted_dihedral_kick_proposer(
+            mol, hardware_opts=None, calc=None, p_concerted_jump=1.5
+        )
+    with pytest.raises(ValueError, match="sigma_concerted_chi_rad must be positive"):
+        make_concerted_dihedral_kick_proposer(
+            mol, hardware_opts=None, calc=None, sigma_concerted_chi_rad=0.0
+        )
+    with pytest.raises(ValueError, match="sp3_wells_deg must be non-empty"):
+        make_concerted_dihedral_kick_proposer(
+            mol, hardware_opts=None, calc=None, sp3_wells_deg=()
+        )
+    with pytest.raises(ValueError, match="aromatic_wells_deg must be non-empty"):
+        make_concerted_dihedral_kick_proposer(
+            mol, hardware_opts=None, calc=None, aromatic_wells_deg=()
+        )
+
+
+def _make_concerted_dihedral_kick_with_mocks(mol, **kwargs):
+    """Mock harness for the concerted factory — mirrors
+    `_make_dihedral_kick_with_mocks` from the v0.2 test block."""
+    from contextlib import contextmanager
+    from unittest.mock import patch as _patch
+
+    from proposers import make_concerted_dihedral_kick_proposer
+
+    proposer = make_concerted_dihedral_kick_proposer(
+        mol,
+        hardware_opts=None,
+        calc=None,
+        **kwargs,
+    )
+
+    counter = [0]
+
+    def _mock_mace(_calc, ase_mols):
+        out = [(counter[0] + i) * 0.01 for i in range(len(ase_mols))]
+        counter[0] += len(ase_mols)
+        return out
+
+    @contextmanager
+    def patched():
+        with (
+            _patch("confsweeper._mace_batch_energies", side_effect=_mock_mace),
+            _patch(
+                "nvmolkit.mmffOptimization.MMFFOptimizeMoleculesConfs",
+                return_value=[[]],
+            ),
+        ):
+            yield
+
+    return proposer, patched
+
+
+def test_concerted_dihedral_kick_pure_rotamer_jump_lands_in_joint_wells():
+    """With `p_concerted_jump=1.0` and MMFF mocked as a no-op (the
+    returned `[[]]` doesn't touch conformers), every proposal must
+    leave the (χ₁, χ₂) angles exactly at one of the joint-well states
+    — χ₁ in sp3_wells_deg, χ₂ in aromatic_wells_deg. Locked Step-1
+    invariant for the rotamer-jump branch."""
+    from rdkit.Chem import rdMolTransforms
+
+    mol = _cremp_sharp_mol()
+    sp3_wells = (-60.0, 60.0, 180.0)
+    aromatic_wells = (-90.0, 0.0, 90.0, 180.0)
+    proposer, patched = _make_concerted_dihedral_kick_with_mocks(
+        mol,
+        seed=0,
+        p_concerted_jump=1.0,
+        sp3_wells_deg=sp3_wells,
+        aromatic_wells_deg=aromatic_wells,
+    )
+    pairs = _enumerate_concerted_dihedral_pairs(mol)
+    assert len(pairs) == 1
+    chi1, chi2 = pairs[0]
+    # Need an embedded seed conformer to provide starting coords.
+    from rdkit.Chem import AllChem as _AllChem
+
+    _AllChem.EmbedMolecule(mol, randomSeed=42)
+    seed_coords = torch.tensor(mol.GetConformer(0).GetPositions(), dtype=torch.float64)
+    coords_list = [seed_coords.clone() for _ in range(6)]
+    with patched():
+        proposals = proposer(coords_list)
+    assert len(proposals) == 6
+    # For each successful proposal, rebuild the mol-with-conformer from
+    # the returned coords and read back the (χ₁, χ₂) values.
+    tmp_mol = Chem.Mol(mol)
+    tmp_mol.RemoveAllConformers()
+    for new_coords, _, _, success in proposals:
+        if not success:
+            continue
+        conf = Chem.Conformer(mol.GetNumAtoms())
+        np_coords = new_coords.detach().cpu().numpy()
+        for a_idx in range(mol.GetNumAtoms()):
+            conf.SetAtomPosition(
+                a_idx,
+                (
+                    float(np_coords[a_idx][0]),
+                    float(np_coords[a_idx][1]),
+                    float(np_coords[a_idx][2]),
+                ),
+            )
+        cid = tmp_mol.AddConformer(conf, assignId=True)
+        chi1_actual = rdMolTransforms.GetDihedralDeg(tmp_mol.GetConformer(cid), *chi1)
+        chi2_actual = rdMolTransforms.GetDihedralDeg(tmp_mol.GetConformer(cid), *chi2)
+        assert any(
+            abs(chi1_actual - w) < 1e-4 for w in sp3_wells
+        ), f"χ₁ landed at {chi1_actual:.3f}°, expected one of {sp3_wells}"
+        assert any(
+            abs(chi2_actual - w) < 1e-4 for w in aromatic_wells
+        ), f"χ₂ landed at {chi2_actual:.3f}°, expected one of {aromatic_wells}"
+    # All 6 proposals took the rotamer-jump branch.
+    assert proposer.stats["n_concerted_rotamer_jumps"] == 6
+    assert proposer.stats["n_concerted_gaussian_steps"] == 0
 
 
 def _stub_proposer(tag: str, n_atoms: int = _TEST_N_ATOMS):
