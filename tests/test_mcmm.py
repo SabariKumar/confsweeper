@@ -3310,3 +3310,121 @@ def test_default_mcmm_composite_short_circuit_preserves_dict_stats_shape():
     out = make_default_mcmm_composite(dbt)
     assert isinstance(out.stats, dict)
     assert "n_walkers" in out.stats
+
+
+# ---------------------------------------------------------------------------
+# make_default_mcmm_composite — 4-way extension (v0.3 Move A / issue #17)
+# ---------------------------------------------------------------------------
+
+
+def test_default_mcmm_composite_validation_negative_concerted_weight():
+    dbt = _stub_proposer("a")
+    with pytest.raises(ValueError, match="weights must be non-negative"):
+        make_default_mcmm_composite(dbt, concerted_dihedral_weight=-0.1)
+
+
+def test_default_mcmm_composite_validation_4way_sum_exceeds_one():
+    """All three non-DBT weights together must sum to ≤ 1; the 3-way
+    constraint generalises naturally to 4-way."""
+    dbt = _stub_proposer("a")
+    cart = _stub_proposer("b")
+    dih = _stub_proposer("c")
+    cdih = _stub_proposer("d")
+    with pytest.raises(ValueError, match="DBT residual weight would be negative"):
+        make_default_mcmm_composite(
+            dbt,
+            cart_proposer=cart,
+            dihedral_proposer=dih,
+            concerted_dihedral_proposer=cdih,
+            cartesian_weight=0.4,
+            dihedral_weight=0.4,
+            concerted_dihedral_weight=0.4,
+        )
+
+
+def test_default_mcmm_composite_validation_concerted_weight_without_proposer():
+    dbt = _stub_proposer("a")
+    with pytest.raises(ValueError, match="weight > 0 iff proposer not None"):
+        make_default_mcmm_composite(dbt, concerted_dihedral_weight=0.3)
+
+
+def test_default_mcmm_composite_validation_concerted_proposer_without_weight():
+    dbt = _stub_proposer("a")
+    cdih = _stub_proposer("d")
+    with pytest.raises(ValueError, match="weight > 0 iff proposer not None"):
+        make_default_mcmm_composite(
+            dbt,
+            concerted_dihedral_proposer=cdih,
+            concerted_dihedral_weight=0.0,
+        )
+
+
+def test_default_mcmm_composite_pure_concerted_short_circuits():
+    """concerted_dihedral_weight=1.0 (DBT residual = 0) returns the
+    concerted proposer directly — no composite overhead."""
+    dbt = _stub_proposer("a")
+    cdih = _stub_proposer("d")
+    out = make_default_mcmm_composite(
+        dbt,
+        concerted_dihedral_proposer=cdih,
+        concerted_dihedral_weight=1.0,
+    )
+    assert out is cdih
+    coords = [torch.zeros(_TEST_N_ATOMS, 3, dtype=torch.float64) for _ in range(5)]
+    out(coords)
+    assert dbt.stats["n_walkers"] == 0
+    assert cdih.stats["n_walkers"] == 5
+
+
+def test_default_mcmm_composite_four_way_distribution():
+    """DBT=0.4, cart=0.2, dihedral=0.2, concerted=0.2 across 4000
+    walkers — each route gets ~its share with ±10% slack."""
+    dbt = _stub_proposer("a")
+    cart = _stub_proposer("b")
+    dih = _stub_proposer("c")
+    cdih = _stub_proposer("d")
+    composite = make_default_mcmm_composite(
+        dbt,
+        cart_proposer=cart,
+        dihedral_proposer=dih,
+        concerted_dihedral_proposer=cdih,
+        cartesian_weight=0.2,
+        dihedral_weight=0.2,
+        concerted_dihedral_weight=0.2,
+        seed=123,
+    )
+    assert isinstance(composite.stats, list)
+    assert len(composite.stats) == 4
+    n_walkers = 4000
+    coords = [
+        torch.zeros(_TEST_N_ATOMS, 3, dtype=torch.float64) for _ in range(n_walkers)
+    ]
+    composite(coords)
+    n_a = dbt.stats["n_walkers"]
+    n_b = cart.stats["n_walkers"]
+    n_c = dih.stats["n_walkers"]
+    n_d = cdih.stats["n_walkers"]
+    assert n_a + n_b + n_c + n_d == n_walkers
+    assert 0.30 * n_walkers < n_a < 0.50 * n_walkers
+    assert 0.10 * n_walkers < n_b < 0.30 * n_walkers
+    assert 0.10 * n_walkers < n_c < 0.30 * n_walkers
+    assert 0.10 * n_walkers < n_d < 0.30 * n_walkers
+
+
+def test_default_mcmm_composite_four_way_substats_reachable():
+    """The composite's .stats must expose all four sub-proposer stats
+    dicts in route order (DBT, cart, dihedral, concerted)."""
+    dbt = _stub_proposer("a")
+    cart = _stub_proposer("b")
+    dih = _stub_proposer("c")
+    cdih = _stub_proposer("d")
+    composite = make_default_mcmm_composite(
+        dbt,
+        cart_proposer=cart,
+        dihedral_proposer=dih,
+        concerted_dihedral_proposer=cdih,
+        cartesian_weight=0.2,
+        dihedral_weight=0.2,
+        concerted_dihedral_weight=0.2,
+    )
+    assert composite.stats == [dbt.stats, cart.stats, dih.stats, cdih.stats]

@@ -1116,10 +1116,13 @@ def get_mol_PE_mcmm(
     sigma_kick_a: float = 0.1,
     cartesian_weight: float = 0.0,
     dihedral_weight: float = 0.0,
+    concerted_dihedral_weight: float = 0.0,
     sigma_chi_rad: float = 0.5,
     p_rotamer_jump: float = 0.3,
     rotamer_wells_deg: tuple = (-60.0, 60.0, 180.0),
     aromatic_wells_deg: tuple | None = None,
+    sigma_concerted_chi_rad: float = 0.5,
+    p_concerted_jump: float = 0.3,
     skip_mmff_relax: bool = False,
     dihedral_weight_by_atom_count: bool = False,
     score_chunk_size: int = 500,
@@ -1234,6 +1237,30 @@ def get_mol_PE_mcmm(
             `(-90.0, 0.0, 90.0, 180.0)` to engage the issue-#15 v0.2
             aromatic-aware path. Only consulted when
             `dihedral_weight > 0`.
+        concerted_dihedral_weight: float : routing weight for the
+            v0.3 concerted (χ₁, χ₂) dihedral-kick proposer relative to
+            DBT. Default 0.0 means the concerted move is not in the
+            route at all (its factory is not called, no MMFF + MACE
+            setup cost paid). DBT residual weight is
+            `1 - cartesian_weight - dihedral_weight - concerted_dihedral_weight`
+            (the helper rejects sums > 1). Issue #17 / v0.3 Move A;
+            attacks the cremp_sharp residual flagged in the v0.2 Step-7
+            Findings — single-bond moves cannot reach the dominant
+            ceiling basin because χ₁ and χ₂ must rotate together.
+            Requires `mol` to have at least one aromatic side chain
+            (Trp / Phe / Tyr / His); raises at factory time otherwise.
+        sigma_concerted_chi_rad: float : Gaussian σ for the concerted
+            dihedral-kick's joint refinement step in radians (default
+            0.5 ≈ 28°). Each of Δχ₁ and Δχ₂ is sampled independently
+            from `N(0, sigma_concerted_chi_rad)`. Only consulted when
+            `concerted_dihedral_weight > 0`.
+        p_concerted_jump: float : probability per walker per step that
+            the concerted move takes a joint rotamer jump (χ₁ sampled
+            from `rotamer_wells_deg`, χ₂ sampled from
+            `aromatic_wells_deg` — when None, the v0.2 locked
+            `(-90, 0, 90, 180)` is used) instead of a joint Gaussian
+            Δχ. Default 0.3. Only consulted when
+            `concerted_dihedral_weight > 0`.
         skip_mmff_relax: bool : v0.2 ablation toggle (issue #15). When
             True, the dihedral-kick proposer's Stage-2 MMFF94 batched
             relax is bypassed — rotated coordinates pass directly to
@@ -1242,7 +1269,11 @@ def get_mol_PE_mcmm(
             across their barriers before MACE sees them, collapsing
             the dihedral-kick's intended diversity onto the MMFF94 PES
             instead of MACE's. Default False preserves v0.1 behaviour.
-            Only consulted when `dihedral_weight > 0`.
+            Threaded through to BOTH the single-bond
+            (`make_dihedral_kick_proposer`) and concerted
+            (`make_concerted_dihedral_kick_proposer`) factories — only
+            consulted when `dihedral_weight > 0` or
+            `concerted_dihedral_weight > 0`.
         dihedral_weight_by_atom_count: bool : v0 stub — when False
             (default) the dihedral kick uniformly samples side-chain
             rotatable bonds; True is a deferred follow-up
@@ -1386,6 +1417,10 @@ def get_mol_PE_mcmm(
         raise ValueError(f"cartesian_weight must be >= 0, got {cartesian_weight}")
     if dihedral_weight < 0:
         raise ValueError(f"dihedral_weight must be >= 0, got {dihedral_weight}")
+    if concerted_dihedral_weight < 0:
+        raise ValueError(
+            f"concerted_dihedral_weight must be >= 0, got {concerted_dihedral_weight}"
+        )
     dbt_proposer = make_mcmm_proposer(
         mol,
         hardware_opts=hardware_opts,
@@ -1398,6 +1433,7 @@ def get_mol_PE_mcmm(
     )
     from proposers import (
         make_cartesian_kick_proposer,
+        make_concerted_dihedral_kick_proposer,
         make_default_mcmm_composite,
         make_dihedral_kick_proposer,
     )
@@ -1429,12 +1465,33 @@ def get_mol_PE_mcmm(
             dihedral_weight_by_atom_count=dihedral_weight_by_atom_count,
             seed=seed + 5_555_555,
         )
+    concerted_dihedral_proposer = None
+    if concerted_dihedral_weight > 0.0:
+        concerted_dihedral_proposer = make_concerted_dihedral_kick_proposer(
+            mol,
+            hardware_opts=hardware_opts,
+            calc=calc,
+            sigma_concerted_chi_rad=sigma_concerted_chi_rad,
+            p_concerted_jump=p_concerted_jump,
+            sp3_wells_deg=rotamer_wells_deg,
+            aromatic_wells_deg=(
+                aromatic_wells_deg
+                if aromatic_wells_deg is not None
+                else (-90.0, 0.0, 90.0, 180.0)
+            ),
+            skip_mmff_relax=skip_mmff_relax,
+            score_chunk_size=score_chunk_size,
+            mmff_backend=mmff_backend,
+            seed=seed + 4_444_444,
+        )
     batch_propose_fn = make_default_mcmm_composite(
         dbt_proposer,
         cart_proposer=cart_proposer,
         dihedral_proposer=dihedral_proposer,
+        concerted_dihedral_proposer=concerted_dihedral_proposer,
         cartesian_weight=cartesian_weight,
         dihedral_weight=dihedral_weight,
+        concerted_dihedral_weight=concerted_dihedral_weight,
         seed=seed + 6_666_666,
     )
 

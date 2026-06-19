@@ -1098,3 +1098,210 @@ def test_mcmm_skip_mmff_relax_unused_when_dihedral_weight_zero():
         "make_dihedral_kick_proposer was constructed despite "
         "dihedral_weight=0.0 — the zero-overhead short-circuit is broken"
     )
+
+
+# ---------------------------------------------------------------------------
+# concerted_dihedral_weight kwarg threading (v0.3 Move A / issue #17)
+# ---------------------------------------------------------------------------
+
+
+def test_mcmm_concerted_dihedral_weight_zero_skips_concerted_factory():
+    """Default `concerted_dihedral_weight=0.0` runs without the
+    concerted dihedral-kick proposer in the route — its factory must
+    not be constructed (no MMFF + MACE setup cost paid, no aromatic
+    side-chain enumeration)."""
+    concerted_factory_calls = {"n": 0}
+    dihedral_factory_calls = {"n": 0}
+
+    def _spy_concerted_factory(mol, **kwargs):
+        del mol, kwargs
+        concerted_factory_calls["n"] += 1
+        return _stub_proposer_factory(None, None, None)
+
+    def _spy_dihedral_factory(mol, **kwargs):
+        del mol, kwargs
+        dihedral_factory_calls["n"] += 1
+        return _stub_proposer_factory(None, None, None)
+
+    mock_mace = _make_seq_mock_mace()
+    with (
+        patch("confsweeper.embed.EmbedMolecules", side_effect=_mock_etkdg_embed),
+        patch("confsweeper._mace_batch_energies", side_effect=mock_mace),
+        patch(
+            "nvmolkit.mmffOptimization.MMFFOptimizeMoleculesConfs",
+            return_value=[[]],
+        ),
+        patch("confsweeper.make_mcmm_proposer", side_effect=_stub_proposer_factory),
+        patch(
+            "proposers.make_dihedral_kick_proposer",
+            side_effect=_spy_dihedral_factory,
+        ),
+        patch(
+            "proposers.make_concerted_dihedral_kick_proposer",
+            side_effect=_spy_concerted_factory,
+        ),
+    ):
+        get_mol_PE_mcmm(
+            TEST_SMILES,
+            get_embed_params(),
+            hardware_opts=None,
+            calc=MagicMock(),
+            n_walkers_per_temp=1,
+            n_temperatures=2,
+            n_steps=1,
+            rmsd_threshold=0.0,
+        )
+    assert concerted_factory_calls["n"] == 0
+    assert dihedral_factory_calls["n"] == 0
+
+
+def test_mcmm_concerted_dihedral_weight_positive_builds_4way_composite():
+    """`concerted_dihedral_weight=0.5` should construct DBT + concerted
+    factories (each once at setup). Other factories must NOT be called
+    when their weights are 0."""
+    dbt_factory_calls = {"n": 0}
+    cart_factory_calls = {"n": 0}
+    dihedral_factory_calls = {"n": 0}
+    concerted_factory_calls = {"n": 0}
+
+    def _spy_dbt_factory(mol, hardware_opts, calc, **kwargs):
+        del hardware_opts, calc, kwargs
+        dbt_factory_calls["n"] += 1
+        return _stub_proposer_factory(mol, None, None)
+
+    def _spy_cart_factory(mol, **kwargs):
+        del mol, kwargs
+        cart_factory_calls["n"] += 1
+        return _stub_proposer_factory(None, None, None)
+
+    def _spy_dihedral_factory(mol, **kwargs):
+        del mol, kwargs
+        dihedral_factory_calls["n"] += 1
+        return _stub_proposer_factory(None, None, None)
+
+    def _spy_concerted_factory(mol, **kwargs):
+        del mol, kwargs
+        concerted_factory_calls["n"] += 1
+        return _stub_proposer_factory(None, None, None)
+
+    mock_mace = _make_seq_mock_mace()
+    with (
+        patch("confsweeper.embed.EmbedMolecules", side_effect=_mock_etkdg_embed),
+        patch("confsweeper._mace_batch_energies", side_effect=mock_mace),
+        patch(
+            "nvmolkit.mmffOptimization.MMFFOptimizeMoleculesConfs",
+            return_value=[[]],
+        ),
+        patch("confsweeper.make_mcmm_proposer", side_effect=_spy_dbt_factory),
+        patch("proposers.make_cartesian_kick_proposer", side_effect=_spy_cart_factory),
+        patch(
+            "proposers.make_dihedral_kick_proposer",
+            side_effect=_spy_dihedral_factory,
+        ),
+        patch(
+            "proposers.make_concerted_dihedral_kick_proposer",
+            side_effect=_spy_concerted_factory,
+        ),
+    ):
+        get_mol_PE_mcmm(
+            TEST_SMILES,
+            get_embed_params(),
+            hardware_opts=None,
+            calc=MagicMock(),
+            n_walkers_per_temp=1,
+            n_temperatures=2,
+            n_steps=1,
+            concerted_dihedral_weight=0.5,
+            rmsd_threshold=0.0,
+        )
+    assert dbt_factory_calls["n"] == 1
+    assert concerted_factory_calls["n"] == 1
+    assert cart_factory_calls["n"] == 0
+    assert dihedral_factory_calls["n"] == 0
+
+
+def test_mcmm_concerted_dihedral_weight_negative_raises():
+    mock_mace = _make_seq_mock_mace()
+    with (
+        patch("confsweeper.embed.EmbedMolecules", side_effect=_mock_etkdg_embed),
+        patch("confsweeper._mace_batch_energies", side_effect=mock_mace),
+        patch("confsweeper.make_mcmm_proposer", side_effect=_stub_proposer_factory),
+    ):
+        with pytest.raises(ValueError, match="concerted_dihedral_weight must be >= 0"):
+            get_mol_PE_mcmm(
+                TEST_SMILES,
+                get_embed_params(),
+                hardware_opts=None,
+                calc=MagicMock(),
+                n_walkers_per_temp=1,
+                n_temperatures=2,
+                n_steps=1,
+                concerted_dihedral_weight=-0.1,
+            )
+
+
+def test_mcmm_4way_routing_builds_all_four_factories():
+    """`cartesian_weight=0.2 + dihedral_weight=0.2 +
+    concerted_dihedral_weight=0.2` exercises the full 4-way route. All
+    four factories must be constructed exactly once at setup."""
+    dbt_factory_calls = {"n": 0}
+    cart_factory_calls = {"n": 0}
+    dihedral_factory_calls = {"n": 0}
+    concerted_factory_calls = {"n": 0}
+
+    def _spy_dbt_factory(mol, hardware_opts, calc, **kwargs):
+        del hardware_opts, calc, kwargs
+        dbt_factory_calls["n"] += 1
+        return _stub_proposer_factory(mol, None, None)
+
+    def _spy_cart_factory(mol, **kwargs):
+        del mol, kwargs
+        cart_factory_calls["n"] += 1
+        return _stub_proposer_factory(None, None, None)
+
+    def _spy_dihedral_factory(mol, **kwargs):
+        del mol, kwargs
+        dihedral_factory_calls["n"] += 1
+        return _stub_proposer_factory(None, None, None)
+
+    def _spy_concerted_factory(mol, **kwargs):
+        del mol, kwargs
+        concerted_factory_calls["n"] += 1
+        return _stub_proposer_factory(None, None, None)
+
+    mock_mace = _make_seq_mock_mace()
+    with (
+        patch("confsweeper.embed.EmbedMolecules", side_effect=_mock_etkdg_embed),
+        patch("confsweeper._mace_batch_energies", side_effect=mock_mace),
+        patch(
+            "nvmolkit.mmffOptimization.MMFFOptimizeMoleculesConfs",
+            return_value=[[]],
+        ),
+        patch("confsweeper.make_mcmm_proposer", side_effect=_spy_dbt_factory),
+        patch("proposers.make_cartesian_kick_proposer", side_effect=_spy_cart_factory),
+        patch(
+            "proposers.make_dihedral_kick_proposer",
+            side_effect=_spy_dihedral_factory,
+        ),
+        patch(
+            "proposers.make_concerted_dihedral_kick_proposer",
+            side_effect=_spy_concerted_factory,
+        ),
+    ):
+        get_mol_PE_mcmm(
+            TEST_SMILES,
+            get_embed_params(),
+            hardware_opts=None,
+            calc=MagicMock(),
+            n_walkers_per_temp=1,
+            n_temperatures=2,
+            n_steps=1,
+            cartesian_weight=0.2,
+            dihedral_weight=0.2,
+            concerted_dihedral_weight=0.2,
+            rmsd_threshold=0.0,
+        )
+    assert dbt_factory_calls["n"] == 1
+    assert cart_factory_calls["n"] == 1
+    assert dihedral_factory_calls["n"] == 1
+    assert concerted_factory_calls["n"] == 1

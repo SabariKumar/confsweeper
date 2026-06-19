@@ -20,8 +20,8 @@ Each move is implemented + validated in sequence; subsequent moves are *conditio
 | Step | Description | Status |
 |------|-------------|--------|
 | 1 | Lock Move A design forks | ✓ complete |
-| 2 | Move A: new `make_concerted_dihedral_kick_proposer` factory + `_enumerate_concerted_dihedral_pairs` helper + tests | pending |
-| 3 | Move A: extend `make_default_mcmm_composite` to 4 sub-proposers + thread `concerted_dihedral_weight` through `get_mol_PE_mcmm` + CLI | pending |
+| 2 | Move A: new `make_concerted_dihedral_kick_proposer` factory + `_enumerate_concerted_dihedral_pairs` helper + tests | ✓ complete (5/5 targeted) |
+| 3 | Move A: extend `make_default_mcmm_composite` to 4 sub-proposers + thread `concerted_dihedral_weight` through `get_mol_PE_mcmm` + CLI | ✓ complete (76/76 family; full suite pending) |
 | 4 | Move A: Validation — cremp_sharp + cremp_typical at n_seeds=10000 | pending |
 | 5 | **Decision point.** Does Move A close cremp_sharp (`cov_bw_ceil > 0.10`)? If yes → skip to Step 13. If no → proceed to Step 6. | pending |
 | 6 | Lock Move B (cis-trans ω) design forks | conditional |
@@ -240,3 +240,52 @@ All four open forks resolved. Three at the running recommendations from the tabl
 - **Step 3** = extend `make_default_mcmm_composite` from 3 sub-proposers → 4 sub-proposers (the `weight > 0 ↔ proposer not None` contract generalises naturally; sum constraint becomes `cartesian_weight + dihedral_weight + concerted_dihedral_weight ≤ 1`). Thread `concerted_dihedral_weight` through `get_mol_PE_mcmm` + CLI flag on `sampler_benchmark.py`. ~3-5 new tests for the composite extension + integration spies.
 
 Step 1 closes; Step 2 (new factory + eligibility helper + tests) unblocked.
+
+### Step 2 Outcome — make_concerted_dihedral_kick_proposer factory + helper + tests (2026-06-19)
+
+**Eligibility helper** `_enumerate_concerted_dihedral_pairs(mol)` shipped at [src/proposers.py:323-373](../src/proposers.py#L323). Algorithm: from `_enumerate_side_chain_dihedrals(mol)`, filter to χ₂ candidates (atom-c aromaticity flag, reusing v0.2's `_classify_rotamer_wells` logic); for each χ₂ candidate `(_, b₂, _, _)`, find the unique upstream χ₁ whose downstream atom `c₁` equals `b₂` (the shared Cβ). Returns `list[tuple[chi1_quadruple, chi2_quadruple]]`. Smoke-test on cremp_sharp: 8 side-chain dihedrals total, exactly 1 concerted pair (the NMe-Trp χ₁ = (Cα, Cβ), χ₂ = (Cβ, Cγ_indole) coupling) — matches expectation.
+
+**New factory** `make_concerted_dihedral_kick_proposer` shipped at [src/proposers.py:1078-1318](../src/proposers.py#L1078). Mirrors `make_dihedral_kick_proposer`'s per-call pipeline (stage walker coords → joint-rotation → batched MMFF → batched MACE → assemble proposals) but:
+
+- Picks a (χ₁, χ₂) pair from `_enumerate_concerted_dihedral_pairs` per walker per step.
+- **Hybrid joint move shape** per A.1 lock: with prob `p_concerted_jump` (default 0.3) take a joint rotamer jump (χ₁_target sampled from `sp3_wells_deg`, χ₂_target sampled from `aromatic_wells_deg`); otherwise take a joint Gaussian step (independent Δχ₁, Δχ₂ each from `N(0, sigma_concerted_chi_rad)`).
+- Rotations applied via two successive `rdMolTransforms.SetDihedralDeg` calls — χ₁ first (its rotation moves χ₂'s b and c atoms, so the Gaussian branch reads χ₂'s current angle AFTER applying χ₁).
+- 6 stats counters: `n_proposed`, `n_concerted_gaussian_steps`, `n_concerted_rotamer_jumps`, `n_relax_failures`, `n_relax_successes`, `n_mmff_skipped`. Threads v0.2's `skip_mmff_relax` for the same MMFF-snap-back ablation path.
+- `det_j = 1.0` per A.4 lock (joint open-tree 2D rotation is volume-preserving).
+- 5 validation paths at factory build time (mmff_backend, p_concerted_jump range, sigma sign, empty sp3 wells, empty aromatic wells, plus the no-aromatic-pairs ValueError).
+
+**5 new tests in `tests/test_mcmm.py`** (Step-2 / Move-A section):
+
+- `test_enumerate_concerted_dihedral_pairs_finds_trp_chi1_chi2_on_cremp_sharp` — locks the shared-Cβ invariant (c₁ == b₂) and the χ₂-c-aromaticity contract on cremp_sharp's NMe-Trp pair.
+- `test_enumerate_concerted_dihedral_pairs_empty_on_pure_sp3_peptide` — cyclic-Ala-Ser returns `[]`; same contract as `make_concerted_dihedral_kick_proposer` raising at factory build time.
+- `test_make_concerted_dihedral_kick_proposer_raises_on_pure_sp3_peptide` — factory raises `ValueError("no enumerable aromatic side-chain")` instead of silently building a no-op proposer.
+- `test_make_concerted_dihedral_kick_proposer_validation_kwargs` — exercises the 5 factory-build validation paths.
+- `test_concerted_dihedral_kick_pure_rotamer_jump_lands_in_joint_wells` — locks the rotamer-jump branch invariant: at `p_concerted_jump=1.0` with MMFF mocked as no-op, every proposal's post-rotation (χ₁, χ₂) reads back to one of the joint wells exactly (χ₁ in `sp3_wells_deg`, χ₂ in `aromatic_wells_deg`).
+
+Targeted run: **5/5 in 2.74 s.**
+
+### Step 3 Outcome — 4-way composite extension + CLI thread-through + integration tests (2026-06-19)
+
+**`make_default_mcmm_composite` extended to 4 sub-proposers** at [src/proposers.py:1432-1572](../src/proposers.py#L1432). New `concerted_dihedral_proposer` positional + `concerted_dihedral_weight: float = 0.0` keyword. The (weight > 0 ↔ proposer not None) contract generalises naturally; sum constraint becomes `cartesian_weight + dihedral_weight + concerted_dihedral_weight ≤ 1`. The short-circuit-to-single-active-proposer path still fires when only one weight is positive (zero composite-routing overhead preserved). All 16 existing 3-way tests pass unchanged → 4-way extension is fully back-compat.
+
+**`get_mol_PE_mcmm` threaded** at [src/confsweeper.py](../src/confsweeper.py): 3 new kwargs (`concerted_dihedral_weight: float = 0.0`, `sigma_concerted_chi_rad: float = 0.5`, `p_concerted_jump: float = 0.3`) — defaults preserve v0.2 byte-for-byte. New `concerted_dihedral_weight < 0` validation. New routing branch builds the concerted proposer only when `concerted_dihedral_weight > 0` (seed offset `+4_444_444`). `aromatic_wells_deg` is plumbed: when the caller's value is None (preserving v0.1 single-bond behaviour), the concerted factory's call site falls back to the v0.2 locked `(-90.0, 0.0, 90.0, 180.0)` — the concerted move always operates with aromatic wells since it's eligibility-bound to aromatic side chains by construction. `skip_mmff_relax` threads through to both single-bond and concerted factories simultaneously, matching the docstring contract.
+
+**`scripts/sampler_benchmark.py` CLI extended** at [scripts/sampler_benchmark.py](../scripts/sampler_benchmark.py): two new flags `--concerted_dihedral_weight FLOAT` and `--p_concerted_jump FLOAT`. Threaded through 8 sites following the Step-3 / Step-6 pattern: `_run_mcmm` signature + body pass to `get_mol_PE_mcmm`, `run_one` signature + dispatcher, click options, `main()` signature, start-of-run log line (`concerted_dihedral_weight=%.2f p_concerted_jump=%.2f`), and `run_one(...)` call. Verified live via `pixi run python scripts/sampler_benchmark.py --help`.
+
+**7 new composite tests in `tests/test_mcmm.py`** (4-way extension section):
+
+- `test_default_mcmm_composite_validation_negative_concerted_weight` — non-negative-weight guard for the new kwarg.
+- `test_default_mcmm_composite_validation_4way_sum_exceeds_one` — sum constraint generalises to 4-way.
+- `test_default_mcmm_composite_validation_concerted_weight_without_proposer` / `_concerted_proposer_without_weight` — the contract from the 3-way version applied to the 4th sub-proposer.
+- `test_default_mcmm_composite_pure_concerted_short_circuits` — `concerted_dihedral_weight=1.0` returns the proposer directly (no composite overhead).
+- `test_default_mcmm_composite_four_way_distribution` — DBT=0.4, cart=0.2, dihedral=0.2, concerted=0.2 across 4000 walkers; each route within ±10 % of expected share.
+- `test_default_mcmm_composite_four_way_substats_reachable` — `composite.stats == [dbt.stats, cart.stats, dih.stats, cdih.stats]` in route order.
+
+**4 new integration tests in `tests/test_get_mol_PE_mcmm.py`** (Move-A thread-through section):
+
+- `test_mcmm_concerted_dihedral_weight_zero_skips_concerted_factory` — default zero ⇒ factory not constructed (no MMFF + MACE setup paid).
+- `test_mcmm_concerted_dihedral_weight_positive_builds_4way_composite` — `concerted_dihedral_weight=0.5` alone builds DBT + concerted only (other factories not called).
+- `test_mcmm_concerted_dihedral_weight_negative_raises` — entry-point validation.
+- `test_mcmm_4way_routing_builds_all_four_factories` — `cart=0.2 dih=0.2 concerted=0.2` exercises full 4-way; all four factories called exactly once.
+
+Targeted runs: 7/7 composite + 4/4 integration in 2.97 s. **Combined regression across dihedral + composite + 4-way-routing families: 76/76 in 5.12 s** — no regression on any v0.1 / v0.2 test. Full suite kicked off in parallel; predicted **457 passed, 8 skipped** (+16 over v0.2's 441/8 = 5 Step-2 + 7 Step-3-composite + 4 Step-3-integration). Step 3 closes; Step 4 (Validation A sweep) unblocked.

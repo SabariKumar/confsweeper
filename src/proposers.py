@@ -1433,25 +1433,34 @@ def make_default_mcmm_composite(
     dbt_proposer,
     cart_proposer=None,
     dihedral_proposer=None,
+    concerted_dihedral_proposer=None,
     *,
     cartesian_weight: float = 0.0,
     dihedral_weight: float = 0.0,
+    concerted_dihedral_weight: float = 0.0,
     seed: int = 0,
 ):
     """
-    Assemble the canonical (DBT, Cartesian-kick, dihedral-kick) composite
-    used by `get_mol_PE_mcmm`. DBT residual weight is
-    `1 - cartesian_weight - dihedral_weight`; the helper validates the
-    sum and the (weight > 0 ↔ proposer not None) contract, then
-    short-circuits to the lone active proposer when only one weight is
-    positive (zero composite-routing overhead — matches the existing
-    "if cartesian_weight == 0: batch_propose_fn = dbt_proposer" path
-    the issue-#10 routing relied on).
+    Assemble the canonical (DBT, Cartesian-kick, dihedral-kick,
+    concerted-dihedral-kick) composite used by `get_mol_PE_mcmm`. DBT
+    residual weight is
+    `1 - cartesian_weight - dihedral_weight - concerted_dihedral_weight`;
+    the helper validates the sum and the
+    (weight > 0 ↔ proposer not None) contract, then short-circuits to
+    the lone active proposer when only one weight is positive (zero
+    composite-routing overhead — matches the existing "if
+    cartesian_weight == 0: batch_propose_fn = dbt_proposer" path the
+    issue-#10 routing relied on).
+
+    v0.3 (issue #17) added the 4th sub-proposer
+    (`make_concerted_dihedral_kick_proposer`) for the concerted
+    (χ₁, χ₂) move on aromatic side chains; the contract generalises
+    naturally from the issue-#15 3-way helper.
 
     The caller is responsible for NOT building a sub-proposer whose
-    weight is zero; the helper enforces this so a `cart_proposer` is
-    never silently constructed and then ignored, which would waste the
-    MMFF + MACE setup cost.
+    weight is zero; the helper enforces this so e.g. a
+    `concerted_dihedral_proposer` is never silently constructed and
+    then ignored, which would waste the MMFF + MACE setup cost.
 
     Params:
         dbt_proposer: callable : the DBT (`make_mcmm_proposer`) batch
@@ -1459,13 +1468,20 @@ def make_default_mcmm_composite(
         cart_proposer: callable | None : Cartesian-kick
             (`make_cartesian_kick_proposer`) batch propose function.
             Must be None iff `cartesian_weight == 0.0`.
-        dihedral_proposer: callable | None : dihedral-kick
+        dihedral_proposer: callable | None : single-bond dihedral-kick
             (`make_dihedral_kick_proposer`) batch propose function.
             Must be None iff `dihedral_weight == 0.0`.
+        concerted_dihedral_proposer: callable | None : concerted
+            (χ₁, χ₂) dihedral-kick
+            (`make_concerted_dihedral_kick_proposer`) batch propose
+            function. Must be None iff
+            `concerted_dihedral_weight == 0.0`. v0.3 Move A.
         cartesian_weight: float : routing weight for the Cartesian kick,
             in [0, 1]. Default 0.0.
-        dihedral_weight: float : routing weight for the dihedral kick,
-            in [0, 1]. Default 0.0.
+        dihedral_weight: float : routing weight for the single-bond
+            dihedral kick, in [0, 1]. Default 0.0.
+        concerted_dihedral_weight: float : routing weight for the
+            concerted (χ₁, χ₂) dihedral kick, in [0, 1]. Default 0.0.
         seed: int : routing RNG seed; threaded into `make_composite_proposer`
             when a composite is needed.
     Returns:
@@ -1475,20 +1491,26 @@ def make_default_mcmm_composite(
             a dict, not a list — and the existing dict/list aggregation
             in `get_mol_PE_mcmm` handles both shapes).
     Raises:
-        ValueError: any weight is negative; `cartesian_weight + dihedral_weight > 1`;
+        ValueError: any weight is negative;
+            `cartesian_weight + dihedral_weight + concerted_dihedral_weight > 1`;
             or the (weight > 0 ↔ proposer not None) contract is violated
-            for either sub-proposer.
+            for any sub-proposer.
     """
-    if cartesian_weight < 0.0 or dihedral_weight < 0.0:
+    if (
+        cartesian_weight < 0.0
+        or dihedral_weight < 0.0
+        or concerted_dihedral_weight < 0.0
+    ):
         raise ValueError(
             f"weights must be non-negative, got cartesian_weight={cartesian_weight}, "
-            f"dihedral_weight={dihedral_weight}"
+            f"dihedral_weight={dihedral_weight}, "
+            f"concerted_dihedral_weight={concerted_dihedral_weight}"
         )
-    total_non_dbt = cartesian_weight + dihedral_weight
+    total_non_dbt = cartesian_weight + dihedral_weight + concerted_dihedral_weight
     if total_non_dbt > 1.0 + 1e-12:
         raise ValueError(
-            f"cartesian_weight + dihedral_weight = {total_non_dbt} > 1.0; "
-            "DBT residual weight would be negative"
+            f"cartesian_weight + dihedral_weight + concerted_dihedral_weight "
+            f"= {total_non_dbt} > 1.0; DBT residual weight would be negative"
         )
     if (cartesian_weight > 0.0) != (cart_proposer is not None):
         raise ValueError(
@@ -1502,6 +1524,13 @@ def make_default_mcmm_composite(
             f"{'None' if dihedral_proposer is None else 'not None'}; "
             "weight > 0 iff proposer not None"
         )
+    if (concerted_dihedral_weight > 0.0) != (concerted_dihedral_proposer is not None):
+        raise ValueError(
+            f"concerted_dihedral_weight={concerted_dihedral_weight} but "
+            f"concerted_dihedral_proposer is "
+            f"{'None' if concerted_dihedral_proposer is None else 'not None'}; "
+            "weight > 0 iff proposer not None"
+        )
 
     dbt_weight = 1.0 - total_non_dbt
 
@@ -1512,6 +1541,8 @@ def make_default_mcmm_composite(
         active.append((cartesian_weight, cart_proposer))
     if dihedral_proposer is not None:
         active.append((dihedral_weight, dihedral_proposer))
+    if concerted_dihedral_proposer is not None:
+        active.append((concerted_dihedral_weight, concerted_dihedral_proposer))
 
     if len(active) == 1:
         return active[0][1]
