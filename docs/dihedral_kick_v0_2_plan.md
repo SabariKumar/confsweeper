@@ -198,6 +198,7 @@ All four forks locked at the choices above. The conversation is captured under t
 - **Partial / constrained MMFF relax.** If `skip_mmff_relax=True` produces uninterpretable acceptance rates, a v0.3 candidate replaces the full Stage-2 MMFF with a constrained MMFF that freezes the rotated dihedral. Trigger: Step 7 cell B.3 or B.4 shows acceptance < 5 %.
 - **Concerted χ₁ + χ₂ rotation.** If all four Step 7 cells stay at zero on cremp_sharp, the v0 single-dihedral-per-step lock is the bottleneck. A v0.3 proposer would rotate χ₁ AND χ₂ together on aromatic side chains. Implementation cost: significant — the joint rotation is non-trivial to keep volume-preserving.
 - **Generalisation to non-CREMP peptides.** v0.2 validation is limited to the 2 CREMP peptides with ceiling SDFs. If the issue-#15 PR ships and the user wants to run on `pampa_large` etc, a v0.3 candidate generates ceilings for those peptides (`scripts/cremp_collapse_test.py`-style pipeline) so the Boltzmann-coverage diagnostic can apply.
+- **Broaden the ETKDG-vs-MC comparison across more CREMP peptides.** The 2026-06-19 finding (exhaustive ETKDG ties MC B.4 at matched budget on both current peptides) is on only 2 peptides, single-run. To establish *where* MC actually beats no-MC on ceiling coverage, score `exhaustive_etkdg` vs the MC sampler across a larger CREMP subset (those with ceiling SDFs / collapse-test data), with replicates for mean ± spread. Trigger: in progress — chosen 2026-06-19 over drawing a single-run before/after figure. Output is the intended replacement for the deferred `scripts/before_after_coverage_figure.py`.
 
 ---
 
@@ -235,3 +236,21 @@ Step 1 closes; Step 2 (aromatic-aware per-bond well helper) unblocked.
 **Recovery for the actual Step-4 sweep.** `scripts/sweep_v0_2_step4_recover.sh` reused the cell-1 cremp_typical data (clean: 11+15 basins via kabsch+crest at n_seeds=10000) and re-ran cell-1 cremp_sharp + cell-2 both peptides from scratch. ~80 min wall-clock; clean completion at 09:07:43 on 2026-06-17.
 
 **Lesson recorded for future GPU-bound sweeps:** do not kick off the full pytest suite (which loads MACECalculator on the same GPU for `tests/test_confsweeper.py::test_run_PE_calc_cli` and similar) while a sweep is running. Sequential or different-GPU only.
+
+### Exhaustive ETKDG ties the MC sampler on ceiling coverage at matched budget (2026-06-19)
+
+**Surfaced while building a before/after coverage figure.** To draw an honest ETKDG-vs-MC comparison, the original randomized sampler (`exhaustive_etkdg` = `get_mol_PE_exhaustive`, saturation-validated defaults) was run at the **same `n_seeds=10000`** as the v0.2 B.4 cell and scored through the **identical** harness (`scripts/union_basin_count.py`, kabsch dedup, `match_rmsd=0.5`, against `results/cremp_ceiling_sdfs/`). Result:
+
+| peptide | exhaustive ETKDG (no MC) | v0.2 MC B.4 (aromatic + skip-MMFF) |
+|---|---|---|
+| cremp_typical (t.I.G.N) | **0.997** (cov_count 21/22, 15 basins) | 0.997 (cov_count 21/22, 14 basins) |
+| cremp_sharp (S.S.N.MeW.MeA.MeN) | **0.000** (`max_missed_bw=0.724`) | 0.000 (`max_missed_bw=0.724`) |
+
+**Interpretation — this qualifies the v0.2 headline.** At matched 10k-seed budget, plain ETKDG **matches** the best MC config on `coverage_bw_ceiling` for *both* CREMP peptides: it ties at 0.997 on cremp_typical and fails identically on cremp_sharp. The v0.2 work therefore did **not** improve ceiling coverage over exhaustive ETKDG on these two peptides — its measurable gains (0.989 → 0.997, the aromatic × skip-MMFF synergy) are gains *within the MC config space*, not over the no-MC baseline. Nothing in the prior plans actually claimed otherwise: the "+0.16 over baseline" in the Step-1 motivation is relative to the **issue-#10 MCMM baseline (DBT-only, 0.83)**, never to ETKDG. The ETKDG-superiority framing was an external assumption, and this run falsifies it for cremp_typical.
+
+**Caveats.**
+- **Single-run, high variance.** Both numbers are one run each. `data/processed/saturation/saturation_etkdg.csv` shows ETKDG on cremp_typical landing anywhere from 1 to 54 basins across single 10k-seed runs, so a single-run head-to-head is fragile. Replicates (mean ± spread) are needed before any quantitative claim.
+- **Metric ≠ the saturation figure.** The earlier saturation evidence (`max_bw`/`eff_n` of the *recovered ensemble* collapsing toward one-hot) measures the sampler's own ensemble entropy, **not** coverage of the ceiling's Boltzmann mass. A run can be near-one-hot in its own ensemble yet still drop a basin near each dominant ceiling basin — so low `eff_n` does not imply low `coverage_bw_ceiling`. The two metrics are not interchangeable and should not be conflated in figures.
+- **Two peptides only.** Both carry a ground-truth ceiling; the `pampa_*` peptides do not. Where (and whether) MC actually beats ETKDG on ceiling coverage is an open question — being pursued by broadening the comparison across more CREMP peptides (see Deferred follow-ups).
+
+**Artefacts.** `results/etkdg_baseline_coverage.csv` (ETKDG coverage, this run); `results/etkdg_baseline_sdfs/` (raw basin SDFs) + `results/etkdg_baseline_sdfs_mcmm/` (renamed for the `*_mcmm.sdf` glob); `results/etkdg_baseline_sampler.csv` (sampler-side metrics). Regenerate via `scripts/sampler_benchmark.py --samplers exhaustive_etkdg --n_seeds 10000` then `scripts/union_basin_count.py`.

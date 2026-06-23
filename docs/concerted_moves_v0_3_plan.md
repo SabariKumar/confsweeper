@@ -24,7 +24,7 @@ Each move is implemented + validated in sequence; subsequent moves are *conditio
 | 3 | Move A: extend `make_default_mcmm_composite` to 4 sub-proposers + thread `concerted_dihedral_weight` through `get_mol_PE_mcmm` + CLI | ✓ complete (76/76 family; full suite pending) |
 | 4 | Move A: Validation — cremp_sharp + cremp_typical at n_seeds=10000 | pending |
 | 5 | **Decision point.** Does Move A close cremp_sharp (`cov_bw_ceil > 0.10`)? If yes → skip to Step 13. If no → proceed to Step 6. | pending |
-| 6 | Lock Move B (cis-trans ω) design forks | conditional |
+| 6 | Lock Move B (cis-trans ω) design forks | ✓ complete (2026-06-22; forks locked, Step 4 ruled out Move A → escalated to B) |
 | 7 | Move B: implementation + thread-through | conditional |
 | 8 | Move B: Validation + decision point | conditional |
 | 9 | Lock Move C (multi-window DBT) design forks | conditional |
@@ -141,9 +141,69 @@ cremp_sharp has 3 NMe residues (positions 4, 5, 6). NMe peptide bonds strongly p
 
 **Hypothesis.** The dominant cremp_sharp ceiling basin may be a cis-ω state at one (or more) of the three NMe positions that no v0.2 proposer can reach.
 
-### Design forks (TBD when Step 6 lands)
+### Design forks — LOCKED (2026-06-22, Step 6)
 
-Detailed design-fork tables for B.1 (closure scheme for cis-ω chains), B.2 (per-NMe-residue eligibility), B.3 (proposal probability), B.4 (Jacobian / reversibility), B.5 (composition with DBT) — left open until Step 6.
+Step 4 ruled out Move A (cremp_sharp `cov_bw_ceil = 0.000` across concerted weights 0.00/0.17/0.34, both dedup modes; dominant ceiling basin `max_missed_bw = 0.724` unreached), so per Step 5 we escalate to Move B. Forks locked:
+
+| fork | locked choice | rationale |
+|---|---|---|
+| **B.1 Closure scheme** | Numerical closure with ω driven to the cis target — reuse the existing `concerted_rotation` `scipy.optimize.least_squares` solver, fixing the flipped ω at 0° and solving the remaining backbone dihedrals to re-close the macrocycle. | No new analytical derivation needed — this is exactly why v0 chose numerical over the trans-only Coutsias polynomial. Sidesteps the "cis-ω closure requires non-trivial geometry work" risk entirely. Effort: low. Analytical cis-ω closure (B.1c) deferred unless numerical proves insufficient. |
+| **B.2 Eligibility** | NMe ω bonds only. Detect via `torsional_sampling.classify_backbone_residues` "NMe" class; the ω is the C(=O)–N amide bond at each NMe backbone nitrogen. | Matches the locked v0.3 scope and the hypothesis (cremp_sharp's 3 NMe residues, pos 4–6). Non-NMe and proline cis ω are rarer and combinatorially heavier — deferred follow-ups. |
+| **B.3 Proposal probability** | Uniform single-ω cis↔trans toggle: pick one eligible NMe ω uniformly, set its target to the opposite state (trans→cis or cis→trans). One topology change per step. | Symmetric proposal → clean detailed balance; one move per step matches the conservative pattern of the other proposers; Metropolis + MACE energy naturally selects the favored state, so no proposal bias (B.3b) is needed. Multi-ω (B.3c) deferred. |
+| **B.4 Jacobian / reversibility** | Wu–Deem 1999 finite-difference Jacobian, reusing the `MoveProposal.det_j` machinery. | Cascades from B.1a: the cis-ω re-closure adjusts dependent backbone dihedrals through the same non-volume-preserving constrained map as DBT, so the same correction applies. Wu–Deem 1999 is literally the analytical-rebridging method for cis/trans isomerization in cyclic peptides — it covers reversibility of the trans↔cis path. |
+| **B.5 Composition with DBT** | 5th independent sub-proposer with its own routing weight (`omega_flip_weight`), dispatched per-walker-per-step by `make_composite_proposer`. | Same pattern as Cartesian-kick / dihedral-kick / concerted-dihedral → clean isolated ablation. The composite refactor to 4–6 sub-proposers is already planned for Step 13. |
+
+### Findings 2026-06-22 — Step 7 geometry: closure cannot tightly close large ω flips
+
+`concerted_rotation.propose_omega_flip` landed (continuation closure reusing
+`closure_residual` + Wu–Deem `det_j`) with 7 passing unit tests. The primitive
+is correct: ω lands exactly on target, identity/failure/validation paths hold.
+**But a geometry probe shows the v0 closure cannot tightly re-close a large ω
+flip.** The closure holds r5+r6 fixed (6 constraints) against only 3 free
+dihedrals — over-determined — so the best-fit residual grows steeply with the
+drive (synthetic 7-atom chain):
+
+| ω drive (rad) | closure residual (Å) |
+|---|---|
+| 0.05 | 0.015 |
+| 0.25 | 0.103 |
+| 0.50 | 0.34 |
+| 1.0 | ~1.0 |
+| π (full cis) | 3.4 |
+
+Continuation tracks the *same* best-fit (no improvement) — warm-starting can't
+beat an over-determined minimum. A real trans→cis flip (~π) leaves an ~Å ring
+distortion, far above the DBT tolerance (0.01 Å). This is the flagged Move-B
+risk materializing at the geometry level: the locked **B.1a** ("reuse the
+existing numerical closure") is geometrically insufficient for large flips
+because the existing solver exposes only 3 free dihedrals.
+
+**Decision (2026-06-22, resolved):** probe real geometry first; if it doesn't
+close, widen the closure (more free dihedrals); do not depend on MMFF.
+
+Real-geometry probe on cremp_sharp conformer 0 (3 NMe ω sites) confirmed the
+synthetic finding — the W=7 closure leaves 1.4–2.0 Å residuals on full cis
+flips (N@4: 1.43 Å, N@16: 2.02 Å; N@1 was already cis). Real backbones close
+large flips no better than the synthetic chain. So per the locked fallback we
+**widen the window**. A second probe with a generalised W-atom closure
+(fix the last 2 atoms; drive ω centred; W−4 free dihedrals; `trf` solver to
+handle the under-determined large-W case) found:
+
+| NMe site | W=7 | W=10 | W=12 | W=14 |
+|---|---|---|---|---|
+| N@1 | 0.002 | 0.000 | 0.000 | 0.000 |
+| N@4 | 1.431 | 0.000 | 0.000 | 0.000 |
+| N@16 | 2.017 | 0.000 | 0.000 | 0.000 |
+
+**B.1 re-locked → B.1a-widened: numerical closure on a 10-atom window.** W=10
+gives 6 free dihedrals after the ω drive — exactly-determined for the 6 r₈/r₉
+position constraints — and closes every real NMe full cis flip to 0.000 Å with
+no MMFF. W=10 is the minimal clean close (W=12/14 also work but perturb more of
+the ring per move and cost more; W=7 is insufficient). Implementation
+consequence: `concerted_rotation` is generalised from a hardcoded 7-atom /
+4-dihedral chain to variable window size (DBT keeps using W=7; the ω-flip path
+uses W=10), and the ω-flip solver switches to `trf` (handles the
+exactly/under-determined shapes `lm` rejects).
 
 ### Validation B sketch
 
@@ -209,6 +269,7 @@ If no Move closes cremp_sharp individually, the matrix tests combinations (Move 
 - **2D joint rotamer-well grid for Move A** (option (a2) above). Trigger: if (a3) doesn't close cremp_sharp at any A.2/A.3 cell, the joint-grid variant becomes the next candidate before Move B.
 - **Non-NMe cis-ω support for Move B.** v0.3 Move B targets NMe positions only; non-NMe cis ω is much rarer and adds combinatorial complexity. Deferred unless Move B succeeds on NMe and the diagnostics suggest extending.
 - **Move C window size > 6.** v0.3 Move C caps at 5–6 residues; longer windows are deferred unless C succeeds at the smaller size and there's residual room to grow.
+- **Widen the DBT window from W=7 to W=10 (broader-exploration lever).** The Step-7 ω-flip work generalised `concerted_rotation` to any window size, so DBT could enumerate W=10 windows (6 free dihedrals, exactly-determined closure) instead of W=7 (3 free, over-determined) at essentially zero implementation cost — just emit 10-atom windows and rebuild the per-window downstream sets. Trade-off (user-accepted direction, 2026-06-22): a W=10 DBT move rearranges more of the ring per step, so it explores more broadly at the cost of a lower closure-success / acceptance rate, and the Wu–Deem Jacobian column grows from 3-d to 6-d. Not pulled now because DBT's `drive_sigma_rad` / `closure_tol` and the v0.2 / Step-4 benchmarks are all tuned for W=7; pulling it means re-tuning and re-benchmarking DBT. **Trigger:** if backbone exploration saturates (DBT basin discovery plateaus, or cremp-style coverage stalls with the dominant gap looking like a large-amplitude backbone rearrangement) and we want more aggressive, less-local backbone moves. Could ship as a configurable `window_size` on the DBT proposer (default 7) rather than a hard switch, so both regimes stay available.
 
 ---
 

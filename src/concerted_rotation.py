@@ -148,12 +148,14 @@ def dihedral_angle(
 
 def apply_dihedral_changes(positions: np.ndarray, deltas: np.ndarray) -> np.ndarray:
     """
-    Apply incremental dihedral changes to a 7-atom chain.
+    Apply incremental dihedral changes to a W-atom chain (W >= 4).
 
-    Atoms r0, r1 stay fixed (the upstream-frame convention). Atoms r2..r6
-    may move. `deltas[k]` (k in 0..3) is the change to the dihedral around
-    bond (k+1, k+2), applied as a rigid rotation of all atoms strictly
-    downstream of that bond, around the bond axis.
+    Atoms r0, r1 stay fixed (the upstream-frame convention). Atoms
+    r2..r(W-1) may move. A W-atom chain has W-3 inner dihedrals;
+    `deltas[k]` (k in 0..W-4) is the change to the dihedral around bond
+    (k+1, k+2), applied as a rigid rotation of all atoms strictly
+    downstream of that bond, around the bond axis. W=7 (the DBT case,
+    4 dihedrals) and W=10 (the ω-flip case, 7 dihedrals) are both used.
 
     The order matters: deltas are applied k=0 first, then k=1, ..., k=3.
     Each rotation acts on the geometry produced by the previous rotations,
@@ -169,19 +171,24 @@ def apply_dihedral_changes(positions: np.ndarray, deltas: np.ndarray) -> np.ndar
     j = k, where τk changes by exactly deltas[k].
 
     Params:
-        positions: np.ndarray (7, 3) : starting atom positions
-        deltas: np.ndarray (4,) : dihedral changes in radians
+        positions: np.ndarray (W, 3) : starting atom positions, W >= 4
+        deltas: np.ndarray (W-3,) : dihedral changes in radians
     Returns:
-        np.ndarray (7, 3) : new atom positions
+        np.ndarray (W, 3) : new atom positions
     """
-    if positions.shape != (7, 3):
-        raise ValueError(f"positions must be (7, 3), got {positions.shape}")
+    if positions.ndim != 2 or positions.shape[1] != 3 or positions.shape[0] < 4:
+        raise ValueError(f"positions must be (W, 3) with W >= 4, got {positions.shape}")
+    window_size = positions.shape[0]
+    n_dih = window_size - 3
     deltas = np.asarray(deltas, dtype=float)
-    if deltas.shape != (N_DIHEDRALS,):
-        raise ValueError(f"deltas must be ({N_DIHEDRALS},), got {deltas.shape}")
+    if deltas.shape != (n_dih,):
+        raise ValueError(
+            f"deltas must be ({n_dih},) for a {window_size}-atom window, "
+            f"got {deltas.shape}"
+        )
 
     pos = positions.copy().astype(float)
-    for k in range(N_DIHEDRALS):
+    for k in range(n_dih):
         delta = float(deltas[k])
         if delta == 0.0:
             continue
@@ -198,7 +205,7 @@ def apply_dihedral_changes(positions: np.ndarray, deltas: np.ndarray) -> np.ndar
         axis = axis_vec / axis_norm
         R = rotation_matrix(axis, delta)
         pivot = pos[k + 2]
-        for idx in range(k + 3, 7):
+        for idx in range(k + 3, window_size):
             pos[idx] = pivot + R @ (pos[idx] - pivot)
     return pos
 
@@ -283,19 +290,38 @@ def _expand_deltas(
     Build the full (4,) deltas vector from drive + 3 non-drive components.
 
     Params:
-        drive_idx: int : index of drive dihedral in [0, 3]
+        drive_idx: int : index of drive dihedral
         drive_delta: float : drive perturbation in radians
-        free_deltas: np.ndarray (3,) : the three non-drive deltas in order
+        free_deltas: np.ndarray (n_dih-1,) : the non-drive deltas in order
     Returns:
-        np.ndarray (4,) : full deltas vector
+        np.ndarray (n_dih,) : full deltas vector, where n_dih =
+            len(free_deltas) + 1 (one slot for the drive)
     """
-    deltas = np.empty(N_DIHEDRALS)
+    n_dih = len(free_deltas) + 1
+    deltas = np.empty(n_dih)
     deltas[drive_idx] = drive_delta
     free_iter = iter(free_deltas)
-    for k in range(N_DIHEDRALS):
+    for k in range(n_dih):
         if k != drive_idx:
             deltas[k] = next(free_iter)
     return deltas
+
+
+def _wrap_to_pi(angle_rad: float) -> float:
+    """
+    Wrap an angle to the half-open interval [-π, π).
+
+    Used by `propose_omega_flip` to express the trans↔cis ω change as the
+    shortest signed rotation from the current ω to the target. The branch
+    cut at ±π is immaterial for ω flips: a +π and a −π drive both reach
+    the same cis (or trans) state.
+
+    Params:
+        angle_rad: float : angle in radians
+    Returns:
+        float : equivalent angle in [-π, π)
+    """
+    return float((angle_rad + np.pi) % (2.0 * np.pi) - np.pi)
 
 
 def closure_residual(
@@ -305,25 +331,29 @@ def closure_residual(
     free_deltas: np.ndarray,
 ) -> np.ndarray:
     """
-    Apply all dihedral changes and return the displacement of atoms r5, r6
-    from their original positions.
+    Apply all dihedral changes and return the displacement of the last two
+    window atoms (r(W-2), r(W-1)) from their original positions.
 
-    The closure problem solved by `propose_move` is finding `free_deltas`
-    such that this residual norm falls below the tolerance. Exposed for
-    testing and for callers that want to integrate the closure into a
-    different solver.
+    The closure problem solved by `propose_move` / `propose_omega_flip` is
+    finding `free_deltas` such that this residual norm falls below the
+    tolerance. Exposed for testing and for callers that want to integrate
+    the closure into a different solver. Window size W is inferred from
+    `positions`; W=7 (DBT) fixes r5, r6 and W=10 (ω flip) fixes r8, r9.
 
     Params:
-        positions: np.ndarray (7, 3) : starting atom positions
-        drive_idx: int : index of drive dihedral in [0, 3]
+        positions: np.ndarray (W, 3) : starting atom positions
+        drive_idx: int : index of drive dihedral in [0, W-4]
         drive_delta: float : drive perturbation in radians
-        free_deltas: np.ndarray (3,) : the three non-drive deltas
+        free_deltas: np.ndarray (W-4,) : the non-drive deltas
     Returns:
-        np.ndarray (6,) : [r5_dx, r5_dy, r5_dz, r6_dx, r6_dy, r6_dz]
+        np.ndarray (6,) : [r(W-2)_dx, dy, dz, r(W-1)_dx, dy, dz]
     """
     deltas = _expand_deltas(drive_idx, drive_delta, free_deltas)
     new_pos = apply_dihedral_changes(positions, deltas)
-    return np.concatenate([new_pos[5] - positions[5], new_pos[6] - positions[6]])
+    last2 = positions.shape[0] - 2
+    return np.concatenate(
+        [new_pos[last2] - positions[last2], new_pos[last2 + 1] - positions[last2 + 1]]
+    )
 
 
 def propose_move(
@@ -409,6 +439,7 @@ def _finite_difference_det_jacobian(
     free_deltas_at_solution: np.ndarray,
     closure_tol: float,
     eps: float = 1e-4,
+    solver_method: str = "lm",
 ) -> float:
     """
     Estimate a Wu-Deem-style Jacobian magnitude via finite differences.
@@ -416,7 +447,7 @@ def _finite_difference_det_jacobian(
     For Wu-Deem detailed balance, the move-acceptance probability is
     weighted by |det J|, where J is the Jacobian of the closure manifold's
     parametric description by the drive angle. For our v0 numerical
-    closure, J is a 3×1 column ∂(free_deltas)/∂(drive_delta) at the
+    closure, J is a (W-4)×1 column ∂(free_deltas)/∂(drive_delta) at the
     solution. We return ‖J‖ (the column's L2 norm) as a scalar proxy for
     the determinant — exact for the 1-d drive case, approximate when the
     underlying constraint geometry has more structure.
@@ -425,12 +456,16 @@ def _finite_difference_det_jacobian(
     DBT 1993 / Coutsias 2004 once the polynomial closure solver lands.
 
     Params:
-        positions: np.ndarray (7, 3)
+        positions: np.ndarray (W, 3)
         drive_idx: int
         drive_delta: float : drive value at which the Jacobian is evaluated
-        free_deltas_at_solution: np.ndarray (3,) : closure solution at this drive
+        free_deltas_at_solution: np.ndarray (W-4,) : closure solution at this drive
         closure_tol: float : passed through to the perturbed re-solve
         eps: float : finite-difference step in radians
+        solver_method: str : least_squares method for the perturbed
+            re-solves ('lm' for the over-determined DBT W=7 closure;
+            'trf' for the exactly/under-determined ω-flip W>=10 closure,
+            which 'lm' rejects).
     Returns:
         float : |J| proxy (non-negative). Returns 1.0 (neutral weight) if
             the perturbed solves fail.
@@ -440,7 +475,7 @@ def _finite_difference_det_jacobian(
         result = least_squares(
             lambda x: closure_residual(positions, drive_idx, drive_value, x),
             free_deltas_at_solution,
-            method="lm",
+            method=solver_method,
         )
         if np.linalg.norm(result.fun) > closure_tol:
             return None
@@ -456,3 +491,125 @@ def _finite_difference_det_jacobian(
 
     jacobian_col = (plus - minus) / (2.0 * eps)
     return float(np.linalg.norm(jacobian_col))
+
+
+def propose_omega_flip(
+    positions: np.ndarray,
+    drive_idx: int,
+    target_omega_rad: float,
+    closure_tol: float = DEFAULT_CLOSURE_TOL,
+    n_continuation_steps: int = 12,
+    max_solver_iter: int = 50,
+) -> MoveProposal:
+    """
+    Propose a cis↔trans ω-isomerization move on a backbone window.
+
+    Move B (v0.3): unlike `propose_move`, which drives an inner dihedral
+    by a small Gaussian Δθ, this drives the ω amide dihedral (the inner
+    dihedral at `drive_idx`, around bond (drive_idx+1, drive_idx+2)) all
+    the way to a target value — typically 0 (cis) or ±π (trans) — and
+    re-solves the remaining inner dihedrals to restore the last two window
+    atoms r(W-2), r(W-1). The ω bond is in the macrocycle ring, so a naive
+    open-tree rotation would break ring closure; the closure solver is
+    what keeps the ring intact (B.1a-widened locked design — see
+    docs/concerted_moves_v0_3_plan.md).
+
+    Because each inner dihedral τk ends at exactly `original + deltas[k]`
+    independent of the others (see `apply_dihedral_changes`), a
+    successful flip lands ω **exactly** on `target_omega_rad`; the free
+    dihedrals only absorb the ring-closure displacement.
+
+    **Window size matters.** The closure fixes the last two atoms (6
+    residuals) against W-4 free dihedrals. For W=7 (the DBT window) that
+    is only 3 free dihedrals — over-determined, so a large flip leaves a
+    multi-Å residual and fails to close. For W=10 (6 free dihedrals) the
+    system is exactly determined and a full trans→cis flip closes to ~0 Å
+    on real macrocycle geometry (Findings 2026-06-22). The ω-flip proposer
+    therefore builds W=10 windows; W=7 is for DBT only.
+
+    A ω flip is a much larger drive (up to π) than a DBT move (~0.1 rad),
+    so a single least_squares solve from a zero guess rarely converges.
+    This routine ramps the drive from 0 to the full Δω in
+    `n_continuation_steps` increments, warm-starting each closure solve
+    from the previous step's free dihedrals — a homotopy continuation
+    that tracks the closure manifold through the large rotation. The
+    solver uses `trf` (not `lm`): with W>=10 the closure is exactly- or
+    under-determined and `lm` rejects those shapes.
+
+    Params:
+        positions: np.ndarray (W, 3) : W-atom backbone window (W>=10 for a
+            closable ω flip). The ω amide C–N bond must be the inner bond
+            (drive_idx+1, drive_idx+2); the ω dihedral is measured over
+            atoms (drive_idx, drive_idx+1, drive_idx+2, drive_idx+3).
+        drive_idx: int : index of the ω dihedral in [0, W-4].
+        target_omega_rad: float : target ω value in radians (0 for cis,
+            ±π for trans).
+        closure_tol: float : maximum acceptable displacement norm of the
+            last two window atoms (Å) for the flip to count as ring-closed.
+        n_continuation_steps: int : number of warm-started closure solves
+            used to ramp the drive from 0 to the full Δω. More steps cost
+            more solver time but improve the chance of tracking the
+            closure manifold through the large rotation.
+        max_solver_iter: int : least_squares iteration cap per step.
+    Returns:
+        MoveProposal : NamedTuple (new_positions, det_jacobian, deltas,
+            success). On failure: input positions copied, det_jacobian
+            0.0, deltas all zero, success False.
+    """
+    window_size = positions.shape[0]
+    n_dih = window_size - 3
+    if not (0 <= drive_idx < n_dih):
+        raise ValueError(
+            f"drive_idx must be in [0, {n_dih - 1}] for a {window_size}-atom "
+            f"window, got {drive_idx}"
+        )
+    if n_continuation_steps < 1:
+        raise ValueError(
+            f"n_continuation_steps must be >= 1, got {n_continuation_steps}"
+        )
+
+    current_omega = dihedral_angle(
+        positions[drive_idx],
+        positions[drive_idx + 1],
+        positions[drive_idx + 2],
+        positions[drive_idx + 3],
+    )
+    total_drive = _wrap_to_pi(target_omega_rad - current_omega)
+
+    # Homotopy continuation: ramp the drive from 0 to total_drive, warm-
+    # starting each closure solve from the previous step's free dihedrals.
+    # 'trf' handles the exactly/under-determined W>=10 shapes that 'lm' rejects.
+    free = np.zeros(n_dih - 1)
+    for step in range(1, n_continuation_steps + 1):
+        drive_value = total_drive * step / n_continuation_steps
+        result = least_squares(
+            lambda x, d=drive_value: closure_residual(positions, drive_idx, d, x),
+            free,
+            method="trf",
+            max_nfev=max_solver_iter,
+        )
+        free = result.x
+
+    final_residual = float(
+        np.linalg.norm(closure_residual(positions, drive_idx, total_drive, free))
+    )
+    if final_residual > closure_tol:
+        return MoveProposal(
+            new_positions=positions.copy(),
+            det_jacobian=0.0,
+            deltas=np.zeros(n_dih),
+            success=False,
+        )
+
+    deltas = _expand_deltas(drive_idx, total_drive, free)
+    new_positions = apply_dihedral_changes(positions, deltas)
+    det_j = _finite_difference_det_jacobian(
+        positions, drive_idx, total_drive, free, closure_tol, solver_method="trf"
+    )
+
+    return MoveProposal(
+        new_positions=new_positions,
+        det_jacobian=det_j,
+        deltas=deltas,
+        success=True,
+    )
