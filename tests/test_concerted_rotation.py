@@ -635,19 +635,30 @@ def test_propose_omega_flip_failure_returns_input_positions():
     assert np.allclose(result.new_positions, pos)
 
 
-def test_propose_omega_flip_w10_large_flip_closes():
+# A 30° ω drive is far past what the over-determined W=7 closure (3 free
+# dihedrals) can absorb at the tight tolerance, but well within the
+# exactly-determined W=10 closure (6 free dihedrals). This pair is the
+# geometry-luck-free demonstration of the widening (B.1a-widened) decision.
+# NOTE: a full trans→cis (~π) flip is geometry-dependent and only closes on a
+# real *ring* window (an open synthetic chain cannot host a π flip with both
+# ends pinned). That full-flip closure is validated on real cremp_sharp
+# geometry in docs/concerted_moves_v0_3_plan.md (Findings 2026-06-22), not in
+# this RDKit-free unit test.
+_OMEGA_W10_FLIP_RAD = np.radians(30.0)
+
+
+def test_propose_omega_flip_w10_moderate_flip_closes():
     """The load-bearing widening test: on a W=10 window (6 free dihedrals,
-    exactly-determined closure) a large ω drive toward cis closes tightly
-    and lands ω exactly on target. W=7 cannot do this (see the next test)."""
+    exactly-determined closure) a 30° ω drive closes at the tight DBT
+    tolerance and lands ω exactly on target."""
     n_success = 0
     for seed in range(6):
         pos = _twisted_chain_w(10, seed=seed)
-        # drive the central-ish omega dihedral by a large amount toward 0 (cis)
-        drive_idx = 3
+        drive_idx = 3  # a central inner dihedral, free dihedrals on both sides
         current = dihedral_angle(
             pos[drive_idx], pos[drive_idx + 1], pos[drive_idx + 2], pos[drive_idx + 3]
         )
-        target = 0.0
+        target = current + _OMEGA_W10_FLIP_RAD
         result = propose_omega_flip(
             pos,
             drive_idx=drive_idx,
@@ -657,7 +668,7 @@ def test_propose_omega_flip_w10_large_flip_closes():
         if not result.success:
             continue
         n_success += 1
-        # closure holds tightly at the DBT-grade tolerance
+        # closure holds tightly (r8, r9 fixed) at the DBT-grade tolerance
         disp = np.concatenate(
             [result.new_positions[8] - pos[8], result.new_positions[9] - pos[9]]
         )
@@ -670,22 +681,23 @@ def test_propose_omega_flip_w10_large_flip_closes():
         )
         diff = (new_omega - target + np.pi) % (2.0 * np.pi) - np.pi
         assert abs(diff) < 1e-6
-    # A large flip must close on most synthetic W=10 windows.
-    assert n_success >= 4
+    assert n_success >= 5  # W=10 closes a 30° flip on essentially every window
 
 
-def test_propose_omega_flip_w7_large_flip_fails_to_close():
-    """Documents *why* the ω-flip proposer uses W=10: a W=7 window has only
-    3 free dihedrals, so a large flip cannot close at the tight tolerance
-    and is correctly rejected (success=False)."""
-    pos = _twisted_chain(seed=0)
-    drive_idx = 1
-    result = propose_omega_flip(
-        pos,
-        drive_idx=drive_idx,
-        target_omega_rad=0.0,
-        closure_tol=DEFAULT_CLOSURE_TOL,
-    )
-    # The over-determined W=7 closure leaves a multi-tenths-Å residual on a
-    # large flip, so it must report failure rather than a bogus geometry.
-    assert not result.success
+def test_propose_omega_flip_w7_moderate_flip_fails_to_close():
+    """Documents *why* the ω-flip proposer uses W=10: the same 30° drive on a
+    W=7 window (3 free dihedrals, over-determined closure) leaves a
+    multi-tenths-Å residual, so it is correctly rejected (success=False)."""
+    n_fail = 0
+    for seed in range(6):
+        pos = _twisted_chain_w(7, seed=seed)
+        drive_idx = 1
+        current = dihedral_angle(pos[1], pos[2], pos[3], pos[4])
+        result = propose_omega_flip(
+            pos,
+            drive_idx=drive_idx,
+            target_omega_rad=current + _OMEGA_W10_FLIP_RAD,
+            closure_tol=DEFAULT_CLOSURE_TOL,
+        )
+        n_fail += not result.success
+    assert n_fail == 6  # W=7 never closes a 30° flip at the tight tolerance
