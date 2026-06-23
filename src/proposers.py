@@ -101,11 +101,13 @@ def _compute_window_downstream_sets(
 ) -> list:
     """
     Compute the full-mol atom indices that should rotate per dihedral
-    when a DBT move acts on `window`.
+    when a concerted-rotation move acts on `window`. Window size W is
+    inferred from `len(window)` (7 for DBT, 10 for the ω-flip path); a
+    W-atom window has W-3 inner dihedrals.
 
     For dihedral k around bond (window[k+1], window[k+2]):
-      - Window backbone atoms strictly downstream: window[k+3..6].
-      - Side chains of window[k+2..6] (the pivot atom k+2's side chain
+      - Window backbone atoms strictly downstream: window[k+3..W-1].
+      - Side chains of window[k+2..W-1] (the pivot atom k+2's side chain
         rotates with the local frame at the pivot; downstream backbone
         atoms' side chains rigidly follow their parents).
 
@@ -115,22 +117,24 @@ def _compute_window_downstream_sets(
 
     Params:
         mol: Chem.Mol : input molecule
-        window: tuple[int, ...] : 7 atom indices, in chain order
+        window: tuple[int, ...] : W atom indices, in chain order
         backbone_atom_set: set[int] : from `_backbone_atom_set(mol)`,
             passed in to avoid recomputation across windows
     Returns:
-        list of 4 frozenset[int] : per-dihedral rotation set, suitable
+        list of W-3 frozenset[int] : per-dihedral rotation set, suitable
             for `concerted_rotation.apply_dihedral_changes_full_mol`
     """
+    window_size = len(window)
+    n_dih = window_size - 3
     side_chains = {
         atom_idx: _side_chain_group(mol, atom_idx, backbone_atom_set)
         for atom_idx in window
     }
     downstream_sets: list = []
-    for k in range(4):
+    for k in range(n_dih):
         rotated: set = set()
         rotated.update(side_chains[window[k + 2]])
-        for j in range(k + 3, 7):
+        for j in range(k + 3, window_size):
             rotated.add(window[j])
             rotated.update(side_chains[window[j]])
         downstream_sets.append(frozenset(rotated))

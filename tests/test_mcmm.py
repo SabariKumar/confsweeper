@@ -23,6 +23,7 @@ from mcmm import (
     _backbone_atom_set,
     _compute_window_downstream_sets,
     _ordered_backbone_residues,
+    _ordered_macrocycle_atoms,
     _side_chain_group,
     _swap_walker_configs,
     enumerate_backbone_windows,
