@@ -1786,33 +1786,35 @@ def make_default_mcmm_composite(
     cart_proposer=None,
     dihedral_proposer=None,
     concerted_dihedral_proposer=None,
+    omega_flip_proposer=None,
     *,
     cartesian_weight: float = 0.0,
     dihedral_weight: float = 0.0,
     concerted_dihedral_weight: float = 0.0,
+    omega_flip_weight: float = 0.0,
     seed: int = 0,
 ):
     """
     Assemble the canonical (DBT, Cartesian-kick, dihedral-kick,
-    concerted-dihedral-kick) composite used by `get_mol_PE_mcmm`. DBT
-    residual weight is
-    `1 - cartesian_weight - dihedral_weight - concerted_dihedral_weight`;
-    the helper validates the sum and the
-    (weight > 0 ↔ proposer not None) contract, then short-circuits to
-    the lone active proposer when only one weight is positive (zero
-    composite-routing overhead — matches the existing "if
+    concerted-dihedral-kick, ω-flip) composite used by `get_mol_PE_mcmm`.
+    DBT residual weight is `1 - cartesian_weight - dihedral_weight -
+    concerted_dihedral_weight - omega_flip_weight`; the helper validates
+    the sum and the (weight > 0 ↔ proposer not None) contract, then
+    short-circuits to the lone active proposer when only one weight is
+    positive (zero composite-routing overhead — matches the existing "if
     cartesian_weight == 0: batch_propose_fn = dbt_proposer" path the
     issue-#10 routing relied on).
 
     v0.3 (issue #17) added the 4th sub-proposer
-    (`make_concerted_dihedral_kick_proposer`) for the concerted
-    (χ₁, χ₂) move on aromatic side chains; the contract generalises
-    naturally from the issue-#15 3-way helper.
+    (`make_concerted_dihedral_kick_proposer`, Move A) and the 5th
+    (`make_omega_flip_proposer`, Move B — cis/trans ω isomerization on NMe
+    amides); the contract generalises naturally from the issue-#15 3-way
+    helper.
 
     The caller is responsible for NOT building a sub-proposer whose
-    weight is zero; the helper enforces this so e.g. a
-    `concerted_dihedral_proposer` is never silently constructed and
-    then ignored, which would waste the MMFF + MACE setup cost.
+    weight is zero; the helper enforces this so e.g. an
+    `omega_flip_proposer` is never silently constructed and then ignored,
+    which would waste the MMFF + MACE setup cost.
 
     Params:
         dbt_proposer: callable : the DBT (`make_mcmm_proposer`) batch
@@ -1828,12 +1830,17 @@ def make_default_mcmm_composite(
             (`make_concerted_dihedral_kick_proposer`) batch propose
             function. Must be None iff
             `concerted_dihedral_weight == 0.0`. v0.3 Move A.
+        omega_flip_proposer: callable | None : ω-flip
+            (`make_omega_flip_proposer`) batch propose function. Must be
+            None iff `omega_flip_weight == 0.0`. v0.3 Move B.
         cartesian_weight: float : routing weight for the Cartesian kick,
             in [0, 1]. Default 0.0.
         dihedral_weight: float : routing weight for the single-bond
             dihedral kick, in [0, 1]. Default 0.0.
         concerted_dihedral_weight: float : routing weight for the
             concerted (χ₁, χ₂) dihedral kick, in [0, 1]. Default 0.0.
+        omega_flip_weight: float : routing weight for the ω-flip move,
+            in [0, 1]. Default 0.0.
         seed: int : routing RNG seed; threaded into `make_composite_proposer`
             when a composite is needed.
     Returns:
@@ -1843,26 +1850,33 @@ def make_default_mcmm_composite(
             a dict, not a list — and the existing dict/list aggregation
             in `get_mol_PE_mcmm` handles both shapes).
     Raises:
-        ValueError: any weight is negative;
-            `cartesian_weight + dihedral_weight + concerted_dihedral_weight > 1`;
-            or the (weight > 0 ↔ proposer not None) contract is violated
-            for any sub-proposer.
+        ValueError: any weight is negative; the non-DBT weights sum to
+            > 1; or the (weight > 0 ↔ proposer not None) contract is
+            violated for any sub-proposer.
     """
     if (
         cartesian_weight < 0.0
         or dihedral_weight < 0.0
         or concerted_dihedral_weight < 0.0
+        or omega_flip_weight < 0.0
     ):
         raise ValueError(
             f"weights must be non-negative, got cartesian_weight={cartesian_weight}, "
             f"dihedral_weight={dihedral_weight}, "
-            f"concerted_dihedral_weight={concerted_dihedral_weight}"
+            f"concerted_dihedral_weight={concerted_dihedral_weight}, "
+            f"omega_flip_weight={omega_flip_weight}"
         )
-    total_non_dbt = cartesian_weight + dihedral_weight + concerted_dihedral_weight
+    total_non_dbt = (
+        cartesian_weight
+        + dihedral_weight
+        + concerted_dihedral_weight
+        + omega_flip_weight
+    )
     if total_non_dbt > 1.0 + 1e-12:
         raise ValueError(
             f"cartesian_weight + dihedral_weight + concerted_dihedral_weight "
-            f"= {total_non_dbt} > 1.0; DBT residual weight would be negative"
+            f"+ omega_flip_weight = {total_non_dbt} > 1.0; DBT residual weight "
+            f"would be negative"
         )
     if (cartesian_weight > 0.0) != (cart_proposer is not None):
         raise ValueError(
@@ -1883,6 +1897,12 @@ def make_default_mcmm_composite(
             f"{'None' if concerted_dihedral_proposer is None else 'not None'}; "
             "weight > 0 iff proposer not None"
         )
+    if (omega_flip_weight > 0.0) != (omega_flip_proposer is not None):
+        raise ValueError(
+            f"omega_flip_weight={omega_flip_weight} but omega_flip_proposer is "
+            f"{'None' if omega_flip_proposer is None else 'not None'}; "
+            "weight > 0 iff proposer not None"
+        )
 
     dbt_weight = 1.0 - total_non_dbt
 
@@ -1895,6 +1915,8 @@ def make_default_mcmm_composite(
         active.append((dihedral_weight, dihedral_proposer))
     if concerted_dihedral_proposer is not None:
         active.append((concerted_dihedral_weight, concerted_dihedral_proposer))
+    if omega_flip_proposer is not None:
+        active.append((omega_flip_weight, omega_flip_proposer))
 
     if len(active) == 1:
         return active[0][1]

@@ -1305,3 +1305,115 @@ def test_mcmm_4way_routing_builds_all_four_factories():
     assert cart_factory_calls["n"] == 1
     assert dihedral_factory_calls["n"] == 1
     assert concerted_factory_calls["n"] == 1
+
+
+# ---------------------------------------------------------------------------
+# omega_flip_weight kwarg threading (v0.3 Move B / issue #17)
+# ---------------------------------------------------------------------------
+
+
+def test_mcmm_omega_flip_weight_zero_skips_omega_factory():
+    """Default `omega_flip_weight=0.0` runs without the ω-flip proposer in
+    the route — its factory must not be constructed (no MMFF + MACE setup
+    cost, no NMe-amide enumeration)."""
+    omega_factory_calls = {"n": 0}
+
+    def _spy_omega_factory(mol, **kwargs):
+        del mol, kwargs
+        omega_factory_calls["n"] += 1
+        return _stub_proposer_factory(None, None, None)
+
+    mock_mace = _make_seq_mock_mace()
+    with (
+        patch("confsweeper.embed.EmbedMolecules", side_effect=_mock_etkdg_embed),
+        patch("confsweeper._mace_batch_energies", side_effect=mock_mace),
+        patch(
+            "nvmolkit.mmffOptimization.MMFFOptimizeMoleculesConfs",
+            return_value=[[]],
+        ),
+        patch("confsweeper.make_mcmm_proposer", side_effect=_stub_proposer_factory),
+        patch("proposers.make_omega_flip_proposer", side_effect=_spy_omega_factory),
+    ):
+        get_mol_PE_mcmm(
+            TEST_SMILES,
+            get_embed_params(),
+            hardware_opts=None,
+            calc=MagicMock(),
+            n_walkers_per_temp=1,
+            n_temperatures=2,
+            n_steps=1,
+            rmsd_threshold=0.0,
+        )
+    assert omega_factory_calls["n"] == 0
+
+
+def test_mcmm_omega_flip_weight_positive_builds_composite():
+    """`omega_flip_weight=0.5` should construct DBT + ω-flip factories
+    (each once at setup); the other optional factories must NOT be called
+    when their weights are 0."""
+    dbt_factory_calls = {"n": 0}
+    cart_factory_calls = {"n": 0}
+    omega_factory_calls = {"n": 0}
+
+    def _spy_dbt_factory(mol, hardware_opts, calc, **kwargs):
+        del hardware_opts, calc, kwargs
+        dbt_factory_calls["n"] += 1
+        return _stub_proposer_factory(mol, None, None)
+
+    def _spy_cart_factory(mol, **kwargs):
+        del mol, kwargs
+        cart_factory_calls["n"] += 1
+        return _stub_proposer_factory(None, None, None)
+
+    def _spy_omega_factory(mol, **kwargs):
+        del mol, kwargs
+        omega_factory_calls["n"] += 1
+        return _stub_proposer_factory(None, None, None)
+
+    mock_mace = _make_seq_mock_mace()
+    with (
+        patch("confsweeper.embed.EmbedMolecules", side_effect=_mock_etkdg_embed),
+        patch("confsweeper._mace_batch_energies", side_effect=mock_mace),
+        patch(
+            "nvmolkit.mmffOptimization.MMFFOptimizeMoleculesConfs",
+            return_value=[[]],
+        ),
+        patch("confsweeper.make_mcmm_proposer", side_effect=_spy_dbt_factory),
+        patch("proposers.make_cartesian_kick_proposer", side_effect=_spy_cart_factory),
+        patch("proposers.make_omega_flip_proposer", side_effect=_spy_omega_factory),
+    ):
+        get_mol_PE_mcmm(
+            TEST_SMILES,
+            get_embed_params(),
+            hardware_opts=None,
+            calc=MagicMock(),
+            n_walkers_per_temp=1,
+            n_temperatures=2,
+            n_steps=1,
+            omega_flip_weight=0.5,
+            rmsd_threshold=0.0,
+        )
+    assert dbt_factory_calls["n"] == 1
+    assert omega_factory_calls["n"] == 1
+    assert cart_factory_calls["n"] == 0
+
+
+def test_mcmm_omega_flip_weight_negative_raises():
+    mock_mace = _make_seq_mock_mace()
+    with (
+        patch("confsweeper.embed.EmbedMolecules", side_effect=_mock_etkdg_embed),
+        patch("confsweeper._mace_batch_energies", side_effect=mock_mace),
+        patch("confsweeper.make_mcmm_proposer", side_effect=_stub_proposer_factory),
+    ):
+        with pytest.raises(ValueError, match="omega_flip_weight must be >= 0"):
+            get_mol_PE_mcmm(
+                TEST_SMILES,
+                get_embed_params(),
+                hardware_opts=None,
+                calc=MagicMock(),
+                n_walkers_per_temp=1,
+                n_temperatures=2,
+                n_steps=1,
+                omega_flip_weight=-0.1,
+                rmsd_threshold=0.0,
+            )

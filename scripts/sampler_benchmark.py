@@ -309,6 +309,7 @@ def _run_mcmm(
     skip_mmff_relax: bool = False,
     concerted_dihedral_weight: float = 0.0,
     p_concerted_jump: float = 0.3,
+    omega_flip_weight: float = 0.0,
     e_window_kT: float = 5.0,
     saunders_exponent: float = 0.5,
 ) -> list[float]:
@@ -389,6 +390,7 @@ def _run_mcmm(
         skip_mmff_relax=skip_mmff_relax,
         concerted_dihedral_weight=concerted_dihedral_weight,
         p_concerted_jump=p_concerted_jump,
+        omega_flip_weight=omega_flip_weight,
         e_window_kT=e_window_kT,
         saunders_exponent=saunders_exponent,
     )
@@ -559,6 +561,7 @@ def run_one(
     skip_mmff_relax: bool = False,
     concerted_dihedral_weight: float = 0.0,
     p_concerted_jump: float = 0.3,
+    omega_flip_weight: float = 0.0,
     e_window_kT: float = 5.0,
     saunders_exponent: float = 0.5,
 ) -> dict:
@@ -600,6 +603,7 @@ def run_one(
         runner_kwargs["skip_mmff_relax"] = skip_mmff_relax
         runner_kwargs["concerted_dihedral_weight"] = concerted_dihedral_weight
         runner_kwargs["p_concerted_jump"] = p_concerted_jump
+        runner_kwargs["omega_flip_weight"] = omega_flip_weight
         runner_kwargs["e_window_kT"] = e_window_kT
         runner_kwargs["saunders_exponent"] = saunders_exponent
     energies_eV = runner(
@@ -786,6 +790,20 @@ def run_one(
     "bond proposer. Ignored when --concerted_dihedral_weight=0.",
 )
 @click.option(
+    "--omega_flip_weight",
+    type=float,
+    default=0.0,
+    show_default=True,
+    help="MCMM proposer mix: routing weight for the v0.3 omega-flip "
+    "proposer (cis/trans isomerization of N-methylated backbone "
+    "amides via the widened W=10 concerted-rotation closure). "
+    "0 = not in the route at all. Combined constraint: "
+    "cartesian_weight + dihedral_weight + concerted_dihedral_weight "
+    "+ omega_flip_weight <= 1 (DBT is the residual). Requires an "
+    "N-methylated amide; ignored by non-MCMM samplers. "
+    "Issue #17 / v0.3 Move B / docs/concerted_moves_v0_3_plan.md.",
+)
+@click.option(
     "--e_window_kT",
     "e_window_kT",
     type=float,
@@ -825,6 +843,7 @@ def main(
     skip_mmff_relax: bool,
     concerted_dihedral_weight: float,
     p_concerted_jump: float,
+    omega_flip_weight: float,
     e_window_kT: float,
     saunders_exponent: float,
 ) -> None:
@@ -892,7 +911,8 @@ def main(
         "samplers=%s  n_seeds=%d  dedup_modes=%s  cartesian_weight=%.2f  "
         "dihedral_weight=%.2f  p_rotamer_jump=%.2f  aromatic_wells=%s  "
         "skip_mmff_relax=%s  concerted_dihedral_weight=%.2f  "
-        "p_concerted_jump=%.2f  e_window_kT=%.2f  saunders_exponent=%.2f",
+        "p_concerted_jump=%.2f  omega_flip_weight=%.2f  "
+        "e_window_kT=%.2f  saunders_exponent=%.2f",
         sampler_list,
         n_seeds,
         mode_list,
@@ -903,6 +923,7 @@ def main(
         "on" if skip_mmff_relax else "off",
         concerted_dihedral_weight,
         p_concerted_jump,
+        omega_flip_weight,
         e_window_kT,
         saunders_exponent,
     )
@@ -963,6 +984,7 @@ def main(
                         skip_mmff_relax=skip_mmff_relax,
                         concerted_dihedral_weight=concerted_dihedral_weight,
                         p_concerted_jump=p_concerted_jump,
+                        omega_flip_weight=omega_flip_weight,
                         e_window_kT=e_window_kT,
                         saunders_exponent=saunders_exponent,
                     )

@@ -3434,6 +3434,107 @@ def test_default_mcmm_composite_four_way_substats_reachable():
 
 
 # ---------------------------------------------------------------------------
+# make_default_mcmm_composite — 5-way extension (v0.3 Move B / issue #17)
+# ---------------------------------------------------------------------------
+
+
+def test_default_mcmm_composite_validation_negative_omega_weight():
+    dbt = _stub_proposer("a")
+    with pytest.raises(ValueError, match="weights must be non-negative"):
+        make_default_mcmm_composite(dbt, omega_flip_weight=-0.1)
+
+
+def test_default_mcmm_composite_validation_5way_sum_exceeds_one():
+    dbt = _stub_proposer("a")
+    cart = _stub_proposer("b")
+    dih = _stub_proposer("c")
+    cdih = _stub_proposer("d")
+    omega = _stub_proposer("e")
+    with pytest.raises(ValueError, match="DBT residual weight would be negative"):
+        make_default_mcmm_composite(
+            dbt,
+            cart_proposer=cart,
+            dihedral_proposer=dih,
+            concerted_dihedral_proposer=cdih,
+            omega_flip_proposer=omega,
+            cartesian_weight=0.3,
+            dihedral_weight=0.3,
+            concerted_dihedral_weight=0.3,
+            omega_flip_weight=0.3,
+        )
+
+
+def test_default_mcmm_composite_validation_omega_weight_without_proposer():
+    dbt = _stub_proposer("a")
+    with pytest.raises(ValueError, match="weight > 0 iff proposer not None"):
+        make_default_mcmm_composite(dbt, omega_flip_weight=0.3)
+
+
+def test_default_mcmm_composite_validation_omega_proposer_without_weight():
+    dbt = _stub_proposer("a")
+    omega = _stub_proposer("e")
+    with pytest.raises(ValueError, match="weight > 0 iff proposer not None"):
+        make_default_mcmm_composite(
+            dbt, omega_flip_proposer=omega, omega_flip_weight=0.0
+        )
+
+
+def test_default_mcmm_composite_pure_omega_short_circuits():
+    """omega_flip_weight=1.0 (DBT residual = 0) returns the ω proposer
+    directly — no composite overhead."""
+    dbt = _stub_proposer("a")
+    omega = _stub_proposer("e")
+    out = make_default_mcmm_composite(
+        dbt, omega_flip_proposer=omega, omega_flip_weight=1.0
+    )
+    assert out is omega
+    coords = [torch.zeros(_TEST_N_ATOMS, 3, dtype=torch.float64) for _ in range(5)]
+    out(coords)
+    assert dbt.stats["n_walkers"] == 0
+    assert omega.stats["n_walkers"] == 5
+
+
+def test_default_mcmm_composite_five_way_distribution_and_substats():
+    """DBT=0.4, cart/dih/concerted/omega=0.15 each across 4000 walkers —
+    each route gets ~its share, and .stats exposes all five in order."""
+    dbt = _stub_proposer("a")
+    cart = _stub_proposer("b")
+    dih = _stub_proposer("c")
+    cdih = _stub_proposer("d")
+    omega = _stub_proposer("e")
+    composite = make_default_mcmm_composite(
+        dbt,
+        cart_proposer=cart,
+        dihedral_proposer=dih,
+        concerted_dihedral_proposer=cdih,
+        omega_flip_proposer=omega,
+        cartesian_weight=0.15,
+        dihedral_weight=0.15,
+        concerted_dihedral_weight=0.15,
+        omega_flip_weight=0.15,
+        seed=321,
+    )
+    assert isinstance(composite.stats, list)
+    assert composite.stats == [
+        dbt.stats,
+        cart.stats,
+        dih.stats,
+        cdih.stats,
+        omega.stats,
+    ]
+    n_walkers = 4000
+    coords = [
+        torch.zeros(_TEST_N_ATOMS, 3, dtype=torch.float64) for _ in range(n_walkers)
+    ]
+    composite(coords)
+    counts = [p.stats["n_walkers"] for p in (dbt, cart, dih, cdih, omega)]
+    assert sum(counts) == n_walkers
+    assert 0.30 * n_walkers < counts[0] < 0.50 * n_walkers  # DBT residual 0.40
+    for c in counts[1:]:
+        assert 0.08 * n_walkers < c < 0.22 * n_walkers  # each 0.15
+
+
+# ---------------------------------------------------------------------------
 # make_omega_flip_proposer — v0.3 Move B (cis/trans ω isomerization)
 # ---------------------------------------------------------------------------
 

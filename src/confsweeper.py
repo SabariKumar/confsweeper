@@ -1117,6 +1117,7 @@ def get_mol_PE_mcmm(
     cartesian_weight: float = 0.0,
     dihedral_weight: float = 0.0,
     concerted_dihedral_weight: float = 0.0,
+    omega_flip_weight: float = 0.0,
     sigma_chi_rad: float = 0.5,
     p_rotamer_jump: float = 0.3,
     rotamer_wells_deg: tuple = (-60.0, 60.0, 180.0),
@@ -1249,6 +1250,18 @@ def get_mol_PE_mcmm(
             ceiling basin because χ₁ and χ₂ must rotate together.
             Requires `mol` to have at least one aromatic side chain
             (Trp / Phe / Tyr / His); raises at factory time otherwise.
+        omega_flip_weight: float : routing weight for the v0.3 ω-flip
+            proposer relative to DBT. Default 0.0 means the ω-flip move
+            is not in the route at all (its factory is not called, no
+            MMFF + MACE setup cost paid). DBT residual weight is
+            `1 - cartesian_weight - dihedral_weight - concerted_dihedral_weight
+            - omega_flip_weight` (the helper rejects sums > 1). Issue #17
+            / v0.3 Move B; flips an NMe backbone amide between cis and
+            trans ω via the widened (W=10) concerted-rotation closure —
+            a backbone topology change no other proposer can make.
+            Requires `mol` to have at least one N-methylated backbone
+            amide; raises at factory time otherwise. Reuses `closure_tol`
+            and `skip_mmff_relax`.
         sigma_concerted_chi_rad: float : Gaussian σ for the concerted
             dihedral-kick's joint refinement step in radians (default
             0.5 ≈ 28°). Each of Δχ₁ and Δχ₂ is sampled independently
@@ -1421,6 +1434,8 @@ def get_mol_PE_mcmm(
         raise ValueError(
             f"concerted_dihedral_weight must be >= 0, got {concerted_dihedral_weight}"
         )
+    if omega_flip_weight < 0:
+        raise ValueError(f"omega_flip_weight must be >= 0, got {omega_flip_weight}")
     dbt_proposer = make_mcmm_proposer(
         mol,
         hardware_opts=hardware_opts,
@@ -1436,6 +1451,7 @@ def get_mol_PE_mcmm(
         make_concerted_dihedral_kick_proposer,
         make_default_mcmm_composite,
         make_dihedral_kick_proposer,
+        make_omega_flip_proposer,
     )
 
     cart_proposer = None
@@ -1484,14 +1500,28 @@ def get_mol_PE_mcmm(
             mmff_backend=mmff_backend,
             seed=seed + 4_444_444,
         )
+    omega_flip_proposer = None
+    if omega_flip_weight > 0.0:
+        omega_flip_proposer = make_omega_flip_proposer(
+            mol,
+            hardware_opts=hardware_opts,
+            calc=calc,
+            closure_tol=closure_tol,
+            skip_mmff_relax=skip_mmff_relax,
+            score_chunk_size=score_chunk_size,
+            mmff_backend=mmff_backend,
+            seed=seed + 3_333_333,
+        )
     batch_propose_fn = make_default_mcmm_composite(
         dbt_proposer,
         cart_proposer=cart_proposer,
         dihedral_proposer=dihedral_proposer,
         concerted_dihedral_proposer=concerted_dihedral_proposer,
+        omega_flip_proposer=omega_flip_proposer,
         cartesian_weight=cartesian_weight,
         dihedral_weight=dihedral_weight,
         concerted_dihedral_weight=concerted_dihedral_weight,
+        omega_flip_weight=omega_flip_weight,
         seed=seed + 6_666_666,
     )
 
