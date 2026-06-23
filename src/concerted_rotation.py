@@ -220,10 +220,12 @@ def apply_dihedral_changes_full_mol(
     Apply DBT dihedral changes to a full-molecule coordinate array,
     transporting side-chain atoms rigidly with their backbone parents.
 
-    Generalises `apply_dihedral_changes` from a self-contained 7-atom
-    chain to an arbitrary atom count. The 7-atom chain is identified by
+    Generalises `apply_dihedral_changes` from a self-contained W-atom
+    chain to an arbitrary atom count. The W-atom chain is identified by
     indices into `positions` via `window`; per-dihedral rotation sets
-    are passed explicitly via `downstream_sets`.
+    are passed explicitly via `downstream_sets`. W is inferred from
+    `len(window)` (7 for DBT, 10 for the ω-flip path); a W-atom window
+    has W-3 inner dihedrals.
 
     For dihedral k (around the axis from positions[window[k+2]] to
     positions[window[k+1]]), every atom in `downstream_sets[k]` rotates
@@ -233,39 +235,43 @@ def apply_dihedral_changes_full_mol(
 
     For a cyclic peptide window the appropriate `downstream_sets[k]` is
     the union of the window's strictly-downstream backbone atoms
-    (window[k+3..6]) and the side-chain groups of window[k+2..6] —
+    (window[k+3..W-1]) and the side-chain groups of window[k+2..W-1] —
     see `mcmm._compute_window_downstream_sets`. The MCMM proposer
     precomputes these sets once per window at factory-build time.
 
-    The 7-atom subset of positions[window] is updated identically to
+    The W-atom subset of positions[window] is updated identically to
     `apply_dihedral_changes`, plus full-mol downstream atoms get the
     same rigid rotation; bond lengths and bond angles are preserved
     everywhere by construction (rigid rotations).
 
     Params:
         positions: np.ndarray (n_atoms, 3) : full-mol starting positions
-        window: list[int] : 7 atom indices into `positions`, in chain order
-        deltas: np.ndarray (4,) : dihedral changes in radians
-        downstream_sets: list of 4 iterables of int : full-mol atom
+        window: list[int] : W atom indices into `positions`, in chain order
+        deltas: np.ndarray (W-3,) : dihedral changes in radians
+        downstream_sets: list of W-3 iterables of int : full-mol atom
             indices to rotate per dihedral. Order matches `deltas`.
     Returns:
         np.ndarray (n_atoms, 3) : new full-mol positions
     """
     if positions.ndim != 2 or positions.shape[1] != 3:
         raise ValueError(f"positions must be (n_atoms, 3), got {positions.shape}")
-    if len(window) != 7:
-        raise ValueError(f"window must have 7 atom indices, got {len(window)}")
+    if len(window) < 4:
+        raise ValueError(f"window must have at least 4 atom indices, got {len(window)}")
+    n_dih = len(window) - 3
     deltas = np.asarray(deltas, dtype=float)
-    if deltas.shape != (N_DIHEDRALS,):
-        raise ValueError(f"deltas must be ({N_DIHEDRALS},), got {deltas.shape}")
-    if len(downstream_sets) != N_DIHEDRALS:
+    if deltas.shape != (n_dih,):
         raise ValueError(
-            f"downstream_sets must have {N_DIHEDRALS} entries, "
-            f"got {len(downstream_sets)}"
+            f"deltas must be ({n_dih},) for a {len(window)}-atom window, "
+            f"got {deltas.shape}"
+        )
+    if len(downstream_sets) != n_dih:
+        raise ValueError(
+            f"downstream_sets must have {n_dih} entries for a "
+            f"{len(window)}-atom window, got {len(downstream_sets)}"
         )
 
     pos = positions.copy().astype(float)
-    for k in range(N_DIHEDRALS):
+    for k in range(n_dih):
         delta = float(deltas[k])
         if delta == 0.0:
             continue

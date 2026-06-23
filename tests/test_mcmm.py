@@ -33,8 +33,10 @@ from mcmm import (
 from proposers import (
     _classify_rotamer_wells,
     _enumerate_concerted_dihedral_pairs,
+    _enumerate_nme_omega_windows,
     _enumerate_side_chain_dihedrals,
     make_default_mcmm_composite,
+    make_omega_flip_proposer,
 )
 
 # ---------------------------------------------------------------------------
@@ -3428,3 +3430,145 @@ def test_default_mcmm_composite_four_way_substats_reachable():
         concerted_dihedral_weight=0.2,
     )
     assert composite.stats == [dbt.stats, cart.stats, dih.stats, cdih.stats]
+
+
+# ---------------------------------------------------------------------------
+# make_omega_flip_proposer — v0.3 Move B (cis/trans ω isomerization)
+# ---------------------------------------------------------------------------
+
+# cyclo(Sar)4 — cyclic tetra-sarcosine (N-methylglycine). Every backbone N is
+# N-methylated, so all four amide bonds are ω-flip eligible; small enough to
+# embed quickly. 12-atom backbone ring (> the W=10 closure window).
+_CYCLOSAR4_SMILES = "O=C1N(C)CC(=O)N(C)CC(=O)N(C)CC(=O)N1C"
+
+
+def _cyclosar4_mol() -> Chem.Mol:
+    """Build the cyclo(Sar)4 test mol with explicit Hs (all-NMe backbone)."""
+    return Chem.AddHs(Chem.MolFromSmiles(_CYCLOSAR4_SMILES))
+
+
+def test_enumerate_nme_omega_windows_cremp_sharp_finds_three():
+    """cremp_sharp (S.S.N.MeW.MeA.MeN) has exactly 3 NMe residues → 3 ω
+    windows; each is a 10-atom window with the ω bond at the central
+    drive_idx, and that central bond joins a carbonyl C and an NMe N."""
+    mol = _cremp_sharp_mol()
+    windows = _enumerate_nme_omega_windows(mol)
+    assert len(windows) == 3
+    backbone = set(_ordered_macrocycle_atoms(mol))
+    for window, drive_idx in windows:
+        assert len(window) == 10
+        assert drive_idx == 3  # (10 - 3) // 2
+        # The ω bond sits at inner bond (drive_idx+1, drive_idx+2).
+        c_atom, n_atom = window[drive_idx + 1], window[drive_idx + 2]
+        pair = {
+            mol.GetAtomWithIdx(c_atom).GetSymbol(),
+            mol.GetAtomWithIdx(n_atom).GetSymbol(),
+        }
+        assert pair == {"C", "N"}
+        # the two bonded atoms are actually bonded and both on the ring
+        assert mol.GetBondBetweenAtoms(c_atom, n_atom) is not None
+        assert c_atom in backbone and n_atom in backbone
+
+
+def test_enumerate_nme_omega_windows_all_sarcosine_finds_four():
+    """cyclo(Sar)4 has four NMe amides → four ω windows."""
+    windows = _enumerate_nme_omega_windows(_cyclosar4_mol())
+    assert len(windows) == 4
+
+
+def test_make_omega_flip_proposer_rejects_no_nme_peptide():
+    """cyclo(Ala)4 has no N-methylated amide → factory raises."""
+    with pytest.raises(ValueError, match="no NMe"):
+        make_omega_flip_proposer(_cycloala_mol(4), hardware_opts=None, calc=None)
+
+
+def test_make_omega_flip_proposer_rejects_non_peptide():
+    """A bare ring with no amide backbone → factory raises."""
+    cyclohexane = Chem.AddHs(Chem.MolFromSmiles("C1CCCCC1"))
+    with pytest.raises(ValueError, match="no NMe"):
+        make_omega_flip_proposer(cyclohexane, hardware_opts=None, calc=None)
+
+
+def test_make_omega_flip_proposer_rejects_bad_backend():
+    with pytest.raises(ValueError, match="unknown mmff_backend"):
+        make_omega_flip_proposer(
+            _cyclosar4_mol(), hardware_opts=None, calc=None, mmff_backend="bogus"
+        )
+
+
+def _make_omega_proposer_with_mocks(mol, seed: int = 0):
+    """Build a real make_omega_flip_proposer with the GPU stages patched
+    (MMFF a no-op, MACE a sequential monotone mock). Returns (proposer,
+    patched_ctx)."""
+    from contextlib import contextmanager
+    from unittest.mock import patch as _patch
+
+    proposer = make_omega_flip_proposer(mol, hardware_opts=None, calc=None, seed=seed)
+    counter = [0]
+
+    def _mock_mace(_calc, ase_mols):
+        out = [(counter[0] + i) * 0.01 for i in range(len(ase_mols))]
+        counter[0] += len(ase_mols)
+        return out
+
+    @contextmanager
+    def patched():
+        with (
+            _patch("confsweeper._mace_batch_energies", side_effect=_mock_mace),
+            _patch(
+                "nvmolkit.mmffOptimization.MMFFOptimizeMoleculesConfs",
+                return_value=[[]],
+            ),
+        ):
+            yield
+
+    return proposer, patched
+
+
+def test_make_omega_flip_proposer_returns_proposal_per_walker():
+    """N input coords → N output 4-tuples (coords, energy, det_j, success),
+    each coords tensor matching the input shape."""
+    mol = _cyclosar4_mol()
+    proposer, patched = _make_omega_proposer_with_mocks(mol, seed=7)
+    seed_coords = _seed_full_mol_coords(mol)
+    for n in [1, 3, 8]:
+        coords_list = [seed_coords.clone() for _ in range(n)]
+        with patched():
+            proposals = proposer(coords_list)
+        assert len(proposals) == n
+        for prop in proposals:
+            assert len(prop) == 4
+            new_coords, energy, det_j, success = prop
+            assert isinstance(new_coords, torch.Tensor)
+            assert new_coords.shape == seed_coords.shape
+            assert isinstance(success, bool)
+
+
+def test_make_omega_flip_proposer_accepts_and_has_real_jacobian():
+    """At least one of several walkers closes its ω flip, and accepted
+    proposals carry a finite, non-negative Wu-Deem |det J| (not the
+    fixed 1.0 of the volume-preserving side-chain kicks)."""
+    mol = _cyclosar4_mol()
+    proposer, patched = _make_omega_proposer_with_mocks(mol, seed=1)
+    seed_coords = _seed_full_mol_coords(mol)
+    coords_list = [seed_coords.clone() for _ in range(8)]
+    with patched():
+        proposals = proposer(coords_list)
+    successes = [p for p in proposals if p[3]]
+    assert len(successes) >= 1  # W=10 closure succeeds on cyclo(Sar)4
+    for _, _, det_j, _ in successes:
+        assert np.isfinite(det_j)
+        assert det_j >= 0.0
+
+
+def test_make_omega_flip_proposer_does_not_mutate_inputs():
+    """The proposer must not modify the input coordinate tensors in place."""
+    mol = _cyclosar4_mol()
+    proposer, patched = _make_omega_proposer_with_mocks(mol, seed=3)
+    seed_coords = _seed_full_mol_coords(mol)
+    coords_list = [seed_coords.clone() for _ in range(4)]
+    snapshots = [c.clone() for c in coords_list]
+    with patched():
+        proposer(coords_list)
+    for before, after in zip(snapshots, coords_list):
+        assert torch.equal(before, after)

@@ -457,6 +457,25 @@ def test_full_mol_window_only_matches_apply_dihedral_changes():
     assert np.allclose(new_full[7:], full[7:], atol=1e-12)
 
 
+def test_full_mol_w10_window_only_matches_apply_dihedral_changes():
+    """The full-mol primitive generalizes to a 10-atom (ω-flip) window: with
+    window-downstream-only sets, the 10-atom subset matches the standalone
+    apply_dihedral_changes on the same window."""
+    base = _twisted_chain_w(10, seed=7)
+    n_extra = 2
+    full = np.zeros((10 + n_extra, 3))
+    full[:10] = base
+    for k in range(n_extra):  # untouched extra atoms, in no downstream set
+        full[10 + k] = full[k] + np.array([0.0, 0.0, 1.0])
+    window = list(range(10))
+    deltas = np.array([0.1, -0.2, 0.05, 0.0, 0.15, -0.1, 0.0])  # W-3 = 7 dihedrals
+    ref = apply_dihedral_changes(base, deltas)
+    downstream_sets = [set(window[k + 3 : 10]) for k in range(7)]
+    new_full = apply_dihedral_changes_full_mol(full, window, deltas, downstream_sets)
+    assert np.allclose(new_full[:10], ref, atol=1e-12)
+    assert np.allclose(new_full[10:], full[10:], atol=1e-12)
+
+
 def test_full_mol_side_chain_rotates_with_parent():
     """When a side-chain atom is included in the same downstream set as
     its backbone parent, it rotates by the same rigid transformation —
@@ -488,8 +507,8 @@ def test_full_mol_invalid_shapes_raise():
         apply_dihedral_changes_full_mol(
             np.zeros((9,)), window, np.zeros(4), [set()] * 4
         )
-    with pytest.raises(ValueError, match="window must have 7"):
-        apply_dihedral_changes_full_mol(full, [0, 1, 2], np.zeros(4), [set()] * 4)
+    with pytest.raises(ValueError, match="window must have at least 4"):
+        apply_dihedral_changes_full_mol(full, [0, 1, 2], np.zeros(1), [set()] * 1)
     with pytest.raises(ValueError, match="deltas must be"):
         apply_dihedral_changes_full_mol(full, window, np.zeros(3), [set()] * 4)
     with pytest.raises(ValueError, match="downstream_sets must have"):

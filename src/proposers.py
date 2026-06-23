@@ -1342,6 +1342,354 @@ def make_concerted_dihedral_kick_proposer(
 
 
 # ---------------------------------------------------------------------------
+# ω-flip proposer — v0.3 Move B (cis/trans isomerization on NMe amide bonds)
+# ---------------------------------------------------------------------------
+
+# Window size for the ω-flip closure. W=10 gives 6 free dihedrals after the
+# ω drive (exactly-determined for the 6 last-two-atom constraints), which
+# closes a full trans→cis flip to ~0 Å on real macrocycle geometry; W=7 (the
+# DBT size, 3 free dihedrals) is over-determined and cannot. See
+# docs/concerted_moves_v0_3_plan.md Findings 2026-06-22.
+_OMEGA_WINDOW_SIZE = 10
+
+
+def _is_carbonyl_carbon(mol: Chem.Mol, idx: int) -> bool:
+    """
+    True iff atom `idx` is a carbonyl carbon (a C double-bonded to an O).
+
+    Identifies the C of a backbone amide C(=O)–N bond. Used together with
+    `_is_nme_amide_nitrogen` to locate NMe ω bonds on the macrocycle ring.
+
+    Params:
+        mol: Chem.Mol : input molecule
+        idx: int : atom index
+    Returns:
+        bool : True if `idx` is a carbon with a double-bonded oxygen neighbour
+    """
+    atom = mol.GetAtomWithIdx(idx)
+    if atom.GetSymbol() != "C":
+        return False
+    return any(
+        nb.GetSymbol() == "O"
+        and mol.GetBondBetweenAtoms(idx, nb.GetIdx()).GetBondTypeAsDouble() == 2.0
+        for nb in atom.GetNeighbors()
+    )
+
+
+def _is_nme_amide_nitrogen(mol: Chem.Mol, idx: int, backbone_atom_set: set) -> bool:
+    """
+    True iff atom `idx` is an N-methylated backbone amide nitrogen.
+
+    An NMe backbone N is tertiary (three heavy neighbours, no H) with one
+    heavy neighbour — the N-methyl carbon — lying off the macrocycle ring.
+    A normal amide NH is secondary (two heavy neighbours + one H) and is
+    excluded; proline N is tertiary but its third heavy neighbour is in the
+    ring (the pyrrolidine), so it is also excluded — matching the B.2 lock
+    (NMe ω bonds only).
+
+    This ring-based atom-property detection is consistent with the rest of
+    `proposers.py` (which sources the backbone from
+    `mcmm._ordered_macrocycle_atoms`) rather than the SMARTS-residue model
+    in `torsional_sampling.classify_backbone_residues`; the eligibility set
+    is identical for canonical NMe residues.
+
+    Params:
+        mol: Chem.Mol : input molecule
+        idx: int : atom index (expected to be a macrocycle ring atom)
+        backbone_atom_set: set[int] : macrocycle ring atom indices
+    Returns:
+        bool : True if `idx` is an N-methylated backbone amide nitrogen
+    """
+    atom = mol.GetAtomWithIdx(idx)
+    if atom.GetSymbol() != "N":
+        return False
+    heavy = [nb for nb in atom.GetNeighbors() if nb.GetAtomicNum() != 1]
+    if len(heavy) != 3:
+        return False
+    return any(
+        nb.GetIdx() not in backbone_atom_set and nb.GetSymbol() == "C" for nb in heavy
+    )
+
+
+def _enumerate_nme_omega_windows(
+    mol: Chem.Mol, window_size: int = _OMEGA_WINDOW_SIZE
+) -> list:
+    """
+    Enumerate ω-flip windows for the N-methylated amide bonds of a cyclic
+    peptide. Each entry locates one NMe C(=O)–N backbone bond and centres a
+    `window_size`-atom backbone window on it.
+
+    Walks the macrocycle ring (`_ordered_macrocycle_atoms`); for every NMe
+    backbone nitrogen with an adjacent carbonyl carbon, builds a window so
+    that the C–N amide bond sits at the central inner dihedral
+    `drive_idx = (window_size - 3) // 2` (the ω dihedral, measured over
+    `window[drive_idx .. drive_idx+3]`), leaving free dihedrals on both
+    sides for the closure solver.
+
+    Params:
+        mol: Chem.Mol : a head-to-tail cyclic peptide with explicit Hs.
+        window_size: int : backbone window length (default 10 — the
+            exactly-determined ω closure; see `_OMEGA_WINDOW_SIZE`).
+    Returns:
+        list of (window, drive_idx) : `window` is a tuple of `window_size`
+            ring atom indices in chain order; `drive_idx` is the inner-
+            dihedral index of the ω bond. Empty if the ring is smaller than
+            `window_size` or has no NMe amide bonds.
+    """
+    ring = _ordered_macrocycle_atoms(mol)
+    n = len(ring)
+    if n < window_size:
+        return []
+    backbone_atom_set = set(ring)
+    drive_idx = (window_size - 3) // 2
+    windows: list = []
+    for j in range(n):
+        if not _is_nme_amide_nitrogen(mol, ring[j], backbone_atom_set):
+            continue
+        for jc in ((j + 1) % n, (j - 1) % n):
+            if _is_carbonyl_carbon(mol, ring[jc]):
+                # `first` is the lower-in-forward-order atom of the (C, N)
+                # bond, so window[drive_idx+1]=ring[first] and
+                # window[drive_idx+2]=ring[first+1] place the bond at the
+                # central inner dihedral.
+                first = j if jc == (j + 1) % n else jc
+                start = (first - (drive_idx + 1)) % n
+                window = tuple(ring[(start + i) % n] for i in range(window_size))
+                windows.append((window, drive_idx))
+                break
+    return windows
+
+
+def make_omega_flip_proposer(
+    mol: Chem.Mol,
+    hardware_opts,
+    calc,
+    closure_tol: float = 0.01,
+    n_continuation_steps: int = 12,
+    score_chunk_size: int = 500,
+    mmff_backend: str = "gpu",
+    skip_mmff_relax: bool = False,
+    seed: int = 0,
+):
+    """
+    Build a `batch_propose_fn` that flips one NMe amide ω bond per walker
+    between cis (0°) and trans (180°), re-closing the macrocycle with the
+    widened concerted-rotation solver, then batches MMFF + MACE. v0.3
+    Move B (issue #17).
+
+    Attacks the cremp_sharp residual that no v0.2 / Move-A proposer can
+    reach: NMe peptide bonds favour cis ω, and the dominant ceiling basin
+    is hypothesised to be a cis-ω state. DBT's closure assumes trans ω, and
+    side-chain / Cartesian / concerted-χ moves never touch the backbone
+    amide dihedral, so a cis flip is a topology change unique to this move.
+    See docs/concerted_moves_v0_3_plan.md Move B design lock (2026-06-22).
+
+    Per-call pipeline (same shape as `make_mcmm_proposer`):
+
+      1. **Per-walker ω flip** (CPU, sequential): pick a random NMe ω
+         window (uniform), measure the current ω, and toggle to the
+         opposite state — target cis (0) if currently trans-like
+         (|ω| > 90°), else trans (π). Run
+         `concerted_rotation.propose_omega_flip` on the W=10 window to
+         drive ω to target and re-solve the free backbone dihedrals to
+         keep the last two window atoms fixed (ring stays closed). Walkers
+         whose closure fails are flagged.
+      2. **Full-mol coordinate update** (CPU, sequential): replay the
+         dihedral changes on the full atom array via
+         `concerted_rotation.apply_dihedral_changes_full_mol`, transporting
+         side chains rigidly with their backbone parents (downstream sets
+         precomputed per window at factory-build time).
+      3. **Batched MMFF** (GPU, one call), unless `skip_mmff_relax=True`.
+      4. **Batched MACE** (GPU, chunked) via `_mace_batch_energies`.
+      5. **Return** `(coords, energy, det_j, success)` per walker in walker
+         order. `det_j` is the Wu–Deem |det J| from the closure (NOT 1.0 —
+         the ω-flip re-closure is the same non-volume-preserving constrained
+         map as DBT and needs the Jacobian for detailed balance). Failed
+         walkers pass through with their pre-move coords and `success=False`.
+
+    Lazy import of `_mace_batch_energies` from `confsweeper` avoids the
+    confsweeper → mcmm → proposers circular dependency at module load time.
+
+    Params:
+        mol: Chem.Mol : a head-to-tail cyclic peptide with explicit Hs and
+            at least one N-methylated backbone amide. Topology captured at
+            factory build time; do not mutate structurally afterwards.
+        hardware_opts : nvmolkit hardware options for batched MMFF (only
+            used when `mmff_backend='gpu'` and not `skip_mmff_relax`).
+        calc : MACECalculator from `get_mace_calc()`.
+        closure_tol: float : maximum last-two-atom displacement norm (Å)
+            tolerated as ring-closed; passed to `propose_omega_flip`.
+        n_continuation_steps: int : drive-ramp steps for the ω closure
+            (passed to `propose_omega_flip`).
+        score_chunk_size: int : MACE per-batch forward pass cap (default 500).
+        mmff_backend: str : 'gpu' (nvmolkit batched CUDA) or 'cpu'.
+        skip_mmff_relax: bool : when True, bypass the Stage-2 MMFF relax and
+            MACE-score the raw re-closed geometry (the closure already keeps
+            the ring intact, so unlike the side-chain kick this is not
+            relied on for geometry repair — it is an ablation toggle).
+        seed: int : RNG seed for the per-step window pick.
+    Returns:
+        callable : `batch_propose_fn(coords_list) -> list[tuple]` matching
+            the `ParallelMCMMDriver` / `ReplicaExchangeMCMMDriver` contract.
+    Raises:
+        ValueError: on unknown `mmff_backend`, or when `mol` has no NMe
+            ω-flip windows (no N-methylated amide bond, or the macrocycle
+            ring is smaller than the closure window).
+    """
+    from concerted_rotation import (
+        apply_dihedral_changes_full_mol,
+        dihedral_angle,
+        propose_omega_flip,
+    )
+
+    if mmff_backend not in ("gpu", "cpu"):
+        raise ValueError(
+            f"unknown mmff_backend {mmff_backend!r}; expected 'gpu' or 'cpu'"
+        )
+
+    windows = _enumerate_nme_omega_windows(mol)
+    if not windows:
+        raise ValueError(
+            "mol has no NMe ω-flip windows; check that it is a cyclic peptide "
+            "with at least one N-methylated backbone amide and a macrocycle "
+            f"ring of at least {_OMEGA_WINDOW_SIZE} atoms"
+        )
+    backbone_atoms = _backbone_atom_set(mol)
+    window_downstream_sets = [
+        _compute_window_downstream_sets(mol, w, backbone_atoms) for (w, _) in windows
+    ]
+    n_windows = len(windows)
+    n_atoms = mol.GetNumAtoms()
+    atomic_nums = [a.GetAtomicNum() for a in mol.GetAtoms()]
+
+    template_mol = Chem.Mol(mol)
+    template_mol.RemoveAllConformers()
+
+    rng = np.random.default_rng(seed)
+    stats = {
+        "n_proposed": 0,
+        "n_closure_failures": 0,
+        "n_closure_successes": 0,
+        "n_to_cis": 0,
+        "n_to_trans": 0,
+        "n_mmff_skipped": 0,
+    }
+
+    def batch_propose_fn(coords_list):
+        from confsweeper import _mace_batch_energies
+
+        n_walkers = len(coords_list)
+        if n_walkers == 0:
+            return []
+        stats["n_proposed"] += n_walkers
+
+        # Stage 1: per-walker ω flip + closure on the chosen NMe window.
+        successful_meta: list = []
+        success_walker_indices: list = []
+        for w_idx, coords in enumerate(coords_list):
+            window_idx = int(rng.integers(n_windows))
+            window, drive_idx = windows[window_idx]
+            coords_np = coords.detach().cpu().numpy().astype(np.float64)
+            window_pos = coords_np[list(window)]
+            current_omega = dihedral_angle(
+                window_pos[drive_idx],
+                window_pos[drive_idx + 1],
+                window_pos[drive_idx + 2],
+                window_pos[drive_idx + 3],
+            )
+            # Toggle to the opposite well: trans-like (|ω| > 90°) → cis (0);
+            # cis-like → trans (π).
+            if abs(current_omega) > math.pi / 2.0:
+                target = 0.0
+                stats["n_to_cis"] += 1
+            else:
+                target = math.pi
+                stats["n_to_trans"] += 1
+            result = propose_omega_flip(
+                window_pos,
+                drive_idx,
+                target,
+                closure_tol=closure_tol,
+                n_continuation_steps=n_continuation_steps,
+            )
+            if not result.success:
+                continue
+            new_full = apply_dihedral_changes_full_mol(
+                coords_np,
+                list(window),
+                result.deltas,
+                window_downstream_sets[window_idx],
+            )
+            successful_meta.append(
+                {"new_full": new_full, "det_j": float(result.det_jacobian)}
+            )
+            success_walker_indices.append(w_idx)
+
+        stats["n_closure_successes"] += len(successful_meta)
+        stats["n_closure_failures"] += n_walkers - len(successful_meta)
+
+        if not successful_meta:
+            return [(coords_list[i], 0.0, 0.0, False) for i in range(n_walkers)]
+
+        # Stage 2: stage candidates as conformers; batched MMFF (or skip).
+        throwaway = Chem.Mol(template_mol)
+        for meta in successful_meta:
+            conf = Chem.Conformer(n_atoms)
+            new_full = meta["new_full"]
+            for a_idx in range(n_atoms):
+                x, y, z = new_full[a_idx]
+                conf.SetAtomPosition(a_idx, (float(x), float(y), float(z)))
+            throwaway.AddConformer(conf, assignId=True)
+
+        if skip_mmff_relax:
+            stats["n_mmff_skipped"] += len(successful_meta)
+        elif mmff_backend == "gpu":
+            from nvmolkit.mmffOptimization import MMFFOptimizeMoleculesConfs
+
+            MMFFOptimizeMoleculesConfs([throwaway], hardwareOptions=hardware_opts)
+        else:
+            from rdkit.Chem import AllChem as _AllChem
+
+            for cid in [c.GetId() for c in throwaway.GetConformers()]:
+                _AllChem.MMFFOptimizeMolecule(throwaway, confId=cid)
+
+        # Stage 3: batched MACE scoring, chunked.
+        post_conf_ids = [c.GetId() for c in throwaway.GetConformers()]
+        energies: list = []
+        for start in range(0, len(post_conf_ids), score_chunk_size):
+            chunk_ids = post_conf_ids[start : start + score_chunk_size]
+            ase_mols = [
+                ase.Atoms(
+                    positions=throwaway.GetConformer(cid).GetPositions(),
+                    numbers=atomic_nums,
+                )
+                for cid in chunk_ids
+            ]
+            energies.extend(_mace_batch_energies(calc, ase_mols))
+
+        # Stage 4: assemble per-walker proposals in walker order.
+        proposals: list = [None] * n_walkers
+        for slot, w_idx in enumerate(success_walker_indices):
+            cid = post_conf_ids[slot]
+            new_coords = torch.tensor(
+                throwaway.GetConformer(cid).GetPositions(), dtype=torch.float64
+            )
+            e = float(energies[slot])
+            if not np.isfinite(e):
+                proposals[w_idx] = (coords_list[w_idx], 0.0, 0.0, False)
+            else:
+                proposals[w_idx] = (new_coords, e, successful_meta[slot]["det_j"], True)
+        for w_idx in range(n_walkers):
+            if proposals[w_idx] is None:
+                proposals[w_idx] = (coords_list[w_idx], 0.0, 0.0, False)
+
+        return proposals
+
+    batch_propose_fn.stats = stats
+    return batch_propose_fn
+
+
+# ---------------------------------------------------------------------------
 # Composite proposer — randomly route walkers to one of several sub-proposers
 # ---------------------------------------------------------------------------
 
