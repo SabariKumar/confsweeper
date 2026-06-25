@@ -479,6 +479,155 @@ poplowestpct is the *stakes* proxy (dominant basin → missing it ≈ zero cover
 an **upper bound** on the MMFF-hard pathology — but the "one deep dominant basin"
 regime is common enough (~1 in 9) that the relaxer issue is worth fixing.
 
+### Findings 2026-06-24 — MMFF→MACE relaxer probe: the benchmark surface is wrong (nothing is MACE-relaxed)
+
+Tested whether MACE-relaxation reaches conf0 where MMFF lands in the neighbour.
+The result is bigger than expected:
+
+- **Control — MACE-relax conf0 itself → −66779.65 eV (820 meV BELOW its ceiling
+  value of −66778.83), moving 0.151 Å.** conf0 is NOT a MACE minimum; it is a
+  CREST/GFN2-xTB geometry that MACE *single-points* at −66778.83 but MACE-*relaxes*
+  ~0.8 eV deeper.
+- **Every fold-region conformer drops ~0.8–1.3 eV when MACE-relaxed** (MMFF
+  landings at −66777.2…−66777.9 → −66778.3…−66779.0 after MACE relax), shifting
+  0.15–1.5 Å.
+
+**Headline: the whole v0.3 coverage benchmark compares non-MACE-relaxed
+geometries.** Sampler basins are MMFF-relaxed + MACE-single-pointed; the ceiling
+is CREST geometry + MACE-single-pointed; but the MACE PES has its minima ~1 eV
+deeper and 0.15–1.5 Å away. The pipeline (MMFF inner loop, MACE only as a
+single-point scorer) never finds true MACE minima — so cov_bw_ceil / max_missed_bw
+have been measured on the wrong energy surface. This is the real root cause,
+deeper than "MMFF lands in the wrong neighbour" and bigger than any move/seeding
+question.
+
+Caveat: this 200-conf pool reached only 1.5 Å of conf0 (the 10k exhaustive run
+got 0.36 Å), so it does not cleanly test "MACE-relax from the 0.36 Å neighbour →
+conf0"; but the systematic ~1 eV deepening on MACE relaxation is robust across
+all six geometries tested.
+
+**Implication (superseded by the root-cause finding below):** an earlier reading
+suggested re-grounding the benchmark on a MACE-relaxed surface. Per the clarified
+objective that is OUT of scope — see the next section.
+
+---
+
+## ROOT CAUSE & v0.3 cremp_sharp synthesis (2026-06-24) — the key finding of this session
+
+**Objective (clarified by the user).** confsweeper's goal is to reproduce a CREST
+conformer ensemble as closely as possible at the lowest possible compute. The
+intended design is: **MMFF/MC drives exploration** (cheap), and **MACE is used
+ONLY as a single-point re-scorer** to correct MMFF's inaccurate energies — *not*
+as a relaxer. MACE-relaxation is explicitly off the table (too expensive). So the
+question is whether cheap MMFF/MC can REACH the CREST geometries, with MACE
+fixing up the ranking.
+
+**THE ROOT CAUSE: an MMFF↔MACE energy rank inversion on the CREST-dominant
+conformer.** For cremp_sharp the dominant CREST basin (conf0, 72% of the 298 K
+population) is ranked oppositely by the two energy models:
+
+| | conf0 (CREST dominant) | our best sampler basin |
+|---|---|---|
+| MMFF energy | 61.39 kcal/mol | 59.04 kcal/mol (2.4 kcal/mol LOWER) |
+| MACE single-point | −66778.83 eV (global min) | −66778.38 eV (~10 kcal/mol higher) |
+
+MMFF ranks conf0 **+2.4 kcal/mol above** our best basin; MACE ranks it **~10
+kcal/mol below**. Because **MMFF drives exploration**, MMFF relaxation pulls every
+nearby proposal *away* from conf0 into the lower-MMFF neighbour, and conf0's MMFF
+basin is both higher and narrow → the walk structurally never reaches it. **MACE,
+being only a downstream scorer, can re-rank the basins MMFF finds but cannot make
+MMFF discover a basin MMFF avoids.** conf0 is MMFF-invisible, so MACE never gets
+to reward it. This is the MMFF↔CREST PES gap itself, manifest as one
+CREST-dominant basin the MMFF explorer cannot enter.
+
+### Evidence chain (this session, in order)
+
+1. **Move B (cis/trans ω isomerization, NMe amides)** — implemented end-to-end
+   (B.1a-widened W=10 closure, real Wu–Deem det_j, 5-way composite, CLI; full
+   suite 497 passed). Validation: cremp_sharp cov_bw_ceil = **0.000** at ω weight
+   0.00/0.17/0.34. Ruled out. (Bug found+fixed: ω-flip crashed non-NMe peptides;
+   now degrades gracefully.)
+2. **Move A + Move B combination probe** — cov_bw_ceil = **0.000** at three A/B
+   splits. Ruled out.
+3. **Move C (large-window DBT, W∈{10,13,16})** — implemented end-to-end
+   (variable-window geometry, trf solver, 6-way composite, CLI; full suite 497
+   passed). Validation: cov_bw_ceil = **0.000** at all window sizes. Ruled out.
+4. **The 0.724 wall is move-independent** — `max_missed_bw` is pinned at *exactly*
+   0.724 across Move A, Move B, the A+B combo, and Move C at every window size.
+   Bit-identical invariance across side-chain, backbone-amide, and large
+   concerted-backbone moves ⇒ the gap is not about the move set.
+5. **Ceiling-basin diagnostic** — conf0 is a *stable* MMFF minimum (0.020 Å under
+   MMFF relax), 398 meV (~15 kT) below our sampler's best on MACE, and 2.33 Å
+   from the nearest MCMM basin. A genuine low-energy minimum the walk never
+   reaches — not a relaxation artifact.
+6. **Seeding probes.** (A) De-novo: exhaustive ETKDG (10k seeds) reaches 0.36 Å
+   of conf0 but lands in a +453 meV neighbour (not within the 0.125 Å match
+   threshold); MCMM reaches only 2.33 Å. (B) Direct conf0 seeding → MMFF retains
+   it and **cov_bw_ceil jumps 0.000 → 0.724**. (C) Exhaustive→MCMM (self-contained)
+   → partial only (0.608 Å, **cov 0.057**).
+7. **CREMP scoping** — ~**10.7%** of CREMP (3,888 peptides) are as sharp as
+   cremp_sharp (poplowestpct ≥ 53.5%), enriched in NMe-containing and larger
+   rings. The dominant-basin regime is common; this is an upper bound on how many
+   could hit the inversion pathology.
+8. **MMFF-energy rank inversion (above)** — the decisive measurement: conf0 is
+   MMFF-disfavoured (+2.4 kcal/mol) but MACE-favoured (~−10 kcal/mol). Root cause.
+
+### Structural conclusion
+
+The MMFF-explore + MACE-score design reproduces CREST well **when MMFF and CREST
+agree on the dominant basin** (cremp_typical → ~0.99 coverage), and
+**fundamentally struggles on the subset where they invert** (part of the ~11%
+sharp cases). No move type (A/B/C, nor a hypothetical Move D) addresses this —
+MACE-as-scorer cannot redirect MMFF-driven exploration. **Move D is not
+indicated.**
+
+### Cheap levers that remain (no MACE relaxation)
+
+All aim at giving the explorer access to MMFF-disfavoured-but-CREST-real
+geometries without paying for MACE relaxation, each with a known ceiling:
+- **Seeding diversity** — richer/larger ETKDG pools, accumulate basins across
+  independent runs, or (where a reference exists) direct CREMP seeding (confirmed
+  0.724). For novel peptides this only helps insofar as a cheap pool happens to
+  land in the MMFF-disfavoured basin.
+- **Lighter MMFF relaxation** — cap MMFF iterations / partial relax so proposals
+  don't fully collapse out of CREST-favoured regions before MACE scores them.
+- **Accept the structural ceiling** — MMFF-disfavoured basins are intrinsically
+  hard for an MMFF explorer; document cremp_sharp as the canonical example of the
+  MMFF↔CREST inversion limit, with cremp_typical as the success case.
+
+### The cremp_sharp peptide — explicit definition (canonical MMFF↔CREST inversion case)
+
+- **CREMP id / sequence:** `S.S.N.MeW.MeA.MeN` — cyclo(L-Ser–L-Ser–L-Asn–
+  *N*-methyl-L-Trp–*N*-methyl-L-Ala–*N*-methyl-L-Asn). Head-to-tail cyclic
+  hexapeptide; CREMP `topology = NMe-only`.
+- **SMILES:**
+  `C[C@H]1C(=O)N(C)[C@@H](CC(N)=O)C(=O)N[C@@H](CO)C(=O)N[C@@H](CO)C(=O)N[C@@H](CC(N)=O)C(=O)N(C)[C@@H](Cc2c[nH]c3ccccc23)C(=O)N1C`
+- **Composition:** 6 residues; 93 atoms (50 heavy); 18-atom backbone macrocycle
+  ring. **3 N-methylated backbone amides** (NMe-Trp, NMe-Ala, NMe-Asn at
+  positions 4–6) and **one aromatic side chain** (Trp indole). It therefore
+  exercises every v0.3 move type (NMe amides → Move B ω-flips; aromatic χ₁/χ₂ →
+  Move A; large ring → Move C).
+- **Why it is "sharp":** CREST finds 850 total / 190 unique conformers, but the
+  single lowest conformer holds `poplowestpct = 53.48 %` of the 298 K Boltzmann
+  population (ground-truth `max_bw = 0.535`), at the ~90th percentile of CREMP
+  sharpness (ensemble entropy 10.94). One basin dominates, so failing to
+  reproduce it ≈ zero Boltzmann coverage.
+- **Why it is the canonical *failure* case (the inversion):** that dominant CREST
+  conformer (conf0) is **MMFF-disfavoured** (MMFF 61.39 kcal/mol, +2.4 kcal/mol
+  above our best sampled basin at 59.04) yet **MACE-favoured** (MACE
+  −66778.83 eV, the single-point global minimum, ~10 kcal/mol below our best). It
+  is a *stable, narrow* MMFF minimum (0.02 Å under MMFF relaxation) that random
+  ETKDG + MMFF never falls into (nearest de-novo approach: exhaustive ETKDG
+  0.36 Å, MCMM 2.33 Å). MMFF-driven exploration steers away from it; MACE-as-
+  scorer cannot pull it back. Direct CREMP-seeding of conf0 closes the gap
+  (`cov_bw_ceil` 0.000 → 0.724), confirming it is reachable/retainable but not
+  *discoverable* by the cheap MMFF/MC explorer.
+- **Contrast — the success case `cremp_typical` (`t.I.G.N`):** a 4-residue
+  D-only cyclic tetrapeptide (27 heavy atoms, no NMe, no aromatic) whose dominant
+  basin MMFF and CREST agree on; the pipeline reaches ~0.99 coverage there. The
+  cremp_typical/cremp_sharp pair is the standard benchmark dyad: agreement vs.
+  inversion.
+
 ---
 
 ## Move D — Backbone + side-chain coupled hybrid (conditional)
