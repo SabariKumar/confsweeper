@@ -101,11 +101,13 @@ def _compute_window_downstream_sets(
 ) -> list:
     """
     Compute the full-mol atom indices that should rotate per dihedral
-    when a DBT move acts on `window`.
+    when a concerted-rotation move acts on `window`. Window size W is
+    inferred from `len(window)` (7 for DBT, 10 for the ω-flip path); a
+    W-atom window has W-3 inner dihedrals.
 
     For dihedral k around bond (window[k+1], window[k+2]):
-      - Window backbone atoms strictly downstream: window[k+3..6].
-      - Side chains of window[k+2..6] (the pivot atom k+2's side chain
+      - Window backbone atoms strictly downstream: window[k+3..W-1].
+      - Side chains of window[k+2..W-1] (the pivot atom k+2's side chain
         rotates with the local frame at the pivot; downstream backbone
         atoms' side chains rigidly follow their parents).
 
@@ -115,22 +117,24 @@ def _compute_window_downstream_sets(
 
     Params:
         mol: Chem.Mol : input molecule
-        window: tuple[int, ...] : 7 atom indices, in chain order
+        window: tuple[int, ...] : W atom indices, in chain order
         backbone_atom_set: set[int] : from `_backbone_atom_set(mol)`,
             passed in to avoid recomputation across windows
     Returns:
-        list of 4 frozenset[int] : per-dihedral rotation set, suitable
+        list of W-3 frozenset[int] : per-dihedral rotation set, suitable
             for `concerted_rotation.apply_dihedral_changes_full_mol`
     """
+    window_size = len(window)
+    n_dih = window_size - 3
     side_chains = {
         atom_idx: _side_chain_group(mol, atom_idx, backbone_atom_set)
         for atom_idx in window
     }
     downstream_sets: list = []
-    for k in range(4):
+    for k in range(n_dih):
         rotated: set = set()
         rotated.update(side_chains[window[k + 2]])
-        for j in range(k + 3, 7):
+        for j in range(k + 3, window_size):
             rotated.add(window[j])
             rotated.update(side_chains[window[j]])
         downstream_sets.append(frozenset(rotated))
@@ -320,6 +324,53 @@ def _classify_rotamer_wells(
     return wells_per_bond
 
 
+def _enumerate_concerted_dihedral_pairs(mol: Chem.Mol):
+    """
+    Enumerate `(χ₁, χ₂)` rotatable-bond pairs on aromatic side chains.
+    Each pair is the input to `make_concerted_dihedral_kick_proposer`
+    (v0.3 Move A); rotating both dihedrals together is the concerted
+    move that v0.2's single-bond proposer cannot make.
+
+    Eligibility: for each rotatable side-chain dihedral
+    `(a₂, b₂, c₂, d₂)` from `_enumerate_side_chain_dihedrals` whose
+    downstream endpoint `c₂` is aromatic (the v0.2 atom-c aromaticity
+    flag), find the *upstream* dihedral `(a₁, b₁, c₁, d₁)` whose `c₁`
+    equals `b₂` — i.e., χ₁'s downstream Cβ is χ₂'s upstream Cβ. For
+    standard amino-acid topology this uniquely identifies the χ₁ that
+    rotates the side chain holding the χ₂ aromatic ring. NMe-Trp is the
+    canonical case on cremp_sharp: χ₁ = (Cα, Cβ), χ₂ = (Cβ, Cγ_indole).
+
+    Reuses the v0.2 atom-c aromaticity detection from
+    `_classify_rotamer_wells` (the locked Step-1 design choice A.2 of
+    v0.3 — see docs/concerted_moves_v0_3_plan.md Findings 2026-06-19).
+
+    Params:
+        mol: Chem.Mol : cyclic peptide with explicit Hs.
+    Returns:
+        list[tuple[tuple[int, int, int, int], tuple[int, int, int, int]]]
+            : pairs of (χ₁_quadruple, χ₂_quadruple). χ₂'s c atom is
+            guaranteed aromatic. Empty list if no aromatic side-chain
+            rotatable bonds exist on `mol` (e.g., cyclo-Ala, cremp_typical
+            — both pure-sp3 peptides), in which case
+            `make_concerted_dihedral_kick_proposer` will raise at factory
+            build time.
+    """
+    dihedrals = _enumerate_side_chain_dihedrals(mol)
+    # χ₂ candidates: bonds whose downstream atom c is aromatic.
+    chi2_bonds = [d for d in dihedrals if mol.GetAtomWithIdx(int(d[2])).GetIsAromatic()]
+    pairs = []
+    for chi2 in chi2_bonds:
+        _, b2, _, _ = chi2  # b2 is Cβ — the atom χ₁ rotates around with Cα.
+        for chi1 in dihedrals:
+            if chi1 == chi2:
+                continue
+            _, _, c1, _ = chi1
+            if c1 == b2:
+                pairs.append((chi1, chi2))
+                break  # one χ₁ per χ₂ — the unique upstream Cα-Cβ pair.
+    return pairs
+
+
 # ---------------------------------------------------------------------------
 # Real-mol proposer factory — DBT concerted rotation
 # ---------------------------------------------------------------------------
@@ -333,6 +384,7 @@ def make_mcmm_proposer(
     closure_tol: float = 0.01,
     score_chunk_size: int = 500,
     mmff_backend: str = "gpu",
+    window_size: int = 7,
     seed: int = 0,
 ):
     """
@@ -394,6 +446,12 @@ def make_mcmm_proposer(
             (default 500, matches `_minimize_score_filter_dedup`).
         mmff_backend: str : 'gpu' (nvmolkit batched CUDA, default) or
             'cpu' (RDKit serial). MMFF runs on the throwaway mol.
+        window_size: int : number of consecutive backbone ring atoms per
+            move window (default 7 — the local DBT move). Larger sizes
+            (e.g. 16) drive the same one-dihedral concerted rotation over
+            a bigger window for a larger backbone rearrangement (v0.3
+            Move C). For window_size > 7 the closure is exactly/under-
+            determined, so the `trf` solver is used (vs `lm` at W=7).
         seed: int : base seed for the move-RNG; deterministic across
             replicate runs.
     Returns:
@@ -401,25 +459,28 @@ def make_mcmm_proposer(
             the contract expected by `ParallelMCMMDriver` and
             `ReplicaExchangeMCMMDriver`.
     Raises:
-        ValueError: if `mol` has no enumerable backbone windows (input
-            is not a cyclic peptide of ≥ 3 residues).
+        ValueError: if `mol` has no enumerable backbone windows of
+            `window_size` atoms (input is not a cyclic peptide, or its
+            macrocycle ring is smaller than `window_size`).
     """
-    from concerted_rotation import (
-        N_DIHEDRALS,
-        apply_dihedral_changes_full_mol,
-        propose_move,
-    )
+    from concerted_rotation import apply_dihedral_changes_full_mol, propose_move
 
     if mmff_backend not in ("gpu", "cpu"):
         raise ValueError(
             f"unknown mmff_backend {mmff_backend!r}; expected 'gpu' or 'cpu'"
         )
 
-    windows = enumerate_backbone_windows(mol)
+    # W=7 closure is over-determined (3 free dihedrals, 6 constraints → 'lm');
+    # larger windows are exactly/under-determined → 'trf' (which 'lm' rejects).
+    n_inner_dihedrals = window_size - 3
+    solver_method = "lm" if window_size <= 7 else "trf"
+
+    windows = enumerate_backbone_windows(mol, window_size=window_size)
     if not windows:
         raise ValueError(
-            "mol has no enumerable backbone windows; "
-            "check that it is a head-to-tail cyclic peptide of at least 3 residues"
+            f"mol has no enumerable {window_size}-atom backbone windows; "
+            f"check that it is a head-to-tail cyclic peptide whose macrocycle "
+            f"ring has at least {window_size} atoms"
         )
     backbone_atoms = _backbone_atom_set(mol)
     window_downstream_sets = [
@@ -464,13 +525,17 @@ def make_mcmm_proposer(
         for w_idx, coords in enumerate(coords_list):
             window_idx = int(rng.integers(n_windows))
             window = windows[window_idx]
-            drive_idx = int(rng.integers(N_DIHEDRALS))
+            drive_idx = int(rng.integers(n_inner_dihedrals))
             drive_delta = float(rng.normal(0.0, drive_sigma_rad))
 
             coords_np = coords.detach().cpu().numpy().astype(np.float64)
             window_pos = coords_np[list(window)]
             result = propose_move(
-                window_pos, drive_idx, drive_delta, closure_tol=closure_tol
+                window_pos,
+                drive_idx,
+                drive_delta,
+                closure_tol=closure_tol,
+                solver_method=solver_method,
             )
             if not result.success:
                 continue
@@ -1020,6 +1085,629 @@ def make_dihedral_kick_proposer(
 
 
 # ---------------------------------------------------------------------------
+# Concerted dihedral kick — v0.3 Move A (joint χ₁ + χ₂ on aromatic side chains)
+# ---------------------------------------------------------------------------
+
+
+def make_concerted_dihedral_kick_proposer(
+    mol: Chem.Mol,
+    hardware_opts,
+    calc,
+    sigma_concerted_chi_rad: float = 0.5,
+    p_concerted_jump: float = 0.3,
+    sp3_wells_deg: tuple = (-60.0, 60.0, 180.0),
+    aromatic_wells_deg: tuple = (-90.0, 0.0, 90.0, 180.0),
+    score_chunk_size: int = 500,
+    mmff_backend: str = "gpu",
+    skip_mmff_relax: bool = False,
+    seed: int = 0,
+):
+    """
+    Build a `batch_propose_fn` that rotates a `(χ₁, χ₂)` side-chain
+    dihedral pair *together* per walker per step (joint hybrid Gaussian
+    + joint rotamer-jump), MMFF-relaxes, and MACE-scores. v0.3 Move A
+    (issue #17). Attacks the cremp_sharp residual flagged in the v0.2
+    Step-7 Findings: single-bond moves cannot reach the dominant
+    ceiling basin because rotating χ₁ alone leaves χ₂ at the wrong
+    orientation (MMFF/MACE rejects), and rotating χ₂ alone leaves the
+    side-chain anchor (Cβ position) at the wrong location. Both bonds
+    must rotate together to reach the joint state. See
+    `docs/concerted_moves_v0_3_plan.md` Move A design lock (2026-06-19)
+    for the locked design choices and rationale.
+
+    Per-call pipeline (same shape as `make_dihedral_kick_proposer`):
+
+      1. **Per-walker joint rotation** (CPU, sequential): pick a
+         `(χ₁, χ₂)` pair uniformly at random from
+         `_enumerate_concerted_dihedral_pairs(mol)`; sample either
+         (a) joint Gaussian Δχ₁, Δχ₂ each from `N(0, σ_concerted_chi_rad)`
+         with probability `1 - p_concerted_jump`, or (b) joint rotamer
+         jump — `χ₁_target` sampled uniformly from `sp3_wells_deg`,
+         `χ₂_target` sampled uniformly from `aromatic_wells_deg` —
+         with probability `p_concerted_jump`. Apply via two successive
+         `Chem.rdMolTransforms.SetDihedralDeg` calls (χ₁ first because
+         the χ₂ rotation axis is downstream of χ₁ — rotating χ₁ moves
+         χ₂'s `b` and `c` atoms; the χ₂ rotation then operates on the
+         post-χ₁ geometry).
+      2. **Batched MMFF** (GPU, one call): every rotated candidate
+         lives as a conformer on a shared throwaway mol;
+         `nvmolkit.mmffOptimization.MMFFOptimizeMoleculesConfs`
+         minimises in place. When `skip_mmff_relax=True` (the v0.2
+         ablation toggle, plumbed through to this factory) Stage 2 is
+         bypassed entirely; Stage 3 scores the raw rotated geometry.
+      3. **Batched MACE** (GPU, chunked) via `_mace_batch_energies`.
+      4. **Return** `(coords_tensor, energy_float, det_j=1.0,
+         success=True)` per walker. A joint open-tree rotation in 2D
+         dihedral space is volume-preserving (the Jacobian of two
+         successive open-tree rotations is the product of two unit
+         Jacobians), so detailed balance needs no correction. Walkers
+         whose post-MMFF / post-MACE energy is non-finite get
+         `success=False` exactly as the single-bond path does.
+
+    Strict separation from DBT and from v0.2's single-bond
+    `make_dihedral_kick_proposer`: the eligibility helper
+    `_enumerate_concerted_dihedral_pairs` returns ONLY pairs whose χ₂'s
+    `c` atom is aromatic, so this factory will never touch a backbone
+    dihedral and never touch a sp3-only side chain. Calling this
+    factory on a peptide with no aromatic side chains (e.g.,
+    cremp_typical) raises `ValueError` at factory build time so the
+    caller learns immediately instead of silently producing a no-op
+    proposer at runtime.
+
+    Composition with the rest of the proposer family: this factory is
+    a new top-level proposer routed by `make_composite_proposer`
+    alongside DBT, Cartesian, and v0.2's single-bond dihedral kick. The
+    Step-3 v0.3 work extends `make_default_mcmm_composite` from 3
+    sub-proposers to 4 to include this one — the
+    `weight > 0 ↔ proposer not None` contract generalises naturally
+    (see locked Step-1 design choice A.3 in
+    `docs/concerted_moves_v0_3_plan.md`).
+
+    Lazy import of `_mace_batch_energies` from `confsweeper` avoids the
+    confsweeper → mcmm → proposers circular dependency at module load
+    time (same convention as the other proposer factories in this
+    module).
+
+    Params:
+        mol: Chem.Mol : reference cyclic peptide with explicit Hs.
+            Topology + `(χ₁, χ₂)` pair enumeration are captured at
+            factory build time; do not mutate the mol structurally
+            afterwards.
+        hardware_opts : nvmolkit hardware options for batched MMFF
+            (only used when `mmff_backend='gpu'`).
+        calc : MACECalculator from `get_mace_calc()`.
+        sigma_concerted_chi_rad: float : Gaussian standard deviation in
+            radians for each component of the joint Gaussian refinement
+            step (default 0.5 ≈ 28.6° — same magnitude as v0.2's
+            single-bond `sigma_chi_rad`).
+        p_concerted_jump: float : probability (per walker per step) of
+            a joint rotamer jump instead of a joint Gaussian
+            refinement step (default 0.3). Set to 0 for pure Gaussian;
+            set to 1 for pure joint rotamer jumps. Same locked default
+            as v0.2's single-bond `p_rotamer_jump`.
+        sp3_wells_deg: tuple[float, ...] : χ₁-component rotameric well
+            centres in degrees (default `(-60, 60, 180)` — standard
+            sp3 χ₁). Used for the χ₁ side of every joint rotamer jump.
+        aromatic_wells_deg: tuple[float, ...] : χ₂-component rotameric
+            well centres in degrees (default `(-90, 0, 90, 180)` —
+            v0.2's locked aromatic well set). Used for the χ₂ side of
+            every joint rotamer jump.
+        score_chunk_size: int : MACE per-batch forward pass cap
+            (default 500).
+        mmff_backend: str : 'gpu' (nvmolkit batched CUDA, default) or
+            'cpu' (RDKit serial).
+        skip_mmff_relax: bool : v0.2 ablation toggle (issue #15). When
+            True, Stage-2 MMFF94 is bypassed and Stage-3 MACE scores
+            the raw rotated geometry. Default False preserves the
+            v0.2-with-MMFF behaviour.
+        seed: int : RNG seed for the per-step pair pick + joint
+            Δχ-or-jump sample.
+    Returns:
+        callable : `batch_propose_fn(coords_list) -> list[tuple]`
+            matching the `ParallelMCMMDriver` /
+            `ReplicaExchangeMCMMDriver` proposer contract.
+    Raises:
+        ValueError: on unknown `mmff_backend`, `p_concerted_jump` not
+            in [0, 1], non-positive `sigma_concerted_chi_rad`, empty
+            `sp3_wells_deg` or `aromatic_wells_deg` when
+            `p_concerted_jump > 0`, or when `mol` has no enumerable
+            aromatic side-chain `(χ₁, χ₂)` pairs (e.g., cyclo-Ala,
+            cremp_typical — call the v0.2 single-bond factory instead
+            on those).
+    """
+    if mmff_backend not in ("gpu", "cpu"):
+        raise ValueError(
+            f"unknown mmff_backend {mmff_backend!r}; expected 'gpu' or 'cpu'"
+        )
+    if not 0.0 <= p_concerted_jump <= 1.0:
+        raise ValueError(f"p_concerted_jump must be in [0, 1], got {p_concerted_jump}")
+    if sigma_concerted_chi_rad <= 0.0:
+        raise ValueError(
+            f"sigma_concerted_chi_rad must be positive, got {sigma_concerted_chi_rad}"
+        )
+    if p_concerted_jump > 0.0 and len(sp3_wells_deg) == 0:
+        raise ValueError("sp3_wells_deg must be non-empty when p_concerted_jump > 0")
+    if p_concerted_jump > 0.0 and len(aromatic_wells_deg) == 0:
+        raise ValueError(
+            "aromatic_wells_deg must be non-empty when p_concerted_jump > 0"
+        )
+
+    pairs = _enumerate_concerted_dihedral_pairs(mol)
+    if not pairs:
+        raise ValueError(
+            "mol has no enumerable aromatic side-chain (χ₁, χ₂) pairs; "
+            "check that the input is a cyclic peptide with at least one "
+            "aromatic side chain (Trp / Phe / Tyr / His). For pure-sp3 "
+            "peptides use `make_dihedral_kick_proposer` (v0.2 single-bond) "
+            "instead."
+        )
+    n_pairs = len(pairs)
+    n_atoms = mol.GetNumAtoms()
+    atomic_nums = [a.GetAtomicNum() for a in mol.GetAtoms()]
+
+    template_mol = Chem.Mol(mol)
+    template_mol.RemoveAllConformers()
+
+    sp3_wells_arr = np.asarray(sp3_wells_deg, dtype=np.float64)
+    aromatic_wells_arr = np.asarray(aromatic_wells_deg, dtype=np.float64)
+    n_sp3_wells = len(sp3_wells_arr)
+    n_aromatic_wells = len(aromatic_wells_arr)
+    sigma_concerted_chi_deg = math.degrees(sigma_concerted_chi_rad)
+
+    rng = np.random.default_rng(seed)
+    stats = {
+        "n_proposed": 0,
+        "n_concerted_gaussian_steps": 0,
+        "n_concerted_rotamer_jumps": 0,
+        "n_relax_failures": 0,
+        "n_relax_successes": 0,
+        "n_mmff_skipped": 0,
+    }
+
+    def batch_propose_fn(coords_list):
+        from confsweeper import _mace_batch_energies
+
+        n_walkers = len(coords_list)
+        if n_walkers == 0:
+            return []
+        stats["n_proposed"] += n_walkers
+
+        # Stage 1: stage walker coords on a fresh throwaway mol, then
+        # apply the per-walker joint rotation in place.
+        throwaway = Chem.Mol(template_mol)
+        for coords in coords_list:
+            conf = Chem.Conformer(n_atoms)
+            coords_np = coords.detach().cpu().numpy().astype(np.float64)
+            for a_idx in range(n_atoms):
+                x, y, z = coords_np[a_idx]
+                conf.SetAtomPosition(a_idx, (float(x), float(y), float(z)))
+            throwaway.AddConformer(conf, assignId=True)
+        pre_mmff_conf_ids = [c.GetId() for c in throwaway.GetConformers()]
+        for cid in pre_mmff_conf_ids:
+            conf = throwaway.GetConformer(cid)
+            pair_idx = int(rng.integers(n_pairs))
+            chi1, chi2 = pairs[pair_idx]
+            a1, b1, c1, d1 = chi1
+            a2, b2, c2, d2 = chi2
+            if rng.uniform() < p_concerted_jump:
+                stats["n_concerted_rotamer_jumps"] += 1
+                new_chi1_deg = float(sp3_wells_arr[rng.integers(n_sp3_wells)])
+                new_chi2_deg = float(aromatic_wells_arr[rng.integers(n_aromatic_wells)])
+                rdMolTransforms.SetDihedralDeg(conf, a1, b1, c1, d1, new_chi1_deg)
+                rdMolTransforms.SetDihedralDeg(conf, a2, b2, c2, d2, new_chi2_deg)
+            else:
+                stats["n_concerted_gaussian_steps"] += 1
+                # Apply χ₁ first; its rotation moves χ₂'s b and c atoms.
+                # Read χ₂'s current angle AFTER applying χ₁ so the Δχ₂ is
+                # relative to the post-χ₁ geometry (the natural way joint
+                # dihedral perturbations compose).
+                current_chi1 = rdMolTransforms.GetDihedralDeg(conf, a1, b1, c1, d1)
+                new_chi1_deg = current_chi1 + float(
+                    rng.normal(0.0, sigma_concerted_chi_deg)
+                )
+                rdMolTransforms.SetDihedralDeg(conf, a1, b1, c1, d1, new_chi1_deg)
+                current_chi2 = rdMolTransforms.GetDihedralDeg(conf, a2, b2, c2, d2)
+                new_chi2_deg = current_chi2 + float(
+                    rng.normal(0.0, sigma_concerted_chi_deg)
+                )
+                rdMolTransforms.SetDihedralDeg(conf, a2, b2, c2, d2, new_chi2_deg)
+
+        # Stage 2: batched MMFF on the throwaway mol; skip when
+        # skip_mmff_relax=True (v0.2 ablation path, plumbed through).
+        if skip_mmff_relax:
+            stats["n_mmff_skipped"] += len(pre_mmff_conf_ids)
+        elif mmff_backend == "gpu":
+            from nvmolkit.mmffOptimization import MMFFOptimizeMoleculesConfs
+
+            MMFFOptimizeMoleculesConfs([throwaway], hardwareOptions=hardware_opts)
+        else:
+            from rdkit.Chem import AllChem as _AllChem
+
+            for cid in pre_mmff_conf_ids:
+                _AllChem.MMFFOptimizeMolecule(throwaway, confId=cid)
+
+        # Stage 3: batched MACE scoring, chunked.
+        post_mmff_conf_ids = [c.GetId() for c in throwaway.GetConformers()]
+        energies: list = []
+        for start in range(0, len(post_mmff_conf_ids), score_chunk_size):
+            chunk_ids = post_mmff_conf_ids[start : start + score_chunk_size]
+            ase_mols = [
+                ase.Atoms(
+                    positions=throwaway.GetConformer(cid).GetPositions(),
+                    numbers=atomic_nums,
+                )
+                for cid in chunk_ids
+            ]
+            energies.extend(_mace_batch_energies(calc, ase_mols))
+
+        # Stage 4: assemble per-walker proposals.
+        proposals: list = []
+        for slot, cid in enumerate(post_mmff_conf_ids):
+            new_coords = torch.tensor(
+                throwaway.GetConformer(cid).GetPositions(), dtype=torch.float64
+            )
+            e = float(energies[slot])
+            if not np.isfinite(e):
+                stats["n_relax_failures"] += 1
+                proposals.append((coords_list[slot], 0.0, 0.0, False))
+            else:
+                stats["n_relax_successes"] += 1
+                proposals.append((new_coords, e, 1.0, True))
+        return proposals
+
+    batch_propose_fn.stats = stats
+    return batch_propose_fn
+
+
+# ---------------------------------------------------------------------------
+# ω-flip proposer — v0.3 Move B (cis/trans isomerization on NMe amide bonds)
+# ---------------------------------------------------------------------------
+
+# Window size for the ω-flip closure. W=10 gives 6 free dihedrals after the
+# ω drive (exactly-determined for the 6 last-two-atom constraints), which
+# closes a full trans→cis flip to ~0 Å on real macrocycle geometry; W=7 (the
+# DBT size, 3 free dihedrals) is over-determined and cannot. See
+# docs/concerted_moves_v0_3_plan.md Findings 2026-06-22.
+_OMEGA_WINDOW_SIZE = 10
+
+
+def _is_carbonyl_carbon(mol: Chem.Mol, idx: int) -> bool:
+    """
+    True iff atom `idx` is a carbonyl carbon (a C double-bonded to an O).
+
+    Identifies the C of a backbone amide C(=O)–N bond. Used together with
+    `_is_nme_amide_nitrogen` to locate NMe ω bonds on the macrocycle ring.
+
+    Params:
+        mol: Chem.Mol : input molecule
+        idx: int : atom index
+    Returns:
+        bool : True if `idx` is a carbon with a double-bonded oxygen neighbour
+    """
+    atom = mol.GetAtomWithIdx(idx)
+    if atom.GetSymbol() != "C":
+        return False
+    return any(
+        nb.GetSymbol() == "O"
+        and mol.GetBondBetweenAtoms(idx, nb.GetIdx()).GetBondTypeAsDouble() == 2.0
+        for nb in atom.GetNeighbors()
+    )
+
+
+def _is_nme_amide_nitrogen(mol: Chem.Mol, idx: int, backbone_atom_set: set) -> bool:
+    """
+    True iff atom `idx` is an N-methylated backbone amide nitrogen.
+
+    An NMe backbone N is tertiary (three heavy neighbours, no H) with one
+    heavy neighbour — the N-methyl carbon — lying off the macrocycle ring.
+    A normal amide NH is secondary (two heavy neighbours + one H) and is
+    excluded; proline N is tertiary but its third heavy neighbour is in the
+    ring (the pyrrolidine), so it is also excluded — matching the B.2 lock
+    (NMe ω bonds only).
+
+    This ring-based atom-property detection is consistent with the rest of
+    `proposers.py` (which sources the backbone from
+    `mcmm._ordered_macrocycle_atoms`) rather than the SMARTS-residue model
+    in `torsional_sampling.classify_backbone_residues`; the eligibility set
+    is identical for canonical NMe residues.
+
+    Params:
+        mol: Chem.Mol : input molecule
+        idx: int : atom index (expected to be a macrocycle ring atom)
+        backbone_atom_set: set[int] : macrocycle ring atom indices
+    Returns:
+        bool : True if `idx` is an N-methylated backbone amide nitrogen
+    """
+    atom = mol.GetAtomWithIdx(idx)
+    if atom.GetSymbol() != "N":
+        return False
+    heavy = [nb for nb in atom.GetNeighbors() if nb.GetAtomicNum() != 1]
+    if len(heavy) != 3:
+        return False
+    return any(
+        nb.GetIdx() not in backbone_atom_set and nb.GetSymbol() == "C" for nb in heavy
+    )
+
+
+def _enumerate_nme_omega_windows(
+    mol: Chem.Mol, window_size: int = _OMEGA_WINDOW_SIZE
+) -> list:
+    """
+    Enumerate ω-flip windows for the N-methylated amide bonds of a cyclic
+    peptide. Each entry locates one NMe C(=O)–N backbone bond and centres a
+    `window_size`-atom backbone window on it.
+
+    Walks the macrocycle ring (`_ordered_macrocycle_atoms`); for every NMe
+    backbone nitrogen with an adjacent carbonyl carbon, builds a window so
+    that the C–N amide bond sits at the central inner dihedral
+    `drive_idx = (window_size - 3) // 2` (the ω dihedral, measured over
+    `window[drive_idx .. drive_idx+3]`), leaving free dihedrals on both
+    sides for the closure solver.
+
+    Params:
+        mol: Chem.Mol : a head-to-tail cyclic peptide with explicit Hs.
+        window_size: int : backbone window length (default 10 — the
+            exactly-determined ω closure; see `_OMEGA_WINDOW_SIZE`).
+    Returns:
+        list of (window, drive_idx) : `window` is a tuple of `window_size`
+            ring atom indices in chain order; `drive_idx` is the inner-
+            dihedral index of the ω bond. Empty if the ring is smaller than
+            `window_size` or has no NMe amide bonds.
+    """
+    ring = _ordered_macrocycle_atoms(mol)
+    n = len(ring)
+    if n < window_size:
+        return []
+    backbone_atom_set = set(ring)
+    drive_idx = (window_size - 3) // 2
+    windows: list = []
+    for j in range(n):
+        if not _is_nme_amide_nitrogen(mol, ring[j], backbone_atom_set):
+            continue
+        for jc in ((j + 1) % n, (j - 1) % n):
+            if _is_carbonyl_carbon(mol, ring[jc]):
+                # `first` is the lower-in-forward-order atom of the (C, N)
+                # bond, so window[drive_idx+1]=ring[first] and
+                # window[drive_idx+2]=ring[first+1] place the bond at the
+                # central inner dihedral.
+                first = j if jc == (j + 1) % n else jc
+                start = (first - (drive_idx + 1)) % n
+                window = tuple(ring[(start + i) % n] for i in range(window_size))
+                windows.append((window, drive_idx))
+                break
+    return windows
+
+
+def make_omega_flip_proposer(
+    mol: Chem.Mol,
+    hardware_opts,
+    calc,
+    closure_tol: float = 0.01,
+    n_continuation_steps: int = 12,
+    score_chunk_size: int = 500,
+    mmff_backend: str = "gpu",
+    skip_mmff_relax: bool = False,
+    seed: int = 0,
+):
+    """
+    Build a `batch_propose_fn` that flips one NMe amide ω bond per walker
+    between cis (0°) and trans (180°), re-closing the macrocycle with the
+    widened concerted-rotation solver, then batches MMFF + MACE. v0.3
+    Move B (issue #17).
+
+    Attacks the cremp_sharp residual that no v0.2 / Move-A proposer can
+    reach: NMe peptide bonds favour cis ω, and the dominant ceiling basin
+    is hypothesised to be a cis-ω state. DBT's closure assumes trans ω, and
+    side-chain / Cartesian / concerted-χ moves never touch the backbone
+    amide dihedral, so a cis flip is a topology change unique to this move.
+    See docs/concerted_moves_v0_3_plan.md Move B design lock (2026-06-22).
+
+    Per-call pipeline (same shape as `make_mcmm_proposer`):
+
+      1. **Per-walker ω flip** (CPU, sequential): pick a random NMe ω
+         window (uniform), measure the current ω, and toggle to the
+         opposite state — target cis (0) if currently trans-like
+         (|ω| > 90°), else trans (π). Run
+         `concerted_rotation.propose_omega_flip` on the W=10 window to
+         drive ω to target and re-solve the free backbone dihedrals to
+         keep the last two window atoms fixed (ring stays closed). Walkers
+         whose closure fails are flagged.
+      2. **Full-mol coordinate update** (CPU, sequential): replay the
+         dihedral changes on the full atom array via
+         `concerted_rotation.apply_dihedral_changes_full_mol`, transporting
+         side chains rigidly with their backbone parents (downstream sets
+         precomputed per window at factory-build time).
+      3. **Batched MMFF** (GPU, one call), unless `skip_mmff_relax=True`.
+      4. **Batched MACE** (GPU, chunked) via `_mace_batch_energies`.
+      5. **Return** `(coords, energy, det_j, success)` per walker in walker
+         order. `det_j` is the Wu–Deem |det J| from the closure (NOT 1.0 —
+         the ω-flip re-closure is the same non-volume-preserving constrained
+         map as DBT and needs the Jacobian for detailed balance). Failed
+         walkers pass through with their pre-move coords and `success=False`.
+
+    Lazy import of `_mace_batch_energies` from `confsweeper` avoids the
+    confsweeper → mcmm → proposers circular dependency at module load time.
+
+    Params:
+        mol: Chem.Mol : a head-to-tail cyclic peptide with explicit Hs and
+            at least one N-methylated backbone amide. Topology captured at
+            factory build time; do not mutate structurally afterwards.
+        hardware_opts : nvmolkit hardware options for batched MMFF (only
+            used when `mmff_backend='gpu'` and not `skip_mmff_relax`).
+        calc : MACECalculator from `get_mace_calc()`.
+        closure_tol: float : maximum last-two-atom displacement norm (Å)
+            tolerated as ring-closed; passed to `propose_omega_flip`.
+        n_continuation_steps: int : drive-ramp steps for the ω closure
+            (passed to `propose_omega_flip`).
+        score_chunk_size: int : MACE per-batch forward pass cap (default 500).
+        mmff_backend: str : 'gpu' (nvmolkit batched CUDA) or 'cpu'.
+        skip_mmff_relax: bool : when True, bypass the Stage-2 MMFF relax and
+            MACE-score the raw re-closed geometry (the closure already keeps
+            the ring intact, so unlike the side-chain kick this is not
+            relied on for geometry repair — it is an ablation toggle).
+        seed: int : RNG seed for the per-step window pick.
+    Returns:
+        callable : `batch_propose_fn(coords_list) -> list[tuple]` matching
+            the `ParallelMCMMDriver` / `ReplicaExchangeMCMMDriver` contract.
+    Raises:
+        ValueError: on unknown `mmff_backend`, or when `mol` has no NMe
+            ω-flip windows (no N-methylated amide bond, or the macrocycle
+            ring is smaller than the closure window).
+    """
+    from concerted_rotation import (
+        apply_dihedral_changes_full_mol,
+        dihedral_angle,
+        propose_omega_flip,
+    )
+
+    if mmff_backend not in ("gpu", "cpu"):
+        raise ValueError(
+            f"unknown mmff_backend {mmff_backend!r}; expected 'gpu' or 'cpu'"
+        )
+
+    windows = _enumerate_nme_omega_windows(mol)
+    if not windows:
+        raise ValueError(
+            "mol has no NMe ω-flip windows; check that it is a cyclic peptide "
+            "with at least one N-methylated backbone amide and a macrocycle "
+            f"ring of at least {_OMEGA_WINDOW_SIZE} atoms"
+        )
+    backbone_atoms = _backbone_atom_set(mol)
+    window_downstream_sets = [
+        _compute_window_downstream_sets(mol, w, backbone_atoms) for (w, _) in windows
+    ]
+    n_windows = len(windows)
+    n_atoms = mol.GetNumAtoms()
+    atomic_nums = [a.GetAtomicNum() for a in mol.GetAtoms()]
+
+    template_mol = Chem.Mol(mol)
+    template_mol.RemoveAllConformers()
+
+    rng = np.random.default_rng(seed)
+    stats = {
+        "n_proposed": 0,
+        "n_closure_failures": 0,
+        "n_closure_successes": 0,
+        "n_to_cis": 0,
+        "n_to_trans": 0,
+        "n_mmff_skipped": 0,
+    }
+
+    def batch_propose_fn(coords_list):
+        from confsweeper import _mace_batch_energies
+
+        n_walkers = len(coords_list)
+        if n_walkers == 0:
+            return []
+        stats["n_proposed"] += n_walkers
+
+        # Stage 1: per-walker ω flip + closure on the chosen NMe window.
+        successful_meta: list = []
+        success_walker_indices: list = []
+        for w_idx, coords in enumerate(coords_list):
+            window_idx = int(rng.integers(n_windows))
+            window, drive_idx = windows[window_idx]
+            coords_np = coords.detach().cpu().numpy().astype(np.float64)
+            window_pos = coords_np[list(window)]
+            current_omega = dihedral_angle(
+                window_pos[drive_idx],
+                window_pos[drive_idx + 1],
+                window_pos[drive_idx + 2],
+                window_pos[drive_idx + 3],
+            )
+            # Toggle to the opposite well: trans-like (|ω| > 90°) → cis (0);
+            # cis-like → trans (π).
+            if abs(current_omega) > math.pi / 2.0:
+                target = 0.0
+                stats["n_to_cis"] += 1
+            else:
+                target = math.pi
+                stats["n_to_trans"] += 1
+            result = propose_omega_flip(
+                window_pos,
+                drive_idx,
+                target,
+                closure_tol=closure_tol,
+                n_continuation_steps=n_continuation_steps,
+            )
+            if not result.success:
+                continue
+            new_full = apply_dihedral_changes_full_mol(
+                coords_np,
+                list(window),
+                result.deltas,
+                window_downstream_sets[window_idx],
+            )
+            successful_meta.append(
+                {"new_full": new_full, "det_j": float(result.det_jacobian)}
+            )
+            success_walker_indices.append(w_idx)
+
+        stats["n_closure_successes"] += len(successful_meta)
+        stats["n_closure_failures"] += n_walkers - len(successful_meta)
+
+        if not successful_meta:
+            return [(coords_list[i], 0.0, 0.0, False) for i in range(n_walkers)]
+
+        # Stage 2: stage candidates as conformers; batched MMFF (or skip).
+        throwaway = Chem.Mol(template_mol)
+        for meta in successful_meta:
+            conf = Chem.Conformer(n_atoms)
+            new_full = meta["new_full"]
+            for a_idx in range(n_atoms):
+                x, y, z = new_full[a_idx]
+                conf.SetAtomPosition(a_idx, (float(x), float(y), float(z)))
+            throwaway.AddConformer(conf, assignId=True)
+
+        if skip_mmff_relax:
+            stats["n_mmff_skipped"] += len(successful_meta)
+        elif mmff_backend == "gpu":
+            from nvmolkit.mmffOptimization import MMFFOptimizeMoleculesConfs
+
+            MMFFOptimizeMoleculesConfs([throwaway], hardwareOptions=hardware_opts)
+        else:
+            from rdkit.Chem import AllChem as _AllChem
+
+            for cid in [c.GetId() for c in throwaway.GetConformers()]:
+                _AllChem.MMFFOptimizeMolecule(throwaway, confId=cid)
+
+        # Stage 3: batched MACE scoring, chunked.
+        post_conf_ids = [c.GetId() for c in throwaway.GetConformers()]
+        energies: list = []
+        for start in range(0, len(post_conf_ids), score_chunk_size):
+            chunk_ids = post_conf_ids[start : start + score_chunk_size]
+            ase_mols = [
+                ase.Atoms(
+                    positions=throwaway.GetConformer(cid).GetPositions(),
+                    numbers=atomic_nums,
+                )
+                for cid in chunk_ids
+            ]
+            energies.extend(_mace_batch_energies(calc, ase_mols))
+
+        # Stage 4: assemble per-walker proposals in walker order.
+        proposals: list = [None] * n_walkers
+        for slot, w_idx in enumerate(success_walker_indices):
+            cid = post_conf_ids[slot]
+            new_coords = torch.tensor(
+                throwaway.GetConformer(cid).GetPositions(), dtype=torch.float64
+            )
+            e = float(energies[slot])
+            if not np.isfinite(e):
+                proposals[w_idx] = (coords_list[w_idx], 0.0, 0.0, False)
+            else:
+                proposals[w_idx] = (new_coords, e, successful_meta[slot]["det_j"], True)
+        for w_idx in range(n_walkers):
+            if proposals[w_idx] is None:
+                proposals[w_idx] = (coords_list[w_idx], 0.0, 0.0, False)
+
+        return proposals
+
+    batch_propose_fn.stats = stats
+    return batch_propose_fn
+
+
+# ---------------------------------------------------------------------------
 # Composite proposer — randomly route walkers to one of several sub-proposers
 # ---------------------------------------------------------------------------
 
@@ -1111,25 +1799,39 @@ def make_default_mcmm_composite(
     dbt_proposer,
     cart_proposer=None,
     dihedral_proposer=None,
+    concerted_dihedral_proposer=None,
+    omega_flip_proposer=None,
+    large_window_dbt_proposer=None,
     *,
     cartesian_weight: float = 0.0,
     dihedral_weight: float = 0.0,
+    concerted_dihedral_weight: float = 0.0,
+    omega_flip_weight: float = 0.0,
+    large_window_dbt_weight: float = 0.0,
     seed: int = 0,
 ):
     """
-    Assemble the canonical (DBT, Cartesian-kick, dihedral-kick) composite
-    used by `get_mol_PE_mcmm`. DBT residual weight is
-    `1 - cartesian_weight - dihedral_weight`; the helper validates the
-    sum and the (weight > 0 ↔ proposer not None) contract, then
+    Assemble the canonical (DBT, Cartesian-kick, dihedral-kick,
+    concerted-dihedral-kick, ω-flip) composite used by `get_mol_PE_mcmm`.
+    DBT residual weight is `1 - cartesian_weight - dihedral_weight -
+    concerted_dihedral_weight - omega_flip_weight`; the helper validates
+    the sum and the (weight > 0 ↔ proposer not None) contract, then
     short-circuits to the lone active proposer when only one weight is
-    positive (zero composite-routing overhead — matches the existing
-    "if cartesian_weight == 0: batch_propose_fn = dbt_proposer" path
-    the issue-#10 routing relied on).
+    positive (zero composite-routing overhead — matches the existing "if
+    cartesian_weight == 0: batch_propose_fn = dbt_proposer" path the
+    issue-#10 routing relied on).
+
+    v0.3 (issue #17) added the 4th sub-proposer
+    (`make_concerted_dihedral_kick_proposer`, Move A), the 5th
+    (`make_omega_flip_proposer`, Move B — cis/trans ω isomerization on NMe
+    amides), and the 6th (large-window DBT, Move C — `make_mcmm_proposer`
+    at a larger `window_size`); the contract generalises naturally from
+    the issue-#15 3-way helper.
 
     The caller is responsible for NOT building a sub-proposer whose
-    weight is zero; the helper enforces this so a `cart_proposer` is
-    never silently constructed and then ignored, which would waste the
-    MMFF + MACE setup cost.
+    weight is zero; the helper enforces this so e.g. an
+    `omega_flip_proposer` is never silently constructed and then ignored,
+    which would waste the MMFF + MACE setup cost.
 
     Params:
         dbt_proposer: callable : the DBT (`make_mcmm_proposer`) batch
@@ -1137,13 +1839,32 @@ def make_default_mcmm_composite(
         cart_proposer: callable | None : Cartesian-kick
             (`make_cartesian_kick_proposer`) batch propose function.
             Must be None iff `cartesian_weight == 0.0`.
-        dihedral_proposer: callable | None : dihedral-kick
+        dihedral_proposer: callable | None : single-bond dihedral-kick
             (`make_dihedral_kick_proposer`) batch propose function.
             Must be None iff `dihedral_weight == 0.0`.
+        concerted_dihedral_proposer: callable | None : concerted
+            (χ₁, χ₂) dihedral-kick
+            (`make_concerted_dihedral_kick_proposer`) batch propose
+            function. Must be None iff
+            `concerted_dihedral_weight == 0.0`. v0.3 Move A.
+        omega_flip_proposer: callable | None : ω-flip
+            (`make_omega_flip_proposer`) batch propose function. Must be
+            None iff `omega_flip_weight == 0.0`. v0.3 Move B.
+        large_window_dbt_proposer: callable | None : large-window DBT
+            (`make_mcmm_proposer(..., window_size=large)`) batch propose
+            function. Must be None iff `large_window_dbt_weight == 0.0`.
+            v0.3 Move C — the same concerted backbone rotation as DBT but
+            over a larger window for a bigger rearrangement.
         cartesian_weight: float : routing weight for the Cartesian kick,
             in [0, 1]. Default 0.0.
-        dihedral_weight: float : routing weight for the dihedral kick,
+        dihedral_weight: float : routing weight for the single-bond
+            dihedral kick, in [0, 1]. Default 0.0.
+        concerted_dihedral_weight: float : routing weight for the
+            concerted (χ₁, χ₂) dihedral kick, in [0, 1]. Default 0.0.
+        omega_flip_weight: float : routing weight for the ω-flip move,
             in [0, 1]. Default 0.0.
+        large_window_dbt_weight: float : routing weight for the
+            large-window DBT move, in [0, 1]. Default 0.0.
         seed: int : routing RNG seed; threaded into `make_composite_proposer`
             when a composite is needed.
     Returns:
@@ -1153,20 +1874,36 @@ def make_default_mcmm_composite(
             a dict, not a list — and the existing dict/list aggregation
             in `get_mol_PE_mcmm` handles both shapes).
     Raises:
-        ValueError: any weight is negative; `cartesian_weight + dihedral_weight > 1`;
-            or the (weight > 0 ↔ proposer not None) contract is violated
-            for either sub-proposer.
+        ValueError: any weight is negative; the non-DBT weights sum to
+            > 1; or the (weight > 0 ↔ proposer not None) contract is
+            violated for any sub-proposer.
     """
-    if cartesian_weight < 0.0 or dihedral_weight < 0.0:
+    if (
+        cartesian_weight < 0.0
+        or dihedral_weight < 0.0
+        or concerted_dihedral_weight < 0.0
+        or omega_flip_weight < 0.0
+        or large_window_dbt_weight < 0.0
+    ):
         raise ValueError(
             f"weights must be non-negative, got cartesian_weight={cartesian_weight}, "
-            f"dihedral_weight={dihedral_weight}"
+            f"dihedral_weight={dihedral_weight}, "
+            f"concerted_dihedral_weight={concerted_dihedral_weight}, "
+            f"omega_flip_weight={omega_flip_weight}, "
+            f"large_window_dbt_weight={large_window_dbt_weight}"
         )
-    total_non_dbt = cartesian_weight + dihedral_weight
+    total_non_dbt = (
+        cartesian_weight
+        + dihedral_weight
+        + concerted_dihedral_weight
+        + omega_flip_weight
+        + large_window_dbt_weight
+    )
     if total_non_dbt > 1.0 + 1e-12:
         raise ValueError(
-            f"cartesian_weight + dihedral_weight = {total_non_dbt} > 1.0; "
-            "DBT residual weight would be negative"
+            f"cartesian_weight + dihedral_weight + concerted_dihedral_weight "
+            f"+ omega_flip_weight + large_window_dbt_weight = {total_non_dbt} > 1.0; "
+            f"DBT residual weight would be negative"
         )
     if (cartesian_weight > 0.0) != (cart_proposer is not None):
         raise ValueError(
@@ -1180,6 +1917,26 @@ def make_default_mcmm_composite(
             f"{'None' if dihedral_proposer is None else 'not None'}; "
             "weight > 0 iff proposer not None"
         )
+    if (concerted_dihedral_weight > 0.0) != (concerted_dihedral_proposer is not None):
+        raise ValueError(
+            f"concerted_dihedral_weight={concerted_dihedral_weight} but "
+            f"concerted_dihedral_proposer is "
+            f"{'None' if concerted_dihedral_proposer is None else 'not None'}; "
+            "weight > 0 iff proposer not None"
+        )
+    if (omega_flip_weight > 0.0) != (omega_flip_proposer is not None):
+        raise ValueError(
+            f"omega_flip_weight={omega_flip_weight} but omega_flip_proposer is "
+            f"{'None' if omega_flip_proposer is None else 'not None'}; "
+            "weight > 0 iff proposer not None"
+        )
+    if (large_window_dbt_weight > 0.0) != (large_window_dbt_proposer is not None):
+        raise ValueError(
+            f"large_window_dbt_weight={large_window_dbt_weight} but "
+            f"large_window_dbt_proposer is "
+            f"{'None' if large_window_dbt_proposer is None else 'not None'}; "
+            "weight > 0 iff proposer not None"
+        )
 
     dbt_weight = 1.0 - total_non_dbt
 
@@ -1190,6 +1947,12 @@ def make_default_mcmm_composite(
         active.append((cartesian_weight, cart_proposer))
     if dihedral_proposer is not None:
         active.append((dihedral_weight, dihedral_proposer))
+    if concerted_dihedral_proposer is not None:
+        active.append((concerted_dihedral_weight, concerted_dihedral_proposer))
+    if omega_flip_proposer is not None:
+        active.append((omega_flip_weight, omega_flip_proposer))
+    if large_window_dbt_proposer is not None:
+        active.append((large_window_dbt_weight, large_window_dbt_proposer))
 
     if len(active) == 1:
         return active[0][1]

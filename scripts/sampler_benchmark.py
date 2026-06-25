@@ -307,6 +307,11 @@ def _run_mcmm(
     p_rotamer_jump: float = 0.3,
     aromatic_wells_deg: tuple | None = None,
     skip_mmff_relax: bool = False,
+    concerted_dihedral_weight: float = 0.0,
+    p_concerted_jump: float = 0.3,
+    omega_flip_weight: float = 0.0,
+    large_window_dbt_weight: float = 0.0,
+    large_window_size: int = 16,
     e_window_kT: float = 5.0,
     saunders_exponent: float = 0.5,
 ) -> list[float]:
@@ -385,6 +390,11 @@ def _run_mcmm(
         p_rotamer_jump=p_rotamer_jump,
         aromatic_wells_deg=aromatic_wells_deg,
         skip_mmff_relax=skip_mmff_relax,
+        concerted_dihedral_weight=concerted_dihedral_weight,
+        p_concerted_jump=p_concerted_jump,
+        omega_flip_weight=omega_flip_weight,
+        large_window_dbt_weight=large_window_dbt_weight,
+        large_window_size=large_window_size,
         e_window_kT=e_window_kT,
         saunders_exponent=saunders_exponent,
     )
@@ -553,6 +563,11 @@ def run_one(
     p_rotamer_jump: float = 0.3,
     aromatic_wells_deg: tuple | None = None,
     skip_mmff_relax: bool = False,
+    concerted_dihedral_weight: float = 0.0,
+    p_concerted_jump: float = 0.3,
+    omega_flip_weight: float = 0.0,
+    large_window_dbt_weight: float = 0.0,
+    large_window_size: int = 16,
     e_window_kT: float = 5.0,
     saunders_exponent: float = 0.5,
 ) -> dict:
@@ -592,6 +607,11 @@ def run_one(
         runner_kwargs["p_rotamer_jump"] = p_rotamer_jump
         runner_kwargs["aromatic_wells_deg"] = aromatic_wells_deg
         runner_kwargs["skip_mmff_relax"] = skip_mmff_relax
+        runner_kwargs["concerted_dihedral_weight"] = concerted_dihedral_weight
+        runner_kwargs["p_concerted_jump"] = p_concerted_jump
+        runner_kwargs["omega_flip_weight"] = omega_flip_weight
+        runner_kwargs["large_window_dbt_weight"] = large_window_dbt_weight
+        runner_kwargs["large_window_size"] = large_window_size
         runner_kwargs["e_window_kT"] = e_window_kT
         runner_kwargs["saunders_exponent"] = saunders_exponent
     energies_eV = runner(
@@ -749,8 +769,70 @@ def run_one(
     "rotated coordinates pass directly to the MACE scorer. "
     "Diagnostic-grade ablation for the MMFF snap-back hypothesis "
     "documented in docs/dihedral_kick_v0_2_plan.md. Defaults off "
-    "so issue-#12 callers are unchanged. Ignored when "
-    "--dihedral_weight=0.",
+    "so issue-#12 callers are unchanged. Threaded through to both "
+    "single-bond and concerted dihedral kicks. Ignored when both "
+    "--dihedral_weight=0 and --concerted_dihedral_weight=0.",
+)
+@click.option(
+    "--concerted_dihedral_weight",
+    type=float,
+    default=0.0,
+    show_default=True,
+    help="MCMM proposer mix: routing weight for the v0.3 concerted "
+    "(chi1, chi2) dihedral-kick proposer on aromatic side chains. "
+    "0 = not in the route at all. Combined constraint: "
+    "cartesian_weight + dihedral_weight + concerted_dihedral_weight "
+    "<= 1 (DBT is the residual). Ignored by non-MCMM samplers. "
+    "Issue #17 / v0.3 Move A / docs/concerted_moves_v0_3_plan.md.",
+)
+@click.option(
+    "--p_concerted_jump",
+    type=float,
+    default=0.3,
+    show_default=True,
+    help="Concerted dihedral-kick knob: probability per walker per "
+    "step that the joint (chi1, chi2) move takes a joint rotamer "
+    "jump (chi1 from rotamer_wells_deg, chi2 from "
+    "aromatic_wells_deg = (-90, 0, 90, 180)) instead of a joint "
+    "Gaussian step. Mirrors --p_rotamer_jump's role on the single-"
+    "bond proposer. Ignored when --concerted_dihedral_weight=0.",
+)
+@click.option(
+    "--omega_flip_weight",
+    type=float,
+    default=0.0,
+    show_default=True,
+    help="MCMM proposer mix: routing weight for the v0.3 omega-flip "
+    "proposer (cis/trans isomerization of N-methylated backbone "
+    "amides via the widened W=10 concerted-rotation closure). "
+    "0 = not in the route at all. Combined constraint: "
+    "cartesian_weight + dihedral_weight + concerted_dihedral_weight "
+    "+ omega_flip_weight <= 1 (DBT is the residual). Requires an "
+    "N-methylated amide; ignored by non-MCMM samplers. "
+    "Issue #17 / v0.3 Move B / docs/concerted_moves_v0_3_plan.md.",
+)
+@click.option(
+    "--large_window_dbt_weight",
+    type=float,
+    default=0.0,
+    show_default=True,
+    help="MCMM proposer mix: routing weight for the v0.3 large-window DBT "
+    "proposer (Move C — the same concerted backbone rotation as DBT but "
+    "over a --large_window_size-atom window for a bigger rearrangement). "
+    "0 = not in the route at all. Combined constraint: cartesian_weight + "
+    "dihedral_weight + concerted_dihedral_weight + omega_flip_weight + "
+    "large_window_dbt_weight <= 1 (W=7 DBT is the residual). Degrades to "
+    "DBT on rings smaller than the window; ignored by non-MCMM samplers. "
+    "Issue #17 / v0.3 Move C / docs/concerted_moves_v0_3_plan.md.",
+)
+@click.option(
+    "--large_window_size",
+    type=int,
+    default=16,
+    show_default=True,
+    help="Backbone window size (ring atoms) for the Move C large-window "
+    "DBT proposer (default 16 ≈ 5 residues). Only used when "
+    "--large_window_dbt_weight > 0.",
 )
 @click.option(
     "--e_window_kT",
@@ -790,6 +872,11 @@ def main(
     p_rotamer_jump: float,
     aromatic_wells: bool,
     skip_mmff_relax: bool,
+    concerted_dihedral_weight: float,
+    p_concerted_jump: float,
+    omega_flip_weight: float,
+    large_window_dbt_weight: float,
+    large_window_size: int,
     e_window_kT: float,
     saunders_exponent: float,
 ) -> None:
@@ -856,7 +943,10 @@ def main(
     logger.info(
         "samplers=%s  n_seeds=%d  dedup_modes=%s  cartesian_weight=%.2f  "
         "dihedral_weight=%.2f  p_rotamer_jump=%.2f  aromatic_wells=%s  "
-        "skip_mmff_relax=%s  e_window_kT=%.2f  saunders_exponent=%.2f",
+        "skip_mmff_relax=%s  concerted_dihedral_weight=%.2f  "
+        "p_concerted_jump=%.2f  omega_flip_weight=%.2f  "
+        "large_window_dbt_weight=%.2f  large_window_size=%d  "
+        "e_window_kT=%.2f  saunders_exponent=%.2f",
         sampler_list,
         n_seeds,
         mode_list,
@@ -865,6 +955,11 @@ def main(
         p_rotamer_jump,
         "on" if aromatic_wells else "off",
         "on" if skip_mmff_relax else "off",
+        concerted_dihedral_weight,
+        p_concerted_jump,
+        omega_flip_weight,
+        large_window_dbt_weight,
+        large_window_size,
         e_window_kT,
         saunders_exponent,
     )
@@ -923,6 +1018,11 @@ def main(
                         p_rotamer_jump=p_rotamer_jump,
                         aromatic_wells_deg=aromatic_wells_deg,
                         skip_mmff_relax=skip_mmff_relax,
+                        concerted_dihedral_weight=concerted_dihedral_weight,
+                        p_concerted_jump=p_concerted_jump,
+                        omega_flip_weight=omega_flip_weight,
+                        large_window_dbt_weight=large_window_dbt_weight,
+                        large_window_size=large_window_size,
                         e_window_kT=e_window_kT,
                         saunders_exponent=saunders_exponent,
                     )

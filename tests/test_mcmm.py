@@ -23,6 +23,7 @@ from mcmm import (
     _backbone_atom_set,
     _compute_window_downstream_sets,
     _ordered_backbone_residues,
+    _ordered_macrocycle_atoms,
     _side_chain_group,
     _swap_walker_configs,
     enumerate_backbone_windows,
@@ -32,8 +33,11 @@ from mcmm import (
 )
 from proposers import (
     _classify_rotamer_wells,
+    _enumerate_concerted_dihedral_pairs,
+    _enumerate_nme_omega_windows,
     _enumerate_side_chain_dihedrals,
     make_default_mcmm_composite,
+    make_omega_flip_proposer,
 )
 
 # ---------------------------------------------------------------------------
@@ -1747,7 +1751,7 @@ def test_make_mcmm_proposer_rejects_for_non_cyclic_input():
     backbone windows (caught at build time, before any moves are
     proposed)."""
     cyclohexane = Chem.AddHs(Chem.MolFromSmiles("C1CCCCC1"))
-    with pytest.raises(ValueError, match="no enumerable backbone windows"):
+    with pytest.raises(ValueError, match="no enumerable .* backbone windows"):
         make_mcmm_proposer(cyclohexane, hardware_opts=None, calc=None, seed=0)
 
 
@@ -2813,6 +2817,186 @@ def test_dihedral_kick_skip_mmff_relax_still_rejects_non_finite_mace():
     assert proposer.stats["n_relax_successes"] == 0
 
 
+# ---------------------------------------------------------------------------
+# Concerted χ₁ + χ₂ dihedral kick (Step 2 / v0.3 Move A — issue #17)
+# ---------------------------------------------------------------------------
+
+
+def test_enumerate_concerted_dihedral_pairs_finds_trp_chi1_chi2_on_cremp_sharp():
+    """cremp_sharp has exactly one aromatic side chain (NMe-Trp at
+    position 4). The helper must return exactly one (χ₁, χ₂) pair, and
+    the pair must satisfy the v0.3 Move A invariants: χ₁'s c equals
+    χ₂'s b (the shared Cβ atom), and χ₂'s c is aromatic."""
+    mol = _cremp_sharp_mol()
+    pairs = _enumerate_concerted_dihedral_pairs(mol)
+    assert len(pairs) == 1, (
+        f"cremp_sharp has 1 aromatic residue (NMe-Trp) — expected 1 "
+        f"concerted pair, got {len(pairs)}"
+    )
+    chi1, chi2 = pairs[0]
+    _, _, c1, _ = chi1
+    _, b2, c2, _ = chi2
+    assert c1 == b2, (
+        f"χ₁'s c (Cβ) must equal χ₂'s b (also Cβ) — the shared atom "
+        f"that defines the (χ₁, χ₂) coupling. Got c1={c1}, b2={b2}"
+    )
+    assert mol.GetAtomWithIdx(c2).GetIsAromatic(), (
+        f"χ₂'s c atom must be aromatic by the helper's eligibility "
+        f"contract; got non-aromatic atom {c2}"
+    )
+
+
+def test_enumerate_concerted_dihedral_pairs_empty_on_pure_sp3_peptide():
+    """cyclic_ala_ser_mol (Ala-Ser-Ala-Ala, no aromatic side chains)
+    must return an empty list — the helper rules out non-aromatic
+    side chains by atom-c aromaticity inspection. Same contract as
+    `make_concerted_dihedral_kick_proposer` raising ValueError on this
+    mol at factory build time."""
+    mol = _cyclic_ala_ser_mol()
+    pairs = _enumerate_concerted_dihedral_pairs(mol)
+    assert (
+        pairs == []
+    ), f"pure-sp3 peptide should yield zero concerted pairs; got {pairs}"
+
+
+def test_make_concerted_dihedral_kick_proposer_raises_on_pure_sp3_peptide():
+    """Calling the factory with a mol that has no aromatic side chains
+    must raise ValueError at build time rather than silently producing
+    a no-op proposer."""
+    from proposers import make_concerted_dihedral_kick_proposer
+
+    mol = _cyclic_ala_ser_mol()
+    with pytest.raises(ValueError, match="no enumerable aromatic side-chain"):
+        make_concerted_dihedral_kick_proposer(mol, hardware_opts=None, calc=None)
+
+
+def test_make_concerted_dihedral_kick_proposer_validation_kwargs():
+    """Validation paths mirror v0.2 single-bond proposer: bad backend,
+    p_concerted_jump out of [0, 1], non-positive sigma, empty wells
+    when jumps are enabled. All raise at factory build time."""
+    from proposers import make_concerted_dihedral_kick_proposer
+
+    mol = _cremp_sharp_mol()  # has 1 aromatic pair — passes pair check.
+    with pytest.raises(ValueError, match="unknown mmff_backend"):
+        make_concerted_dihedral_kick_proposer(
+            mol, hardware_opts=None, calc=None, mmff_backend="bogus"
+        )
+    with pytest.raises(ValueError, match="p_concerted_jump must be in"):
+        make_concerted_dihedral_kick_proposer(
+            mol, hardware_opts=None, calc=None, p_concerted_jump=1.5
+        )
+    with pytest.raises(ValueError, match="sigma_concerted_chi_rad must be positive"):
+        make_concerted_dihedral_kick_proposer(
+            mol, hardware_opts=None, calc=None, sigma_concerted_chi_rad=0.0
+        )
+    with pytest.raises(ValueError, match="sp3_wells_deg must be non-empty"):
+        make_concerted_dihedral_kick_proposer(
+            mol, hardware_opts=None, calc=None, sp3_wells_deg=()
+        )
+    with pytest.raises(ValueError, match="aromatic_wells_deg must be non-empty"):
+        make_concerted_dihedral_kick_proposer(
+            mol, hardware_opts=None, calc=None, aromatic_wells_deg=()
+        )
+
+
+def _make_concerted_dihedral_kick_with_mocks(mol, **kwargs):
+    """Mock harness for the concerted factory — mirrors
+    `_make_dihedral_kick_with_mocks` from the v0.2 test block."""
+    from contextlib import contextmanager
+    from unittest.mock import patch as _patch
+
+    from proposers import make_concerted_dihedral_kick_proposer
+
+    proposer = make_concerted_dihedral_kick_proposer(
+        mol,
+        hardware_opts=None,
+        calc=None,
+        **kwargs,
+    )
+
+    counter = [0]
+
+    def _mock_mace(_calc, ase_mols):
+        out = [(counter[0] + i) * 0.01 for i in range(len(ase_mols))]
+        counter[0] += len(ase_mols)
+        return out
+
+    @contextmanager
+    def patched():
+        with (
+            _patch("confsweeper._mace_batch_energies", side_effect=_mock_mace),
+            _patch(
+                "nvmolkit.mmffOptimization.MMFFOptimizeMoleculesConfs",
+                return_value=[[]],
+            ),
+        ):
+            yield
+
+    return proposer, patched
+
+
+def test_concerted_dihedral_kick_pure_rotamer_jump_lands_in_joint_wells():
+    """With `p_concerted_jump=1.0` and MMFF mocked as a no-op (the
+    returned `[[]]` doesn't touch conformers), every proposal must
+    leave the (χ₁, χ₂) angles exactly at one of the joint-well states
+    — χ₁ in sp3_wells_deg, χ₂ in aromatic_wells_deg. Locked Step-1
+    invariant for the rotamer-jump branch."""
+    from rdkit.Chem import rdMolTransforms
+
+    mol = _cremp_sharp_mol()
+    sp3_wells = (-60.0, 60.0, 180.0)
+    aromatic_wells = (-90.0, 0.0, 90.0, 180.0)
+    proposer, patched = _make_concerted_dihedral_kick_with_mocks(
+        mol,
+        seed=0,
+        p_concerted_jump=1.0,
+        sp3_wells_deg=sp3_wells,
+        aromatic_wells_deg=aromatic_wells,
+    )
+    pairs = _enumerate_concerted_dihedral_pairs(mol)
+    assert len(pairs) == 1
+    chi1, chi2 = pairs[0]
+    # Need an embedded seed conformer to provide starting coords.
+    from rdkit.Chem import AllChem as _AllChem
+
+    _AllChem.EmbedMolecule(mol, randomSeed=42)
+    seed_coords = torch.tensor(mol.GetConformer(0).GetPositions(), dtype=torch.float64)
+    coords_list = [seed_coords.clone() for _ in range(6)]
+    with patched():
+        proposals = proposer(coords_list)
+    assert len(proposals) == 6
+    # For each successful proposal, rebuild the mol-with-conformer from
+    # the returned coords and read back the (χ₁, χ₂) values.
+    tmp_mol = Chem.Mol(mol)
+    tmp_mol.RemoveAllConformers()
+    for new_coords, _, _, success in proposals:
+        if not success:
+            continue
+        conf = Chem.Conformer(mol.GetNumAtoms())
+        np_coords = new_coords.detach().cpu().numpy()
+        for a_idx in range(mol.GetNumAtoms()):
+            conf.SetAtomPosition(
+                a_idx,
+                (
+                    float(np_coords[a_idx][0]),
+                    float(np_coords[a_idx][1]),
+                    float(np_coords[a_idx][2]),
+                ),
+            )
+        cid = tmp_mol.AddConformer(conf, assignId=True)
+        chi1_actual = rdMolTransforms.GetDihedralDeg(tmp_mol.GetConformer(cid), *chi1)
+        chi2_actual = rdMolTransforms.GetDihedralDeg(tmp_mol.GetConformer(cid), *chi2)
+        assert any(
+            abs(chi1_actual - w) < 1e-4 for w in sp3_wells
+        ), f"χ₁ landed at {chi1_actual:.3f}°, expected one of {sp3_wells}"
+        assert any(
+            abs(chi2_actual - w) < 1e-4 for w in aromatic_wells
+        ), f"χ₂ landed at {chi2_actual:.3f}°, expected one of {aromatic_wells}"
+    # All 6 proposals took the rotamer-jump branch.
+    assert proposer.stats["n_concerted_rotamer_jumps"] == 6
+    assert proposer.stats["n_concerted_gaussian_steps"] == 0
+
+
 def _stub_proposer(tag: str, n_atoms: int = _TEST_N_ATOMS):
     """Build a mock proposer that returns a tagged sentinel coords tensor
     so we can verify which sub-proposer routed each walker."""
@@ -3129,3 +3313,483 @@ def test_default_mcmm_composite_short_circuit_preserves_dict_stats_shape():
     out = make_default_mcmm_composite(dbt)
     assert isinstance(out.stats, dict)
     assert "n_walkers" in out.stats
+
+
+# ---------------------------------------------------------------------------
+# make_default_mcmm_composite — 4-way extension (v0.3 Move A / issue #17)
+# ---------------------------------------------------------------------------
+
+
+def test_default_mcmm_composite_validation_negative_concerted_weight():
+    dbt = _stub_proposer("a")
+    with pytest.raises(ValueError, match="weights must be non-negative"):
+        make_default_mcmm_composite(dbt, concerted_dihedral_weight=-0.1)
+
+
+def test_default_mcmm_composite_validation_4way_sum_exceeds_one():
+    """All three non-DBT weights together must sum to ≤ 1; the 3-way
+    constraint generalises naturally to 4-way."""
+    dbt = _stub_proposer("a")
+    cart = _stub_proposer("b")
+    dih = _stub_proposer("c")
+    cdih = _stub_proposer("d")
+    with pytest.raises(ValueError, match="DBT residual weight would be negative"):
+        make_default_mcmm_composite(
+            dbt,
+            cart_proposer=cart,
+            dihedral_proposer=dih,
+            concerted_dihedral_proposer=cdih,
+            cartesian_weight=0.4,
+            dihedral_weight=0.4,
+            concerted_dihedral_weight=0.4,
+        )
+
+
+def test_default_mcmm_composite_validation_concerted_weight_without_proposer():
+    dbt = _stub_proposer("a")
+    with pytest.raises(ValueError, match="weight > 0 iff proposer not None"):
+        make_default_mcmm_composite(dbt, concerted_dihedral_weight=0.3)
+
+
+def test_default_mcmm_composite_validation_concerted_proposer_without_weight():
+    dbt = _stub_proposer("a")
+    cdih = _stub_proposer("d")
+    with pytest.raises(ValueError, match="weight > 0 iff proposer not None"):
+        make_default_mcmm_composite(
+            dbt,
+            concerted_dihedral_proposer=cdih,
+            concerted_dihedral_weight=0.0,
+        )
+
+
+def test_default_mcmm_composite_pure_concerted_short_circuits():
+    """concerted_dihedral_weight=1.0 (DBT residual = 0) returns the
+    concerted proposer directly — no composite overhead."""
+    dbt = _stub_proposer("a")
+    cdih = _stub_proposer("d")
+    out = make_default_mcmm_composite(
+        dbt,
+        concerted_dihedral_proposer=cdih,
+        concerted_dihedral_weight=1.0,
+    )
+    assert out is cdih
+    coords = [torch.zeros(_TEST_N_ATOMS, 3, dtype=torch.float64) for _ in range(5)]
+    out(coords)
+    assert dbt.stats["n_walkers"] == 0
+    assert cdih.stats["n_walkers"] == 5
+
+
+def test_default_mcmm_composite_four_way_distribution():
+    """DBT=0.4, cart=0.2, dihedral=0.2, concerted=0.2 across 4000
+    walkers — each route gets ~its share with ±10% slack."""
+    dbt = _stub_proposer("a")
+    cart = _stub_proposer("b")
+    dih = _stub_proposer("c")
+    cdih = _stub_proposer("d")
+    composite = make_default_mcmm_composite(
+        dbt,
+        cart_proposer=cart,
+        dihedral_proposer=dih,
+        concerted_dihedral_proposer=cdih,
+        cartesian_weight=0.2,
+        dihedral_weight=0.2,
+        concerted_dihedral_weight=0.2,
+        seed=123,
+    )
+    assert isinstance(composite.stats, list)
+    assert len(composite.stats) == 4
+    n_walkers = 4000
+    coords = [
+        torch.zeros(_TEST_N_ATOMS, 3, dtype=torch.float64) for _ in range(n_walkers)
+    ]
+    composite(coords)
+    n_a = dbt.stats["n_walkers"]
+    n_b = cart.stats["n_walkers"]
+    n_c = dih.stats["n_walkers"]
+    n_d = cdih.stats["n_walkers"]
+    assert n_a + n_b + n_c + n_d == n_walkers
+    assert 0.30 * n_walkers < n_a < 0.50 * n_walkers
+    assert 0.10 * n_walkers < n_b < 0.30 * n_walkers
+    assert 0.10 * n_walkers < n_c < 0.30 * n_walkers
+    assert 0.10 * n_walkers < n_d < 0.30 * n_walkers
+
+
+def test_default_mcmm_composite_four_way_substats_reachable():
+    """The composite's .stats must expose all four sub-proposer stats
+    dicts in route order (DBT, cart, dihedral, concerted)."""
+    dbt = _stub_proposer("a")
+    cart = _stub_proposer("b")
+    dih = _stub_proposer("c")
+    cdih = _stub_proposer("d")
+    composite = make_default_mcmm_composite(
+        dbt,
+        cart_proposer=cart,
+        dihedral_proposer=dih,
+        concerted_dihedral_proposer=cdih,
+        cartesian_weight=0.2,
+        dihedral_weight=0.2,
+        concerted_dihedral_weight=0.2,
+    )
+    assert composite.stats == [dbt.stats, cart.stats, dih.stats, cdih.stats]
+
+
+# ---------------------------------------------------------------------------
+# make_default_mcmm_composite — 5-way extension (v0.3 Move B / issue #17)
+# ---------------------------------------------------------------------------
+
+
+def test_default_mcmm_composite_validation_negative_omega_weight():
+    dbt = _stub_proposer("a")
+    with pytest.raises(ValueError, match="weights must be non-negative"):
+        make_default_mcmm_composite(dbt, omega_flip_weight=-0.1)
+
+
+def test_default_mcmm_composite_validation_5way_sum_exceeds_one():
+    dbt = _stub_proposer("a")
+    cart = _stub_proposer("b")
+    dih = _stub_proposer("c")
+    cdih = _stub_proposer("d")
+    omega = _stub_proposer("e")
+    with pytest.raises(ValueError, match="DBT residual weight would be negative"):
+        make_default_mcmm_composite(
+            dbt,
+            cart_proposer=cart,
+            dihedral_proposer=dih,
+            concerted_dihedral_proposer=cdih,
+            omega_flip_proposer=omega,
+            cartesian_weight=0.3,
+            dihedral_weight=0.3,
+            concerted_dihedral_weight=0.3,
+            omega_flip_weight=0.3,
+        )
+
+
+def test_default_mcmm_composite_validation_omega_weight_without_proposer():
+    dbt = _stub_proposer("a")
+    with pytest.raises(ValueError, match="weight > 0 iff proposer not None"):
+        make_default_mcmm_composite(dbt, omega_flip_weight=0.3)
+
+
+def test_default_mcmm_composite_validation_omega_proposer_without_weight():
+    dbt = _stub_proposer("a")
+    omega = _stub_proposer("e")
+    with pytest.raises(ValueError, match="weight > 0 iff proposer not None"):
+        make_default_mcmm_composite(
+            dbt, omega_flip_proposer=omega, omega_flip_weight=0.0
+        )
+
+
+def test_default_mcmm_composite_pure_omega_short_circuits():
+    """omega_flip_weight=1.0 (DBT residual = 0) returns the ω proposer
+    directly — no composite overhead."""
+    dbt = _stub_proposer("a")
+    omega = _stub_proposer("e")
+    out = make_default_mcmm_composite(
+        dbt, omega_flip_proposer=omega, omega_flip_weight=1.0
+    )
+    assert out is omega
+    coords = [torch.zeros(_TEST_N_ATOMS, 3, dtype=torch.float64) for _ in range(5)]
+    out(coords)
+    assert dbt.stats["n_walkers"] == 0
+    assert omega.stats["n_walkers"] == 5
+
+
+def test_default_mcmm_composite_five_way_distribution_and_substats():
+    """DBT=0.4, cart/dih/concerted/omega=0.15 each across 4000 walkers —
+    each route gets ~its share, and .stats exposes all five in order."""
+    dbt = _stub_proposer("a")
+    cart = _stub_proposer("b")
+    dih = _stub_proposer("c")
+    cdih = _stub_proposer("d")
+    omega = _stub_proposer("e")
+    composite = make_default_mcmm_composite(
+        dbt,
+        cart_proposer=cart,
+        dihedral_proposer=dih,
+        concerted_dihedral_proposer=cdih,
+        omega_flip_proposer=omega,
+        cartesian_weight=0.15,
+        dihedral_weight=0.15,
+        concerted_dihedral_weight=0.15,
+        omega_flip_weight=0.15,
+        seed=321,
+    )
+    assert isinstance(composite.stats, list)
+    assert composite.stats == [
+        dbt.stats,
+        cart.stats,
+        dih.stats,
+        cdih.stats,
+        omega.stats,
+    ]
+    n_walkers = 4000
+    coords = [
+        torch.zeros(_TEST_N_ATOMS, 3, dtype=torch.float64) for _ in range(n_walkers)
+    ]
+    composite(coords)
+    counts = [p.stats["n_walkers"] for p in (dbt, cart, dih, cdih, omega)]
+    assert sum(counts) == n_walkers
+    assert 0.30 * n_walkers < counts[0] < 0.50 * n_walkers  # DBT residual 0.40
+    for c in counts[1:]:
+        assert 0.08 * n_walkers < c < 0.22 * n_walkers  # each 0.15
+
+
+# ---------------------------------------------------------------------------
+# make_omega_flip_proposer — v0.3 Move B (cis/trans ω isomerization)
+# ---------------------------------------------------------------------------
+
+# cyclo(Sar)4 — cyclic tetra-sarcosine (N-methylglycine). Every backbone N is
+# N-methylated, so all four amide bonds are ω-flip eligible; small enough to
+# embed quickly. 12-atom backbone ring (> the W=10 closure window).
+_CYCLOSAR4_SMILES = "O=C1N(C)CC(=O)N(C)CC(=O)N(C)CC(=O)N1C"
+
+
+def _cyclosar4_mol() -> Chem.Mol:
+    """Build the cyclo(Sar)4 test mol with explicit Hs (all-NMe backbone)."""
+    return Chem.AddHs(Chem.MolFromSmiles(_CYCLOSAR4_SMILES))
+
+
+def test_enumerate_nme_omega_windows_cremp_sharp_finds_three():
+    """cremp_sharp (S.S.N.MeW.MeA.MeN) has exactly 3 NMe residues → 3 ω
+    windows; each is a 10-atom window with the ω bond at the central
+    drive_idx, and that central bond joins a carbonyl C and an NMe N."""
+    mol = _cremp_sharp_mol()
+    windows = _enumerate_nme_omega_windows(mol)
+    assert len(windows) == 3
+    backbone = set(_ordered_macrocycle_atoms(mol))
+    for window, drive_idx in windows:
+        assert len(window) == 10
+        assert drive_idx == 3  # (10 - 3) // 2
+        # The ω bond sits at inner bond (drive_idx+1, drive_idx+2).
+        c_atom, n_atom = window[drive_idx + 1], window[drive_idx + 2]
+        pair = {
+            mol.GetAtomWithIdx(c_atom).GetSymbol(),
+            mol.GetAtomWithIdx(n_atom).GetSymbol(),
+        }
+        assert pair == {"C", "N"}
+        # the two bonded atoms are actually bonded and both on the ring
+        assert mol.GetBondBetweenAtoms(c_atom, n_atom) is not None
+        assert c_atom in backbone and n_atom in backbone
+
+
+def test_enumerate_nme_omega_windows_all_sarcosine_finds_four():
+    """cyclo(Sar)4 has four NMe amides → four ω windows."""
+    windows = _enumerate_nme_omega_windows(_cyclosar4_mol())
+    assert len(windows) == 4
+
+
+def test_make_omega_flip_proposer_rejects_no_nme_peptide():
+    """cyclo(Ala)4 has no N-methylated amide → factory raises."""
+    with pytest.raises(ValueError, match="no NMe"):
+        make_omega_flip_proposer(_cycloala_mol(4), hardware_opts=None, calc=None)
+
+
+def test_make_omega_flip_proposer_rejects_non_peptide():
+    """A bare ring with no amide backbone → factory raises."""
+    cyclohexane = Chem.AddHs(Chem.MolFromSmiles("C1CCCCC1"))
+    with pytest.raises(ValueError, match="no NMe"):
+        make_omega_flip_proposer(cyclohexane, hardware_opts=None, calc=None)
+
+
+def test_make_omega_flip_proposer_rejects_bad_backend():
+    with pytest.raises(ValueError, match="unknown mmff_backend"):
+        make_omega_flip_proposer(
+            _cyclosar4_mol(), hardware_opts=None, calc=None, mmff_backend="bogus"
+        )
+
+
+def _make_omega_proposer_with_mocks(mol, seed: int = 0):
+    """Build a real make_omega_flip_proposer with the GPU stages patched
+    (MMFF a no-op, MACE a sequential monotone mock). Returns (proposer,
+    patched_ctx)."""
+    from contextlib import contextmanager
+    from unittest.mock import patch as _patch
+
+    proposer = make_omega_flip_proposer(mol, hardware_opts=None, calc=None, seed=seed)
+    counter = [0]
+
+    def _mock_mace(_calc, ase_mols):
+        out = [(counter[0] + i) * 0.01 for i in range(len(ase_mols))]
+        counter[0] += len(ase_mols)
+        return out
+
+    @contextmanager
+    def patched():
+        with (
+            _patch("confsweeper._mace_batch_energies", side_effect=_mock_mace),
+            _patch(
+                "nvmolkit.mmffOptimization.MMFFOptimizeMoleculesConfs",
+                return_value=[[]],
+            ),
+        ):
+            yield
+
+    return proposer, patched
+
+
+def test_make_omega_flip_proposer_returns_proposal_per_walker():
+    """N input coords → N output 4-tuples (coords, energy, det_j, success),
+    each coords tensor matching the input shape."""
+    mol = _cyclosar4_mol()
+    proposer, patched = _make_omega_proposer_with_mocks(mol, seed=7)
+    seed_coords = _seed_full_mol_coords(mol)
+    for n in [1, 3, 8]:
+        coords_list = [seed_coords.clone() for _ in range(n)]
+        with patched():
+            proposals = proposer(coords_list)
+        assert len(proposals) == n
+        for prop in proposals:
+            assert len(prop) == 4
+            new_coords, energy, det_j, success = prop
+            assert isinstance(new_coords, torch.Tensor)
+            assert new_coords.shape == seed_coords.shape
+            assert isinstance(success, bool)
+
+
+def test_make_omega_flip_proposer_accepts_and_has_real_jacobian():
+    """At least one of several walkers closes its ω flip, and accepted
+    proposals carry a finite, non-negative Wu-Deem |det J| (not the
+    fixed 1.0 of the volume-preserving side-chain kicks)."""
+    mol = _cyclosar4_mol()
+    proposer, patched = _make_omega_proposer_with_mocks(mol, seed=1)
+    seed_coords = _seed_full_mol_coords(mol)
+    coords_list = [seed_coords.clone() for _ in range(8)]
+    with patched():
+        proposals = proposer(coords_list)
+    successes = [p for p in proposals if p[3]]
+    assert len(successes) >= 1  # W=10 closure succeeds on cyclo(Sar)4
+    for _, _, det_j, _ in successes:
+        assert np.isfinite(det_j)
+        assert det_j >= 0.0
+
+
+def test_make_omega_flip_proposer_does_not_mutate_inputs():
+    """The proposer must not modify the input coordinate tensors in place."""
+    mol = _cyclosar4_mol()
+    proposer, patched = _make_omega_proposer_with_mocks(mol, seed=3)
+    seed_coords = _seed_full_mol_coords(mol)
+    coords_list = [seed_coords.clone() for _ in range(4)]
+    snapshots = [c.clone() for c in coords_list]
+    with patched():
+        proposer(coords_list)
+    for before, after in zip(snapshots, coords_list):
+        assert torch.equal(before, after)
+
+
+# ---------------------------------------------------------------------------
+# make_mcmm_proposer window_size (v0.3 Move C — large-window DBT)
+# ---------------------------------------------------------------------------
+
+
+def test_make_mcmm_proposer_large_window_enumerates_on_big_ring():
+    """window_size=16 builds on cremp_sharp (18-atom ring); raises on a
+    ring smaller than the window (cyclo(Ala)4, 12-atom ring)."""
+    cs = _cremp_sharp_mol()
+    # builds without error on the 18-atom ring
+    make_mcmm_proposer(cs, hardware_opts=None, calc=None, window_size=16, seed=0)
+    small = _cycloala_mol(4)  # 12-atom ring < 16
+    with pytest.raises(ValueError, match="no enumerable 16-atom backbone windows"):
+        make_mcmm_proposer(small, hardware_opts=None, calc=None, window_size=16)
+
+
+# ---------------------------------------------------------------------------
+# make_default_mcmm_composite — 6-way extension (v0.3 Move C / issue #17)
+# ---------------------------------------------------------------------------
+
+
+def test_default_mcmm_composite_validation_negative_large_window_weight():
+    dbt = _stub_proposer("a")
+    with pytest.raises(ValueError, match="weights must be non-negative"):
+        make_default_mcmm_composite(dbt, large_window_dbt_weight=-0.1)
+
+
+def test_default_mcmm_composite_validation_6way_sum_exceeds_one():
+    dbt = _stub_proposer("a")
+    cart = _stub_proposer("b")
+    dih = _stub_proposer("c")
+    cdih = _stub_proposer("d")
+    omega = _stub_proposer("e")
+    lwin = _stub_proposer("f")
+    with pytest.raises(ValueError, match="DBT residual weight would be negative"):
+        make_default_mcmm_composite(
+            dbt,
+            cart_proposer=cart,
+            dihedral_proposer=dih,
+            concerted_dihedral_proposer=cdih,
+            omega_flip_proposer=omega,
+            large_window_dbt_proposer=lwin,
+            cartesian_weight=0.25,
+            dihedral_weight=0.25,
+            concerted_dihedral_weight=0.25,
+            omega_flip_weight=0.25,
+            large_window_dbt_weight=0.25,
+        )
+
+
+def test_default_mcmm_composite_validation_large_window_weight_without_proposer():
+    dbt = _stub_proposer("a")
+    with pytest.raises(ValueError, match="weight > 0 iff proposer not None"):
+        make_default_mcmm_composite(dbt, large_window_dbt_weight=0.3)
+
+
+def test_default_mcmm_composite_validation_large_window_proposer_without_weight():
+    dbt = _stub_proposer("a")
+    lwin = _stub_proposer("f")
+    with pytest.raises(ValueError, match="weight > 0 iff proposer not None"):
+        make_default_mcmm_composite(
+            dbt, large_window_dbt_proposer=lwin, large_window_dbt_weight=0.0
+        )
+
+
+def test_default_mcmm_composite_pure_large_window_short_circuits():
+    """large_window_dbt_weight=1.0 (DBT residual = 0) returns the
+    large-window proposer directly."""
+    dbt = _stub_proposer("a")
+    lwin = _stub_proposer("f")
+    out = make_default_mcmm_composite(
+        dbt, large_window_dbt_proposer=lwin, large_window_dbt_weight=1.0
+    )
+    assert out is lwin
+
+
+def test_default_mcmm_composite_six_way_distribution_and_substats():
+    """Full 6-way mix: each route gets ~its share and .stats exposes all six
+    sub-proposer stats in route order."""
+    dbt = _stub_proposer("a")
+    cart = _stub_proposer("b")
+    dih = _stub_proposer("c")
+    cdih = _stub_proposer("d")
+    omega = _stub_proposer("e")
+    lwin = _stub_proposer("f")
+    composite = make_default_mcmm_composite(
+        dbt,
+        cart_proposer=cart,
+        dihedral_proposer=dih,
+        concerted_dihedral_proposer=cdih,
+        omega_flip_proposer=omega,
+        large_window_dbt_proposer=lwin,
+        cartesian_weight=0.15,
+        dihedral_weight=0.15,
+        concerted_dihedral_weight=0.15,
+        omega_flip_weight=0.15,
+        large_window_dbt_weight=0.15,
+        seed=99,
+    )
+    assert composite.stats == [
+        dbt.stats,
+        cart.stats,
+        dih.stats,
+        cdih.stats,
+        omega.stats,
+        lwin.stats,
+    ]
+    n_walkers = 4000
+    coords = [
+        torch.zeros(_TEST_N_ATOMS, 3, dtype=torch.float64) for _ in range(n_walkers)
+    ]
+    composite(coords)
+    counts = [p.stats["n_walkers"] for p in (dbt, cart, dih, cdih, omega, lwin)]
+    assert sum(counts) == n_walkers
+    assert 0.15 * n_walkers < counts[0] < 0.35 * n_walkers  # DBT residual 0.25
+    for c in counts[1:]:
+        assert 0.08 * n_walkers < c < 0.22 * n_walkers  # each 0.15

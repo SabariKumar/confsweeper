@@ -90,19 +90,21 @@ def _ordered_macrocycle_atoms(mol: Chem.Mol) -> list:
     return list(largest)
 
 
-def enumerate_backbone_windows(mol: Chem.Mol) -> list:
+def enumerate_backbone_windows(mol: Chem.Mol, window_size: int = WINDOW_SIZE) -> list:
     """
-    Return every 7-atom backbone window in a cyclic macromolecule.
+    Return every `window_size`-atom backbone window in a cyclic macromolecule.
 
     Walks the macrocycle (largest ring per RDKit's ring perception) and
     emits one cyclic window per starting ring atom. For a K-atom ring
-    there are K windows.
+    there are K windows (when K >= window_size).
 
-    Each window is a tuple of 7 atom indices in the order they appear
-    around the ring. The window's atom layout matches what
-    `concerted_rotation.propose_move` expects: r0..r6 are 7 consecutive
-    ring atoms with bonds r0-r1, r1-r2, ..., r5-r6. The 4 inner
-    dihedrals (around bonds (1,2)..(4,5)) are what the move perturbs.
+    Each window is a tuple of `window_size` atom indices in the order they
+    appear around the ring. The window's atom layout matches what
+    `concerted_rotation.propose_move` expects: r0..r(W-1) are W consecutive
+    ring atoms with bonds r0-r1, ..., r(W-2)-r(W-1). The W-3 inner dihedrals
+    (around bonds (1,2)..(W-3,W-2)) are what the move perturbs. W=7 is the
+    default single-window DBT move; larger W (e.g. 16) is the v0.3 Move C
+    large-window backbone rearrangement.
 
     Switched in Step 8b from a SMARTS-based residue enumeration to
     direct RDKit ring perception, so it handles arbitrary cyclic
@@ -111,19 +113,22 @@ def enumerate_backbone_windows(mol: Chem.Mol) -> list:
     backbones the SMARTS pattern doesn't fit.
 
     Params:
-        mol: Chem.Mol : a cyclic molecule with a macrocycle of ≥ 7 ring
-            atoms; explicit Hs are optional. Side chains are ignored
+        mol: Chem.Mol : a cyclic molecule with a macrocycle of >= window_size
+            ring atoms; explicit Hs are optional. Side chains are ignored
             (only ring atoms participate in the windows).
+        window_size: int : number of consecutive ring atoms per window
+            (default 7 — the DBT move; >= 4 required for an inner dihedral).
     Returns:
-        list of 7-tuples of atom indices in cyclic ring order. Empty if
-        the molecule has no ring of ≥ 7 atoms.
+        list of `window_size`-tuples of atom indices in cyclic ring order.
+        Empty if the molecule's largest ring has fewer than `window_size`
+        atoms (e.g. a W=16 window requested on a 12-atom ring).
     """
     ring_atoms = _ordered_macrocycle_atoms(mol)
     n = len(ring_atoms)
-    if n < WINDOW_SIZE:
+    if n < window_size:
         return []
     return [
-        tuple(ring_atoms[(start + i) % n] for i in range(WINDOW_SIZE))
+        tuple(ring_atoms[(start + i) % n] for i in range(window_size))
         for start in range(n)
     ]
 

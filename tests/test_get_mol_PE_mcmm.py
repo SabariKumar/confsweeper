@@ -25,6 +25,11 @@ from confsweeper import (
 # has 12 backbone atoms and 30 atoms total with explicit Hs.
 TEST_SMILES = "C[C@@H]1NC(=O)[C@@H](C)NC(=O)[C@@H](C)NC(=O)[C@@H](C)NC1=O"
 
+# cyclo(Sar)4 — cyclic tetra-sarcosine; every backbone N is N-methylated, so it
+# HAS ω-flip windows (unlike cyclo(Ala)4 above). Used for the ω-flip tests that
+# need the proposer to be eligible.
+NME_TEST_SMILES = "O=C1N(C)CC(=O)N(C)CC(=O)N(C)CC(=O)N1C"
+
 
 def _mock_etkdg_embed(mols, params, confsPerMolecule, hardwareOptions):
     """CPU drop-in for nvmolkit ETKDG: embed `confsPerMolecule` conformers
@@ -1098,3 +1103,498 @@ def test_mcmm_skip_mmff_relax_unused_when_dihedral_weight_zero():
         "make_dihedral_kick_proposer was constructed despite "
         "dihedral_weight=0.0 — the zero-overhead short-circuit is broken"
     )
+
+
+# ---------------------------------------------------------------------------
+# concerted_dihedral_weight kwarg threading (v0.3 Move A / issue #17)
+# ---------------------------------------------------------------------------
+
+
+def test_mcmm_concerted_dihedral_weight_zero_skips_concerted_factory():
+    """Default `concerted_dihedral_weight=0.0` runs without the
+    concerted dihedral-kick proposer in the route — its factory must
+    not be constructed (no MMFF + MACE setup cost paid, no aromatic
+    side-chain enumeration)."""
+    concerted_factory_calls = {"n": 0}
+    dihedral_factory_calls = {"n": 0}
+
+    def _spy_concerted_factory(mol, **kwargs):
+        del mol, kwargs
+        concerted_factory_calls["n"] += 1
+        return _stub_proposer_factory(None, None, None)
+
+    def _spy_dihedral_factory(mol, **kwargs):
+        del mol, kwargs
+        dihedral_factory_calls["n"] += 1
+        return _stub_proposer_factory(None, None, None)
+
+    mock_mace = _make_seq_mock_mace()
+    with (
+        patch("confsweeper.embed.EmbedMolecules", side_effect=_mock_etkdg_embed),
+        patch("confsweeper._mace_batch_energies", side_effect=mock_mace),
+        patch(
+            "nvmolkit.mmffOptimization.MMFFOptimizeMoleculesConfs",
+            return_value=[[]],
+        ),
+        patch("confsweeper.make_mcmm_proposer", side_effect=_stub_proposer_factory),
+        patch(
+            "proposers.make_dihedral_kick_proposer",
+            side_effect=_spy_dihedral_factory,
+        ),
+        patch(
+            "proposers.make_concerted_dihedral_kick_proposer",
+            side_effect=_spy_concerted_factory,
+        ),
+    ):
+        get_mol_PE_mcmm(
+            TEST_SMILES,
+            get_embed_params(),
+            hardware_opts=None,
+            calc=MagicMock(),
+            n_walkers_per_temp=1,
+            n_temperatures=2,
+            n_steps=1,
+            rmsd_threshold=0.0,
+        )
+    assert concerted_factory_calls["n"] == 0
+    assert dihedral_factory_calls["n"] == 0
+
+
+def test_mcmm_concerted_dihedral_weight_positive_builds_4way_composite():
+    """`concerted_dihedral_weight=0.5` should construct DBT + concerted
+    factories (each once at setup). Other factories must NOT be called
+    when their weights are 0."""
+    dbt_factory_calls = {"n": 0}
+    cart_factory_calls = {"n": 0}
+    dihedral_factory_calls = {"n": 0}
+    concerted_factory_calls = {"n": 0}
+
+    def _spy_dbt_factory(mol, hardware_opts, calc, **kwargs):
+        del hardware_opts, calc, kwargs
+        dbt_factory_calls["n"] += 1
+        return _stub_proposer_factory(mol, None, None)
+
+    def _spy_cart_factory(mol, **kwargs):
+        del mol, kwargs
+        cart_factory_calls["n"] += 1
+        return _stub_proposer_factory(None, None, None)
+
+    def _spy_dihedral_factory(mol, **kwargs):
+        del mol, kwargs
+        dihedral_factory_calls["n"] += 1
+        return _stub_proposer_factory(None, None, None)
+
+    def _spy_concerted_factory(mol, **kwargs):
+        del mol, kwargs
+        concerted_factory_calls["n"] += 1
+        return _stub_proposer_factory(None, None, None)
+
+    mock_mace = _make_seq_mock_mace()
+    with (
+        patch("confsweeper.embed.EmbedMolecules", side_effect=_mock_etkdg_embed),
+        patch("confsweeper._mace_batch_energies", side_effect=mock_mace),
+        patch(
+            "nvmolkit.mmffOptimization.MMFFOptimizeMoleculesConfs",
+            return_value=[[]],
+        ),
+        patch("confsweeper.make_mcmm_proposer", side_effect=_spy_dbt_factory),
+        patch("proposers.make_cartesian_kick_proposer", side_effect=_spy_cart_factory),
+        patch(
+            "proposers.make_dihedral_kick_proposer",
+            side_effect=_spy_dihedral_factory,
+        ),
+        patch(
+            "proposers.make_concerted_dihedral_kick_proposer",
+            side_effect=_spy_concerted_factory,
+        ),
+    ):
+        get_mol_PE_mcmm(
+            TEST_SMILES,
+            get_embed_params(),
+            hardware_opts=None,
+            calc=MagicMock(),
+            n_walkers_per_temp=1,
+            n_temperatures=2,
+            n_steps=1,
+            concerted_dihedral_weight=0.5,
+            rmsd_threshold=0.0,
+        )
+    assert dbt_factory_calls["n"] == 1
+    assert concerted_factory_calls["n"] == 1
+    assert cart_factory_calls["n"] == 0
+    assert dihedral_factory_calls["n"] == 0
+
+
+def test_mcmm_concerted_dihedral_weight_negative_raises():
+    mock_mace = _make_seq_mock_mace()
+    with (
+        patch("confsweeper.embed.EmbedMolecules", side_effect=_mock_etkdg_embed),
+        patch("confsweeper._mace_batch_energies", side_effect=mock_mace),
+        patch("confsweeper.make_mcmm_proposer", side_effect=_stub_proposer_factory),
+    ):
+        with pytest.raises(ValueError, match="concerted_dihedral_weight must be >= 0"):
+            get_mol_PE_mcmm(
+                TEST_SMILES,
+                get_embed_params(),
+                hardware_opts=None,
+                calc=MagicMock(),
+                n_walkers_per_temp=1,
+                n_temperatures=2,
+                n_steps=1,
+                concerted_dihedral_weight=-0.1,
+            )
+
+
+def test_mcmm_4way_routing_builds_all_four_factories():
+    """`cartesian_weight=0.2 + dihedral_weight=0.2 +
+    concerted_dihedral_weight=0.2` exercises the full 4-way route. All
+    four factories must be constructed exactly once at setup."""
+    dbt_factory_calls = {"n": 0}
+    cart_factory_calls = {"n": 0}
+    dihedral_factory_calls = {"n": 0}
+    concerted_factory_calls = {"n": 0}
+
+    def _spy_dbt_factory(mol, hardware_opts, calc, **kwargs):
+        del hardware_opts, calc, kwargs
+        dbt_factory_calls["n"] += 1
+        return _stub_proposer_factory(mol, None, None)
+
+    def _spy_cart_factory(mol, **kwargs):
+        del mol, kwargs
+        cart_factory_calls["n"] += 1
+        return _stub_proposer_factory(None, None, None)
+
+    def _spy_dihedral_factory(mol, **kwargs):
+        del mol, kwargs
+        dihedral_factory_calls["n"] += 1
+        return _stub_proposer_factory(None, None, None)
+
+    def _spy_concerted_factory(mol, **kwargs):
+        del mol, kwargs
+        concerted_factory_calls["n"] += 1
+        return _stub_proposer_factory(None, None, None)
+
+    mock_mace = _make_seq_mock_mace()
+    with (
+        patch("confsweeper.embed.EmbedMolecules", side_effect=_mock_etkdg_embed),
+        patch("confsweeper._mace_batch_energies", side_effect=mock_mace),
+        patch(
+            "nvmolkit.mmffOptimization.MMFFOptimizeMoleculesConfs",
+            return_value=[[]],
+        ),
+        patch("confsweeper.make_mcmm_proposer", side_effect=_spy_dbt_factory),
+        patch("proposers.make_cartesian_kick_proposer", side_effect=_spy_cart_factory),
+        patch(
+            "proposers.make_dihedral_kick_proposer",
+            side_effect=_spy_dihedral_factory,
+        ),
+        patch(
+            "proposers.make_concerted_dihedral_kick_proposer",
+            side_effect=_spy_concerted_factory,
+        ),
+    ):
+        get_mol_PE_mcmm(
+            TEST_SMILES,
+            get_embed_params(),
+            hardware_opts=None,
+            calc=MagicMock(),
+            n_walkers_per_temp=1,
+            n_temperatures=2,
+            n_steps=1,
+            cartesian_weight=0.2,
+            dihedral_weight=0.2,
+            concerted_dihedral_weight=0.2,
+            rmsd_threshold=0.0,
+        )
+    assert dbt_factory_calls["n"] == 1
+    assert cart_factory_calls["n"] == 1
+    assert dihedral_factory_calls["n"] == 1
+    assert concerted_factory_calls["n"] == 1
+
+
+# ---------------------------------------------------------------------------
+# omega_flip_weight kwarg threading (v0.3 Move B / issue #17)
+# ---------------------------------------------------------------------------
+
+
+def test_mcmm_omega_flip_weight_zero_skips_omega_factory():
+    """Default `omega_flip_weight=0.0` runs without the ω-flip proposer in
+    the route — its factory must not be constructed (no MMFF + MACE setup
+    cost, no NMe-amide enumeration)."""
+    omega_factory_calls = {"n": 0}
+
+    def _spy_omega_factory(mol, **kwargs):
+        del mol, kwargs
+        omega_factory_calls["n"] += 1
+        return _stub_proposer_factory(None, None, None)
+
+    mock_mace = _make_seq_mock_mace()
+    with (
+        patch("confsweeper.embed.EmbedMolecules", side_effect=_mock_etkdg_embed),
+        patch("confsweeper._mace_batch_energies", side_effect=mock_mace),
+        patch(
+            "nvmolkit.mmffOptimization.MMFFOptimizeMoleculesConfs",
+            return_value=[[]],
+        ),
+        patch("confsweeper.make_mcmm_proposer", side_effect=_stub_proposer_factory),
+        patch("proposers.make_omega_flip_proposer", side_effect=_spy_omega_factory),
+    ):
+        get_mol_PE_mcmm(
+            TEST_SMILES,
+            get_embed_params(),
+            hardware_opts=None,
+            calc=MagicMock(),
+            n_walkers_per_temp=1,
+            n_temperatures=2,
+            n_steps=1,
+            rmsd_threshold=0.0,
+        )
+    assert omega_factory_calls["n"] == 0
+
+
+def test_mcmm_omega_flip_weight_positive_builds_composite():
+    """`omega_flip_weight=0.5` should construct DBT + ω-flip factories
+    (each once at setup); the other optional factories must NOT be called
+    when their weights are 0."""
+    dbt_factory_calls = {"n": 0}
+    cart_factory_calls = {"n": 0}
+    omega_factory_calls = {"n": 0}
+
+    def _spy_dbt_factory(mol, hardware_opts, calc, **kwargs):
+        del hardware_opts, calc, kwargs
+        dbt_factory_calls["n"] += 1
+        return _stub_proposer_factory(mol, None, None)
+
+    def _spy_cart_factory(mol, **kwargs):
+        del mol, kwargs
+        cart_factory_calls["n"] += 1
+        return _stub_proposer_factory(None, None, None)
+
+    def _spy_omega_factory(mol, **kwargs):
+        del mol, kwargs
+        omega_factory_calls["n"] += 1
+        return _stub_proposer_factory(None, None, None)
+
+    mock_mace = _make_seq_mock_mace()
+    with (
+        patch("confsweeper.embed.EmbedMolecules", side_effect=_mock_etkdg_embed),
+        patch("confsweeper._mace_batch_energies", side_effect=mock_mace),
+        patch(
+            "nvmolkit.mmffOptimization.MMFFOptimizeMoleculesConfs",
+            return_value=[[]],
+        ),
+        patch("confsweeper.make_mcmm_proposer", side_effect=_spy_dbt_factory),
+        patch("proposers.make_cartesian_kick_proposer", side_effect=_spy_cart_factory),
+        patch("proposers.make_omega_flip_proposer", side_effect=_spy_omega_factory),
+    ):
+        get_mol_PE_mcmm(
+            NME_TEST_SMILES,  # has NMe → ω-flip eligible
+            get_embed_params(),
+            hardware_opts=None,
+            calc=MagicMock(),
+            n_walkers_per_temp=1,
+            n_temperatures=2,
+            n_steps=1,
+            omega_flip_weight=0.5,
+            rmsd_threshold=0.0,
+        )
+    assert dbt_factory_calls["n"] == 1
+    assert omega_factory_calls["n"] == 1
+    assert cart_factory_calls["n"] == 0
+
+
+def test_mcmm_omega_flip_weight_no_nme_degrades_gracefully():
+    """omega_flip_weight>0 on a peptide with NO N-methylated amide must NOT
+    crash: the ω sub-proposer is dropped (its factory not called) and its
+    weight folds into DBT, so the run completes normally. Regression test
+    for the non-NMe crash found in the Step-8 Move B sweep."""
+    omega_factory_calls = {"n": 0}
+
+    def _spy_omega_factory(mol, **kwargs):
+        del mol, kwargs
+        omega_factory_calls["n"] += 1
+        return _stub_proposer_factory(None, None, None)
+
+    mock_mace = _make_seq_mock_mace()
+    with (
+        patch("confsweeper.embed.EmbedMolecules", side_effect=_mock_etkdg_embed),
+        patch("confsweeper._mace_batch_energies", side_effect=mock_mace),
+        patch(
+            "nvmolkit.mmffOptimization.MMFFOptimizeMoleculesConfs",
+            return_value=[[]],
+        ),
+        patch("confsweeper.make_mcmm_proposer", side_effect=_stub_proposer_factory),
+        patch("proposers.make_omega_flip_proposer", side_effect=_spy_omega_factory),
+    ):
+        # cyclo(Ala)4 (TEST_SMILES) has no NMe amide — must not raise.
+        mol, conf_ids, energies = get_mol_PE_mcmm(
+            TEST_SMILES,
+            get_embed_params(),
+            hardware_opts=None,
+            calc=MagicMock(),
+            n_walkers_per_temp=1,
+            n_temperatures=2,
+            n_steps=1,
+            omega_flip_weight=0.5,
+            rmsd_threshold=0.0,
+        )
+    # ω factory never constructed (no NMe windows); run still produced output.
+    assert omega_factory_calls["n"] == 0
+    assert len(conf_ids) == len(energies)
+
+
+def test_mcmm_omega_flip_weight_negative_raises():
+    mock_mace = _make_seq_mock_mace()
+    with (
+        patch("confsweeper.embed.EmbedMolecules", side_effect=_mock_etkdg_embed),
+        patch("confsweeper._mace_batch_energies", side_effect=mock_mace),
+        patch("confsweeper.make_mcmm_proposer", side_effect=_stub_proposer_factory),
+    ):
+        with pytest.raises(ValueError, match="omega_flip_weight must be >= 0"):
+            get_mol_PE_mcmm(
+                TEST_SMILES,
+                get_embed_params(),
+                hardware_opts=None,
+                calc=MagicMock(),
+                n_walkers_per_temp=1,
+                n_temperatures=2,
+                n_steps=1,
+                omega_flip_weight=-0.1,
+                rmsd_threshold=0.0,
+            )
+
+
+# ---------------------------------------------------------------------------
+# large_window_dbt_weight kwarg threading (v0.3 Move C / issue #17)
+# ---------------------------------------------------------------------------
+
+
+def _spy_window_sizes_factory(recorder):
+    """make_mcmm_proposer spy that records the window_size of each call
+    (default 7 for the W=7 DBT proposer; the large-window proposer passes
+    a larger window_size). Returns a stub proposer."""
+
+    def _spy(mol, **kwargs):
+        recorder.append(kwargs.get("window_size", 7))
+        return _stub_proposer_factory(mol, None, None)
+
+    return _spy
+
+
+def test_mcmm_large_window_weight_zero_skips_large_factory():
+    """Default large_window_dbt_weight=0.0 → only the W=7 DBT proposer is
+    built; no large-window (window_size>7) construction."""
+    window_sizes: list = []
+    mock_mace = _make_seq_mock_mace()
+    with (
+        patch("confsweeper.embed.EmbedMolecules", side_effect=_mock_etkdg_embed),
+        patch("confsweeper._mace_batch_energies", side_effect=mock_mace),
+        patch(
+            "nvmolkit.mmffOptimization.MMFFOptimizeMoleculesConfs",
+            return_value=[[]],
+        ),
+        patch(
+            "confsweeper.make_mcmm_proposer",
+            side_effect=_spy_window_sizes_factory(window_sizes),
+        ),
+    ):
+        get_mol_PE_mcmm(
+            TEST_SMILES,
+            get_embed_params(),
+            hardware_opts=None,
+            calc=MagicMock(),
+            n_walkers_per_temp=1,
+            n_temperatures=2,
+            n_steps=1,
+            rmsd_threshold=0.0,
+        )
+    assert window_sizes == [7]  # only the DBT proposer
+
+
+def test_mcmm_large_window_weight_positive_builds_large_proposer():
+    """large_window_dbt_weight>0 with a ring >= large_window_size builds a
+    second make_mcmm_proposer at the larger window_size."""
+    window_sizes: list = []
+    mock_mace = _make_seq_mock_mace()
+    with (
+        patch("confsweeper.embed.EmbedMolecules", side_effect=_mock_etkdg_embed),
+        patch("confsweeper._mace_batch_energies", side_effect=mock_mace),
+        patch(
+            "nvmolkit.mmffOptimization.MMFFOptimizeMoleculesConfs",
+            return_value=[[]],
+        ),
+        patch(
+            "confsweeper.make_mcmm_proposer",
+            side_effect=_spy_window_sizes_factory(window_sizes),
+        ),
+    ):
+        # TEST_SMILES is a 12-atom ring → use large_window_size=10 (<=12).
+        get_mol_PE_mcmm(
+            TEST_SMILES,
+            get_embed_params(),
+            hardware_opts=None,
+            calc=MagicMock(),
+            n_walkers_per_temp=1,
+            n_temperatures=2,
+            n_steps=1,
+            large_window_dbt_weight=0.5,
+            large_window_size=10,
+            rmsd_threshold=0.0,
+        )
+    assert 7 in window_sizes  # the W=7 DBT
+    assert 10 in window_sizes  # the large-window DBT
+
+
+def test_mcmm_large_window_weight_small_ring_degrades_gracefully():
+    """large_window_dbt_weight>0 but the ring is smaller than
+    large_window_size → drop the large-window proposer (no large call),
+    fold weight into DBT, run completes without raising."""
+    window_sizes: list = []
+    mock_mace = _make_seq_mock_mace()
+    with (
+        patch("confsweeper.embed.EmbedMolecules", side_effect=_mock_etkdg_embed),
+        patch("confsweeper._mace_batch_energies", side_effect=mock_mace),
+        patch(
+            "nvmolkit.mmffOptimization.MMFFOptimizeMoleculesConfs",
+            return_value=[[]],
+        ),
+        patch(
+            "confsweeper.make_mcmm_proposer",
+            side_effect=_spy_window_sizes_factory(window_sizes),
+        ),
+    ):
+        # TEST_SMILES 12-atom ring < default large_window_size=16 → degrade.
+        mol, conf_ids, energies = get_mol_PE_mcmm(
+            TEST_SMILES,
+            get_embed_params(),
+            hardware_opts=None,
+            calc=MagicMock(),
+            n_walkers_per_temp=1,
+            n_temperatures=2,
+            n_steps=1,
+            large_window_dbt_weight=0.5,
+            rmsd_threshold=0.0,
+        )
+    assert window_sizes == [7]  # large-window proposer never built
+    assert len(conf_ids) == len(energies)
+
+
+def test_mcmm_large_window_weight_negative_raises():
+    mock_mace = _make_seq_mock_mace()
+    with (
+        patch("confsweeper.embed.EmbedMolecules", side_effect=_mock_etkdg_embed),
+        patch("confsweeper._mace_batch_energies", side_effect=mock_mace),
+        patch("confsweeper.make_mcmm_proposer", side_effect=_stub_proposer_factory),
+    ):
+        with pytest.raises(ValueError, match="large_window_dbt_weight must be >= 0"):
+            get_mol_PE_mcmm(
+                TEST_SMILES,
+                get_embed_params(),
+                hardware_opts=None,
+                calc=MagicMock(),
+                n_walkers_per_temp=1,
+                n_temperatures=2,
+                n_steps=1,
+                large_window_dbt_weight=-0.1,
+                rmsd_threshold=0.0,
+            )
