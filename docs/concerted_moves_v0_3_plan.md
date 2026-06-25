@@ -411,6 +411,74 @@ ETKDG embeds) closes the gap. If a pool reaches conf0 → the fix is seeding, ~n
 new move code. If nothing reaches it → genuinely deep; Move D, biased moves, or
 direct CREMP-seeding then warranted.
 
+### Findings 2026-06-24 — seeding probes (conf0 is a narrow deep minimum; direct seeding fixes coverage)
+
+Coverage match threshold is `match_rmsd = 0.125 Å`.
+
+**Probe A — de-novo reachability (exhaustive ETKDG, n_seeds=10000).** Nearest
+basin to conf0 = **0.36 Å** (finds the broad fold) but at **+453 meV** above
+conf0, i.e. it settles in a neighbouring *shallower* sub-minimum, not conf0's
+deep one — and 0.36 Å > the 0.125 Å match threshold, so even exhaustive ETKDG
+does NOT cover conf0 de novo. MCMM (Move C) reaches only **2.33 Å** → MCMM has a
+clear seeding deficiency *relative to exhaustive ETKDG*, but conf0's exact deep
+minimum is not discoverable de novo by *either* pipeline (random embed + MMFF
+falls into the wider neighbour, not conf0's narrow basin).
+
+**Probe B — direct conf0 seeding.** Seeding MCMM's initial pool from conf0: the
+walk collapses to that single deep minimum (1 basin, 0.000 Å from ceiling conf0,
+−66778.77 eV) and **`cov_bw_ceil` jumps 0.000 → 0.724**. Confirmed: direct
+CREMP-seeding closes the gap (conf0 is stable once you start there — consistent
+with the 0.02 Å MMFF-relax diagnostic).
+
+**Probe C — MCMM seeded from the exhaustive-ETKDG pool.** Partial help, not a
+close. The walk *descends* from the seed (e_min −66778.55 → −66778.76, within
+70 meV of conf0; nearest 0.608 Å) but does not land in conf0's narrow deep basin
+within the 0.125 Å threshold → **`cov_bw_ceil` = 0.057** (was 0.000). The
+exhaustive seed quality is bursty (this run: 1 basin / −66778.55; earlier run:
+6 basins / −66778.38), which confounds it somewhat, but even the better seed is
+0.36 Å / +453 meV from conf0, so exhaustive→MCMM is unlikely to reliably cover.
+
+**Synthesis (all three probes):**
+
+| approach | reaches conf0 | cov_bw_ceil |
+|---|---|---|
+| de-novo (exhaustive ETKDG or MCMM) | no (0.36–2.33 Å, +453 meV) | 0.000 |
+| exhaustive → MCMM (self-contained) | partial (0.608 Å, +70 meV) | 0.057 |
+| direct CREMP seeding | yes (0.000 Å) | 0.724 |
+
+**Root-cause hypothesis: the MMFF inner-loop relaxer, not the move set.** conf0
+and its +453 meV neighbour are *both* valid MMFF minima 0.36 Å apart; random init
++ MMFF falls into the wider-basin neighbour even though MACE strongly prefers
+conf0 (−453 meV). So no move type (A/B/C/D) or self-seeding fully closes the gap
+— the limitation is how we *relax*, not how we *sample*. This connects to the
+Step-16 finding that GFN2-xTB geometries sit closer to MACE's minima than
+MMFF-relaxed ones. Candidate fixes (decision pending, NOT yet chosen): (i)
+MACE-relaxation (or constrained/tighter MMFF) in the inner loop so the walk
+relaxes into MACE's deep basins; (ii) accept + document the limitation (the
+dominant basin is below the pipeline's de-novo resolution and the 0.125 Å metric
+is stringent); (iii) direct reference-seeding only where a CREMP ensemble exists.
+Move D is NOT indicated — the wall is move-independent.
+
+### Findings 2026-06-24 — CREMP sharp-basin prevalence (scoping)
+
+How common is the cremp_sharp regime (one dominant basin)? Using `poplowestpct`
+(CREST Boltzmann population of the lowest conformer) across all 36,198 CREMP
+peptides — cremp_sharp = 53.5%, the ~90th percentile:
+
+| poplowestpct ≥ | peptides | % |
+|---|---|---|
+| 25% (median) | 18,399 | 50.8 |
+| 40% | 8,514 | 23.5 |
+| 53.5% (cremp_sharp) | 3,888 | 10.7 |
+| 70% | 1,336 | 3.7 |
+| 90% | 149 | 0.4 |
+
+~11% of CREMP is as sharp or sharper than cremp_sharp; enriched in NMe-containing
+(11.9% vs 9.7%) and larger rings (6-mer 15.3% vs 4-mer 9.3%). Caveat: high
+poplowestpct is the *stakes* proxy (dominant basin → missing it ≈ zero coverage),
+an **upper bound** on the MMFF-hard pathology — but the "one deep dominant basin"
+regime is common enough (~1 in 9) that the relaxer issue is worth fixing.
+
 ---
 
 ## Move D — Backbone + side-chain coupled hybrid (conditional)
