@@ -1118,6 +1118,8 @@ def get_mol_PE_mcmm(
     dihedral_weight: float = 0.0,
     concerted_dihedral_weight: float = 0.0,
     omega_flip_weight: float = 0.0,
+    large_window_dbt_weight: float = 0.0,
+    large_window_size: int = 16,
     sigma_chi_rad: float = 0.5,
     p_rotamer_jump: float = 0.3,
     rotamer_wells_deg: tuple = (-60.0, 60.0, 180.0),
@@ -1262,6 +1264,17 @@ def get_mol_PE_mcmm(
             Requires `mol` to have at least one N-methylated backbone
             amide; raises at factory time otherwise. Reuses `closure_tol`
             and `skip_mmff_relax`.
+        large_window_dbt_weight: float : routing weight for the v0.3
+            large-window DBT proposer (Move C) relative to DBT. Default
+            0.0 = not in the route. The same concerted backbone rotation
+            as DBT but over a `large_window_size`-atom window for a bigger
+            rearrangement. DBT residual weight subtracts this too. Issue
+            #17 / v0.3 Move C. Degrades gracefully (weight folds into DBT)
+            on rings smaller than `large_window_size`. Reuses
+            `drive_sigma_rad` and `closure_tol`.
+        large_window_size: int : backbone window size (ring atoms) for
+            the large-window DBT move (default 16 ≈ 5 residues). Only
+            consulted when `large_window_dbt_weight > 0`.
         sigma_concerted_chi_rad: float : Gaussian σ for the concerted
             dihedral-kick's joint refinement step in radians (default
             0.5 ≈ 28°). Each of Δχ₁ and Δχ₂ is sampled independently
@@ -1436,6 +1449,10 @@ def get_mol_PE_mcmm(
         )
     if omega_flip_weight < 0:
         raise ValueError(f"omega_flip_weight must be >= 0, got {omega_flip_weight}")
+    if large_window_dbt_weight < 0:
+        raise ValueError(
+            f"large_window_dbt_weight must be >= 0, got {large_window_dbt_weight}"
+        )
     dbt_proposer = make_mcmm_proposer(
         mol,
         hardware_opts=hardware_opts,
@@ -1446,7 +1463,9 @@ def get_mol_PE_mcmm(
         mmff_backend=mmff_backend,
         seed=seed + 7_777_777,
     )
+    from mcmm import enumerate_backbone_windows
     from proposers import (
+        _enumerate_nme_omega_windows,
         make_cartesian_kick_proposer,
         make_concerted_dihedral_kick_proposer,
         make_default_mcmm_composite,
@@ -1500,28 +1519,73 @@ def get_mol_PE_mcmm(
             mmff_backend=mmff_backend,
             seed=seed + 4_444_444,
         )
+    # ω-flip is only defined for peptides with an N-methylated backbone amide.
+    # Degrade gracefully on non-NMe mols: drop the ω sub-proposer and let its
+    # weight flow to the DBT residual, rather than crashing the whole run (a
+    # single global omega_flip_weight must be safe across a mixed dataset).
     omega_flip_proposer = None
+    effective_omega_flip_weight = omega_flip_weight
     if omega_flip_weight > 0.0:
-        omega_flip_proposer = make_omega_flip_proposer(
-            mol,
-            hardware_opts=hardware_opts,
-            calc=calc,
-            closure_tol=closure_tol,
-            skip_mmff_relax=skip_mmff_relax,
-            score_chunk_size=score_chunk_size,
-            mmff_backend=mmff_backend,
-            seed=seed + 3_333_333,
-        )
+        if _enumerate_nme_omega_windows(mol):
+            omega_flip_proposer = make_omega_flip_proposer(
+                mol,
+                hardware_opts=hardware_opts,
+                calc=calc,
+                closure_tol=closure_tol,
+                skip_mmff_relax=skip_mmff_relax,
+                score_chunk_size=score_chunk_size,
+                mmff_backend=mmff_backend,
+                seed=seed + 3_333_333,
+            )
+        else:
+            logger.warning(
+                "omega_flip_weight=%.3f requested but %r has no NMe ω-flip "
+                "windows; dropping the ω move and folding its weight into DBT",
+                omega_flip_weight,
+                smi,
+            )
+            effective_omega_flip_weight = 0.0
+    # Large-window DBT (Move C) only applies when the macrocycle ring is at
+    # least `large_window_size` atoms. Degrade gracefully on smaller rings:
+    # drop the large-window sub-proposer and fold its weight into the W=7 DBT
+    # residual (same contract as the ω-flip non-NMe guard above).
+    large_window_dbt_proposer = None
+    effective_large_window_dbt_weight = large_window_dbt_weight
+    if large_window_dbt_weight > 0.0:
+        if enumerate_backbone_windows(mol, window_size=large_window_size):
+            large_window_dbt_proposer = make_mcmm_proposer(
+                mol,
+                hardware_opts=hardware_opts,
+                calc=calc,
+                drive_sigma_rad=drive_sigma_rad,
+                closure_tol=closure_tol,
+                score_chunk_size=score_chunk_size,
+                mmff_backend=mmff_backend,
+                window_size=large_window_size,
+                seed=seed + 2_222_222,
+            )
+        else:
+            logger.warning(
+                "large_window_dbt_weight=%.3f requested but %r has no "
+                "%d-atom backbone windows (ring too small); dropping the "
+                "large-window move and folding its weight into DBT",
+                large_window_dbt_weight,
+                smi,
+                large_window_size,
+            )
+            effective_large_window_dbt_weight = 0.0
     batch_propose_fn = make_default_mcmm_composite(
         dbt_proposer,
         cart_proposer=cart_proposer,
         dihedral_proposer=dihedral_proposer,
         concerted_dihedral_proposer=concerted_dihedral_proposer,
         omega_flip_proposer=omega_flip_proposer,
+        large_window_dbt_proposer=large_window_dbt_proposer,
         cartesian_weight=cartesian_weight,
         dihedral_weight=dihedral_weight,
         concerted_dihedral_weight=concerted_dihedral_weight,
-        omega_flip_weight=omega_flip_weight,
+        omega_flip_weight=effective_omega_flip_weight,
+        large_window_dbt_weight=effective_large_window_dbt_weight,
         seed=seed + 6_666_666,
     )
 

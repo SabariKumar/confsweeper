@@ -1751,7 +1751,7 @@ def test_make_mcmm_proposer_rejects_for_non_cyclic_input():
     backbone windows (caught at build time, before any moves are
     proposed)."""
     cyclohexane = Chem.AddHs(Chem.MolFromSmiles("C1CCCCC1"))
-    with pytest.raises(ValueError, match="no enumerable backbone windows"):
+    with pytest.raises(ValueError, match="no enumerable .* backbone windows"):
         make_mcmm_proposer(cyclohexane, hardware_opts=None, calc=None, seed=0)
 
 
@@ -3674,3 +3674,122 @@ def test_make_omega_flip_proposer_does_not_mutate_inputs():
         proposer(coords_list)
     for before, after in zip(snapshots, coords_list):
         assert torch.equal(before, after)
+
+
+# ---------------------------------------------------------------------------
+# make_mcmm_proposer window_size (v0.3 Move C — large-window DBT)
+# ---------------------------------------------------------------------------
+
+
+def test_make_mcmm_proposer_large_window_enumerates_on_big_ring():
+    """window_size=16 builds on cremp_sharp (18-atom ring); raises on a
+    ring smaller than the window (cyclo(Ala)4, 12-atom ring)."""
+    cs = _cremp_sharp_mol()
+    # builds without error on the 18-atom ring
+    make_mcmm_proposer(cs, hardware_opts=None, calc=None, window_size=16, seed=0)
+    small = _cycloala_mol(4)  # 12-atom ring < 16
+    with pytest.raises(ValueError, match="no enumerable 16-atom backbone windows"):
+        make_mcmm_proposer(small, hardware_opts=None, calc=None, window_size=16)
+
+
+# ---------------------------------------------------------------------------
+# make_default_mcmm_composite — 6-way extension (v0.3 Move C / issue #17)
+# ---------------------------------------------------------------------------
+
+
+def test_default_mcmm_composite_validation_negative_large_window_weight():
+    dbt = _stub_proposer("a")
+    with pytest.raises(ValueError, match="weights must be non-negative"):
+        make_default_mcmm_composite(dbt, large_window_dbt_weight=-0.1)
+
+
+def test_default_mcmm_composite_validation_6way_sum_exceeds_one():
+    dbt = _stub_proposer("a")
+    cart = _stub_proposer("b")
+    dih = _stub_proposer("c")
+    cdih = _stub_proposer("d")
+    omega = _stub_proposer("e")
+    lwin = _stub_proposer("f")
+    with pytest.raises(ValueError, match="DBT residual weight would be negative"):
+        make_default_mcmm_composite(
+            dbt,
+            cart_proposer=cart,
+            dihedral_proposer=dih,
+            concerted_dihedral_proposer=cdih,
+            omega_flip_proposer=omega,
+            large_window_dbt_proposer=lwin,
+            cartesian_weight=0.25,
+            dihedral_weight=0.25,
+            concerted_dihedral_weight=0.25,
+            omega_flip_weight=0.25,
+            large_window_dbt_weight=0.25,
+        )
+
+
+def test_default_mcmm_composite_validation_large_window_weight_without_proposer():
+    dbt = _stub_proposer("a")
+    with pytest.raises(ValueError, match="weight > 0 iff proposer not None"):
+        make_default_mcmm_composite(dbt, large_window_dbt_weight=0.3)
+
+
+def test_default_mcmm_composite_validation_large_window_proposer_without_weight():
+    dbt = _stub_proposer("a")
+    lwin = _stub_proposer("f")
+    with pytest.raises(ValueError, match="weight > 0 iff proposer not None"):
+        make_default_mcmm_composite(
+            dbt, large_window_dbt_proposer=lwin, large_window_dbt_weight=0.0
+        )
+
+
+def test_default_mcmm_composite_pure_large_window_short_circuits():
+    """large_window_dbt_weight=1.0 (DBT residual = 0) returns the
+    large-window proposer directly."""
+    dbt = _stub_proposer("a")
+    lwin = _stub_proposer("f")
+    out = make_default_mcmm_composite(
+        dbt, large_window_dbt_proposer=lwin, large_window_dbt_weight=1.0
+    )
+    assert out is lwin
+
+
+def test_default_mcmm_composite_six_way_distribution_and_substats():
+    """Full 6-way mix: each route gets ~its share and .stats exposes all six
+    sub-proposer stats in route order."""
+    dbt = _stub_proposer("a")
+    cart = _stub_proposer("b")
+    dih = _stub_proposer("c")
+    cdih = _stub_proposer("d")
+    omega = _stub_proposer("e")
+    lwin = _stub_proposer("f")
+    composite = make_default_mcmm_composite(
+        dbt,
+        cart_proposer=cart,
+        dihedral_proposer=dih,
+        concerted_dihedral_proposer=cdih,
+        omega_flip_proposer=omega,
+        large_window_dbt_proposer=lwin,
+        cartesian_weight=0.15,
+        dihedral_weight=0.15,
+        concerted_dihedral_weight=0.15,
+        omega_flip_weight=0.15,
+        large_window_dbt_weight=0.15,
+        seed=99,
+    )
+    assert composite.stats == [
+        dbt.stats,
+        cart.stats,
+        dih.stats,
+        cdih.stats,
+        omega.stats,
+        lwin.stats,
+    ]
+    n_walkers = 4000
+    coords = [
+        torch.zeros(_TEST_N_ATOMS, 3, dtype=torch.float64) for _ in range(n_walkers)
+    ]
+    composite(coords)
+    counts = [p.stats["n_walkers"] for p in (dbt, cart, dih, cdih, omega, lwin)]
+    assert sum(counts) == n_walkers
+    assert 0.15 * n_walkers < counts[0] < 0.35 * n_walkers  # DBT residual 0.25
+    for c in counts[1:]:
+        assert 0.08 * n_walkers < c < 0.22 * n_walkers  # each 0.15

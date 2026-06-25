@@ -720,3 +720,33 @@ def test_propose_omega_flip_w7_moderate_flip_fails_to_close():
         )
         n_fail += not result.success
     assert n_fail == 6  # W=7 never closes a 30° flip at the tight tolerance
+
+
+def test_propose_move_large_window_trf_closes():
+    """Move C: propose_move on a larger window (W=13) with a small drive and
+    the 'trf' solver closes tightly (under-determined: 9 free dihedrals vs 6
+    constraints) and lands the drive dihedral at original+delta."""
+    n_success = 0
+    for seed in range(5):
+        pos = _twisted_chain_w(13, seed=seed)
+        drive_idx = 4  # a central inner dihedral
+        delta = 0.2
+        result = propose_move(
+            pos,
+            drive_idx,
+            delta,
+            solver_method="trf",
+        )
+        if not result.success:
+            continue
+        n_success += 1
+        # last two atoms held fixed (closure)
+        disp = np.concatenate(
+            [result.new_positions[11] - pos[11], result.new_positions[12] - pos[12]]
+        )
+        assert np.linalg.norm(disp) <= DEFAULT_CLOSURE_TOL + 1e-9
+        # drive dihedral changed by exactly delta
+        assert abs(result.deltas[drive_idx] - delta) < 1e-9
+        # deltas vector has W-3 = 10 entries
+        assert result.deltas.shape == (10,)
+    assert n_success >= 4

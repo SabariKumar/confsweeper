@@ -384,6 +384,7 @@ def make_mcmm_proposer(
     closure_tol: float = 0.01,
     score_chunk_size: int = 500,
     mmff_backend: str = "gpu",
+    window_size: int = 7,
     seed: int = 0,
 ):
     """
@@ -445,6 +446,12 @@ def make_mcmm_proposer(
             (default 500, matches `_minimize_score_filter_dedup`).
         mmff_backend: str : 'gpu' (nvmolkit batched CUDA, default) or
             'cpu' (RDKit serial). MMFF runs on the throwaway mol.
+        window_size: int : number of consecutive backbone ring atoms per
+            move window (default 7 — the local DBT move). Larger sizes
+            (e.g. 16) drive the same one-dihedral concerted rotation over
+            a bigger window for a larger backbone rearrangement (v0.3
+            Move C). For window_size > 7 the closure is exactly/under-
+            determined, so the `trf` solver is used (vs `lm` at W=7).
         seed: int : base seed for the move-RNG; deterministic across
             replicate runs.
     Returns:
@@ -452,25 +459,28 @@ def make_mcmm_proposer(
             the contract expected by `ParallelMCMMDriver` and
             `ReplicaExchangeMCMMDriver`.
     Raises:
-        ValueError: if `mol` has no enumerable backbone windows (input
-            is not a cyclic peptide of ≥ 3 residues).
+        ValueError: if `mol` has no enumerable backbone windows of
+            `window_size` atoms (input is not a cyclic peptide, or its
+            macrocycle ring is smaller than `window_size`).
     """
-    from concerted_rotation import (
-        N_DIHEDRALS,
-        apply_dihedral_changes_full_mol,
-        propose_move,
-    )
+    from concerted_rotation import apply_dihedral_changes_full_mol, propose_move
 
     if mmff_backend not in ("gpu", "cpu"):
         raise ValueError(
             f"unknown mmff_backend {mmff_backend!r}; expected 'gpu' or 'cpu'"
         )
 
-    windows = enumerate_backbone_windows(mol)
+    # W=7 closure is over-determined (3 free dihedrals, 6 constraints → 'lm');
+    # larger windows are exactly/under-determined → 'trf' (which 'lm' rejects).
+    n_inner_dihedrals = window_size - 3
+    solver_method = "lm" if window_size <= 7 else "trf"
+
+    windows = enumerate_backbone_windows(mol, window_size=window_size)
     if not windows:
         raise ValueError(
-            "mol has no enumerable backbone windows; "
-            "check that it is a head-to-tail cyclic peptide of at least 3 residues"
+            f"mol has no enumerable {window_size}-atom backbone windows; "
+            f"check that it is a head-to-tail cyclic peptide whose macrocycle "
+            f"ring has at least {window_size} atoms"
         )
     backbone_atoms = _backbone_atom_set(mol)
     window_downstream_sets = [
@@ -515,13 +525,17 @@ def make_mcmm_proposer(
         for w_idx, coords in enumerate(coords_list):
             window_idx = int(rng.integers(n_windows))
             window = windows[window_idx]
-            drive_idx = int(rng.integers(N_DIHEDRALS))
+            drive_idx = int(rng.integers(n_inner_dihedrals))
             drive_delta = float(rng.normal(0.0, drive_sigma_rad))
 
             coords_np = coords.detach().cpu().numpy().astype(np.float64)
             window_pos = coords_np[list(window)]
             result = propose_move(
-                window_pos, drive_idx, drive_delta, closure_tol=closure_tol
+                window_pos,
+                drive_idx,
+                drive_delta,
+                closure_tol=closure_tol,
+                solver_method=solver_method,
             )
             if not result.success:
                 continue
@@ -1787,11 +1801,13 @@ def make_default_mcmm_composite(
     dihedral_proposer=None,
     concerted_dihedral_proposer=None,
     omega_flip_proposer=None,
+    large_window_dbt_proposer=None,
     *,
     cartesian_weight: float = 0.0,
     dihedral_weight: float = 0.0,
     concerted_dihedral_weight: float = 0.0,
     omega_flip_weight: float = 0.0,
+    large_window_dbt_weight: float = 0.0,
     seed: int = 0,
 ):
     """
@@ -1806,10 +1822,11 @@ def make_default_mcmm_composite(
     issue-#10 routing relied on).
 
     v0.3 (issue #17) added the 4th sub-proposer
-    (`make_concerted_dihedral_kick_proposer`, Move A) and the 5th
+    (`make_concerted_dihedral_kick_proposer`, Move A), the 5th
     (`make_omega_flip_proposer`, Move B — cis/trans ω isomerization on NMe
-    amides); the contract generalises naturally from the issue-#15 3-way
-    helper.
+    amides), and the 6th (large-window DBT, Move C — `make_mcmm_proposer`
+    at a larger `window_size`); the contract generalises naturally from
+    the issue-#15 3-way helper.
 
     The caller is responsible for NOT building a sub-proposer whose
     weight is zero; the helper enforces this so e.g. an
@@ -1833,6 +1850,11 @@ def make_default_mcmm_composite(
         omega_flip_proposer: callable | None : ω-flip
             (`make_omega_flip_proposer`) batch propose function. Must be
             None iff `omega_flip_weight == 0.0`. v0.3 Move B.
+        large_window_dbt_proposer: callable | None : large-window DBT
+            (`make_mcmm_proposer(..., window_size=large)`) batch propose
+            function. Must be None iff `large_window_dbt_weight == 0.0`.
+            v0.3 Move C — the same concerted backbone rotation as DBT but
+            over a larger window for a bigger rearrangement.
         cartesian_weight: float : routing weight for the Cartesian kick,
             in [0, 1]. Default 0.0.
         dihedral_weight: float : routing weight for the single-bond
@@ -1841,6 +1863,8 @@ def make_default_mcmm_composite(
             concerted (χ₁, χ₂) dihedral kick, in [0, 1]. Default 0.0.
         omega_flip_weight: float : routing weight for the ω-flip move,
             in [0, 1]. Default 0.0.
+        large_window_dbt_weight: float : routing weight for the
+            large-window DBT move, in [0, 1]. Default 0.0.
         seed: int : routing RNG seed; threaded into `make_composite_proposer`
             when a composite is needed.
     Returns:
@@ -1859,24 +1883,27 @@ def make_default_mcmm_composite(
         or dihedral_weight < 0.0
         or concerted_dihedral_weight < 0.0
         or omega_flip_weight < 0.0
+        or large_window_dbt_weight < 0.0
     ):
         raise ValueError(
             f"weights must be non-negative, got cartesian_weight={cartesian_weight}, "
             f"dihedral_weight={dihedral_weight}, "
             f"concerted_dihedral_weight={concerted_dihedral_weight}, "
-            f"omega_flip_weight={omega_flip_weight}"
+            f"omega_flip_weight={omega_flip_weight}, "
+            f"large_window_dbt_weight={large_window_dbt_weight}"
         )
     total_non_dbt = (
         cartesian_weight
         + dihedral_weight
         + concerted_dihedral_weight
         + omega_flip_weight
+        + large_window_dbt_weight
     )
     if total_non_dbt > 1.0 + 1e-12:
         raise ValueError(
             f"cartesian_weight + dihedral_weight + concerted_dihedral_weight "
-            f"+ omega_flip_weight = {total_non_dbt} > 1.0; DBT residual weight "
-            f"would be negative"
+            f"+ omega_flip_weight + large_window_dbt_weight = {total_non_dbt} > 1.0; "
+            f"DBT residual weight would be negative"
         )
     if (cartesian_weight > 0.0) != (cart_proposer is not None):
         raise ValueError(
@@ -1903,6 +1930,13 @@ def make_default_mcmm_composite(
             f"{'None' if omega_flip_proposer is None else 'not None'}; "
             "weight > 0 iff proposer not None"
         )
+    if (large_window_dbt_weight > 0.0) != (large_window_dbt_proposer is not None):
+        raise ValueError(
+            f"large_window_dbt_weight={large_window_dbt_weight} but "
+            f"large_window_dbt_proposer is "
+            f"{'None' if large_window_dbt_proposer is None else 'not None'}; "
+            "weight > 0 iff proposer not None"
+        )
 
     dbt_weight = 1.0 - total_non_dbt
 
@@ -1917,6 +1951,8 @@ def make_default_mcmm_composite(
         active.append((concerted_dihedral_weight, concerted_dihedral_proposer))
     if omega_flip_proposer is not None:
         active.append((omega_flip_weight, omega_flip_proposer))
+    if large_window_dbt_proposer is not None:
+        active.append((large_window_dbt_weight, large_window_dbt_proposer))
 
     if len(active) == 1:
         return active[0][1]

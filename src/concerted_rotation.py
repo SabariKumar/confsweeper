@@ -368,16 +368,21 @@ def propose_move(
     drive_delta: float,
     closure_tol: float = DEFAULT_CLOSURE_TOL,
     max_solver_iter: int = 50,
+    solver_method: str = "lm",
 ) -> MoveProposal:
     """
     Propose a concerted-rotation move with the given drive perturbation.
 
+    Window size W is inferred from `positions` (W=7 is the DBT move; larger
+    W, e.g. 16, is the v0.3 Move C large-window backbone rearrangement).
+
     Pipeline:
-      1. Solve numerically for the 3 non-drive dihedrals that minimise
-         the displacement of atoms r5 and r6 from their original
-         positions. The system has 6 residuals (3 components each for
-         r5 and r6) and 3 unknowns; least_squares handles the
-         over-constraint gracefully.
+      1. Solve numerically for the W-4 non-drive dihedrals that minimise
+         the displacement of the last two window atoms from their original
+         positions. The system has 6 residuals (3 components each for the
+         two fixed atoms) and W-4 unknowns: over-determined for W=7 (3
+         free, use `solver_method='lm'`), exactly/under-determined for
+         W>=10 (use `solver_method='trf'`, which `lm` rejects).
       2. Check closure: if the residual norm exceeds closure_tol, the
          move is geometrically infeasible. Return a MoveProposal with
          `success=False` so the caller can reject without paying for
@@ -386,24 +391,30 @@ def propose_move(
          balance correction).
 
     Params:
-        positions: np.ndarray (7, 3) : starting atom positions
-        drive_idx: int : index of drive dihedral in [0, 3]
+        positions: np.ndarray (W, 3) : starting atom positions, W >= 4
+        drive_idx: int : index of drive dihedral in [0, W-4]
         drive_delta: float : drive perturbation in radians
         closure_tol: float : maximum acceptable residual norm in Å
         max_solver_iter: int : least_squares iteration cap
+        solver_method: str : least_squares method — 'lm' (default; the
+            over-determined W=7 DBT case) or 'trf' (the exactly/under-
+            determined W>=10 large-window case, which 'lm' rejects).
     Returns:
         MoveProposal : NamedTuple with fields (new_positions,
             det_jacobian, deltas, success). Tuple-unpackable as a
-            4-tuple. The `deltas` field is the (4,) array of dihedral
+            4-tuple. The `deltas` field is the (W-3,) array of dihedral
             changes applied — drive_delta at drive_idx, closure-solver
-            outputs at the other three positions. All zeros on failure.
+            outputs at the other positions. All zeros on failure.
     """
-    if not (0 <= drive_idx < N_DIHEDRALS):
+    window_size = positions.shape[0]
+    n_dih = window_size - 3
+    if not (0 <= drive_idx < n_dih):
         raise ValueError(
-            f"drive_idx must be in [0, {N_DIHEDRALS - 1}], got {drive_idx}"
+            f"drive_idx must be in [0, {n_dih - 1}] for a {window_size}-atom "
+            f"window, got {drive_idx}"
         )
 
-    initial_guess = np.zeros(3)
+    initial_guess = np.zeros(n_dih - 1)
 
     def _residual(free_deltas):
         return closure_residual(positions, drive_idx, drive_delta, free_deltas)
@@ -411,7 +422,7 @@ def propose_move(
     result = least_squares(
         _residual,
         initial_guess,
-        method="lm",
+        method=solver_method,
         max_nfev=max_solver_iter,
     )
 
@@ -420,14 +431,19 @@ def propose_move(
         return MoveProposal(
             new_positions=positions.copy(),
             det_jacobian=0.0,
-            deltas=np.zeros(N_DIHEDRALS),
+            deltas=np.zeros(n_dih),
             success=False,
         )
 
     deltas = _expand_deltas(drive_idx, drive_delta, result.x)
     new_positions = apply_dihedral_changes(positions, deltas)
     det_j = _finite_difference_det_jacobian(
-        positions, drive_idx, drive_delta, result.x, closure_tol
+        positions,
+        drive_idx,
+        drive_delta,
+        result.x,
+        closure_tol,
+        solver_method=solver_method,
     )
 
     return MoveProposal(

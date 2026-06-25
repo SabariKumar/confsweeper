@@ -22,13 +22,13 @@ Each move is implemented + validated in sequence; subsequent moves are *conditio
 | 1 | Lock Move A design forks | ✓ complete |
 | 2 | Move A: new `make_concerted_dihedral_kick_proposer` factory + `_enumerate_concerted_dihedral_pairs` helper + tests | ✓ complete (5/5 targeted) |
 | 3 | Move A: extend `make_default_mcmm_composite` to 4 sub-proposers + thread `concerted_dihedral_weight` through `get_mol_PE_mcmm` + CLI | ✓ complete (76/76 family; full suite pending) |
-| 4 | Move A: Validation — cremp_sharp + cremp_typical at n_seeds=10000 | pending |
-| 5 | **Decision point.** Does Move A close cremp_sharp (`cov_bw_ceil > 0.10`)? If yes → skip to Step 13. If no → proceed to Step 6. | pending |
+| 4 | Move A: Validation — cremp_sharp + cremp_typical at n_seeds=10000 | ✓ complete (2026-06-22; cremp_sharp cov_bw_ceil=0.000 at concerted_w 0.00/0.17/0.34) |
+| 5 | **Decision point.** Does Move A close cremp_sharp (`cov_bw_ceil > 0.10`)? If yes → skip to Step 13. If no → proceed to Step 6. | ✓ complete (NO — Move A ruled out → Move B) |
 | 6 | Lock Move B (cis-trans ω) design forks | ✓ complete (2026-06-22; forks locked, Step 4 ruled out Move A → escalated to B) |
-| 7 | Move B: implementation + thread-through | conditional |
-| 8 | Move B: Validation + decision point | conditional |
-| 9 | Lock Move C (multi-window DBT) design forks | conditional |
-| 10 | Move C: implementation + thread-through + Validation + decision point | conditional |
+| 7 | Move B: implementation + thread-through | ✓ complete (2026-06-23; B.1a-widened W=10 closure; full suite 484 passed) |
+| 8 | Move B: Validation + decision point | ✓ complete (2026-06-23; cremp_sharp cov_bw_ceil=0.000 at ω 0.00/0.17/0.34 → Move B ruled out → Move C). ⚠ non-NMe-crash bug found, see Findings |
+| 9 | Lock Move C (multi-window DBT) design forks | ✓ complete (2026-06-23; larger single window W=16, separate 6th sub-proposer, reuse closure+Jacobian) |
+| 10 | Move C: implementation + thread-through + Validation + decision point | ✓ complete (2026-06-24; impl done, full suite 497 passed; cremp_sharp cov_bw_ceil=0.000 at W∈{10,13,16} → Move C ruled out). Next: ceiling-basin diagnostic before Move D |
 | 11 | Lock Move D (backbone + side-chain hybrid) design forks | conditional |
 | 12 | Move D: implementation + thread-through + Validation | conditional |
 | 13 | Final combined ablation matrix across all *shipped* moves + production-mix lock | pending |
@@ -205,9 +205,109 @@ consequence: `concerted_rotation` is generalised from a hardcoded 7-atom /
 uses W=10), and the ω-flip solver switches to `trf` (handles the
 exactly/under-determined shapes `lm` rejects).
 
+### Findings 2026-06-23 — Step 7 implementation complete
+
+Move B shipped end-to-end on the B.1a-widened design; full suite **484 passed,
+8 skipped** (was 457 before Move B → +27 new tests, no regressions).
+
+- **Geometry** (`src/concerted_rotation.py`): `propose_omega_flip` (continuation
+  drive-ramp + Wu–Deem `det_j`, `trf` solver); `apply_dihedral_changes`,
+  `closure_residual`, `_expand_deltas`, `_finite_difference_det_jacobian`
+  generalised to any window size W (DBT W=7 unchanged, ω-flip W=10).
+- **Full-mol application** (`src/proposers.py`): `apply_dihedral_changes_full_mol`
+  and `_compute_window_downstream_sets` generalised to any W.
+- **Proposer**: `make_omega_flip_proposer` — enumerates NMe ω windows, picks one
+  uniformly, toggles cis↔trans (target cis if |ω|>90° else trans), closes on
+  W=10, batches MMFF+MACE, returns the real Wu–Deem `det_j` (not 1.0).
+- **Routing**: `make_default_mcmm_composite` extended to 5-way; `omega_flip_weight`
+  threaded through `get_mol_PE_mcmm` and the `sampler_benchmark.py` CLI
+  (`--omega_flip_weight`).
+- **B.2 detection note (deviation from fork wording):** NMe ω bonds are detected
+  by ring-based atom properties (tertiary N with an off-ring methyl C, adjacent
+  carbonyl C) via `_ordered_macrocycle_atoms`, NOT
+  `torsional_sampling.classify_backbone_residues`. This is consistent with the
+  rest of `proposers.py` (which sources the backbone from ring perception, per
+  the Step-8b switch away from the SMARTS-residue model); the eligibility set is
+  identical for canonical NMe residues. Verified: cremp_sharp → 3 windows,
+  cyclo(Sar)₄ → 4, cyclo(Ala)₄ / cyclohexane → factory raises.
+
+### Findings 2026-06-23 — Combination probe (Move A + Move B): still 0.000 → Move C
+
+Before investing in Move C, probed whether Move A (concerted χ₁+χ₂) and Move B
+(cis-ω) *together* reach the cremp_sharp dominant basin. `scripts/sweep_v0_3_combo_probe.sh`,
+cremp_sharp only (the only test peptide with both an aromatic side chain and an
+NMe amide), kabsch, n_seeds=10000, v0.2 base (aromatic_wells + skip_mmff):
+
+| cell | cart/dih/concerted/ω | cov_bw_ceil | max_missed_bw | n_basins |
+|---|---|---|---|---|
+| AB1 | .33/.33/.17/.17 | 0.000 | 0.724 | 2 |
+| AB2 | .25/.25/.25/.25 | 0.000 | 0.724 | 3 |
+| AB3 | .10/.10/.35/.35 | 0.000 | 0.724 | 6 |
+
+**The combination does not close cremp_sharp either.** `max_missed_bw` is pinned
+at **exactly 0.724** across every v0.3 experiment to date — Move A alone, Move B
+alone, and all three A+B weightings. Side-chain (χ₁/χ₂) and backbone-amide
+(cis-ω) moves, individually or combined, never reach the dominant ceiling basin
+(72% of population), though basin enrichment scales modestly with new-move
+weight (AB3: 6 basins vs 2 baseline). The invariance of max_missed_bw is strong
+evidence the dominant basin is a backbone φ/ψ fold unreachable by anything short
+of a larger concerted backbone rearrangement.
+
+**Decision: implement Move C (multi-window / larger-window DBT).** The Step-7
+variable-W generalisation of `concerted_rotation` already makes a larger backbone
+window cheap to build (this is also the W=10 DBT widening lever recorded in
+Deferred follow-ups).
+
 ### Validation B sketch
 
-`scripts/sweep_v0_3_move_b.sh` similar 3-cell structure × 2 peptides at n_seeds=10000.
+`scripts/sweep_v0_3_move_b.sh` — 3 cells (omega_flip_weight 0.00/0.17/0.34) on
+the v0.2 production stack, × 2 peptides at n_seeds=10000, **kabsch dedup only**
+(crest deferred to the winning mix). Decision: cremp_sharp `cov_bw_ceil > 0.10`
+→ Move B is the fix (Step 13); else → Move C.
+
+### Findings 2026-06-23 — Step 8 validation: Move B does NOT close cremp_sharp
+
+cremp_sharp `cov_bw_ceil` (kabsch) on the v0.2 production stack:
+
+| cell | omega_flip_weight | cov_bw_ceil | max_missed_bw | sampler n_basins |
+|---|---|---|---|---|
+| B1 | 0.00 (baseline) | 0.000 | 0.724 | 2 |
+| B2 | 0.17 | 0.000 | 0.724 | 9 |
+| B3 | 0.34 | 0.000 | 0.724 | 2 |
+
+`cov_bw_ceil = 0.000` at every ω weight; the dominant ceiling basin
+(`max_missed_bw = 0.724`) is never reached. **Decision: Move B ruled out →
+proceed to Move C (multi-window DBT).** Secondary signal worth keeping: B2
+(ω=0.17) lifted cremp_sharp basin diversity to 9 basins (vs 2 baseline; sampler
+max_bw 0.975→0.746) — cis-ω moves find more thermodynamically real basins, just
+not the dominant one. Same "enriches but misses the dominant basin" pattern as
+Move A; cis-ω may still earn a place in the final production mix for NMe
+peptides even though it isn't the cremp_sharp fix.
+
+**⚠ Bug found — ω-flip crashes non-NMe peptides.** cremp_typical (no NMe
+residues) is absent from the B2/B3 results because `make_omega_flip_proposer`
+raises `ValueError("mol has no NMe ω-flip windows")`, which aborts the entire
+MCMM run whenever `omega_flip_weight > 0`. A single global ω weight would crash
+every non-NMe peptide (most of a real dataset). **Fix needed: graceful
+degradation** — when a mol has no NMe windows, `get_mol_PE_mcmm` /
+`make_default_mcmm_composite` should drop the ω sub-proposer for that mol and
+renormalize its weight onto DBT, instead of constructing a factory that raises.
+(ω-flip is inapplicable to non-NMe peptides, so this provably cannot regress
+cremp_typical once fixed.) Independent of the Move C escalation.
+
+**Bug fixed (2026-06-23):** `get_mol_PE_mcmm` now pre-checks
+`_enumerate_nme_omega_windows(mol)` and, when empty, drops the ω sub-proposer
+and folds its weight into DBT (logs a warning). Regression test
+`test_mcmm_omega_flip_weight_no_nme_degrades_gracefully` (cyclo(Ala)₄ +
+omega_flip_weight=0.5 → no crash, ω factory not built, run completes).
+
+**Parallel gap noted — Move A (concerted) has the same defect.**
+`make_concerted_dihedral_kick_proposer` raises on peptides with no aromatic
+side chain, so `concerted_dihedral_weight > 0` crashes such peptides (this is
+why cremp_typical was also absent from the Step-4 A2/A3 cells). Not yet fixed —
+Move A was ruled out for cremp_sharp so its production relevance is lower, but
+the same graceful-degradation treatment should be applied to concerted before
+any production mix that includes it. Deferred follow-up.
 
 ---
 
@@ -219,9 +319,97 @@ The existing DBT proposer enumerates 4-residue backbone windows. A "multi-window
 
 **Hypothesis.** The dominant cremp_sharp ceiling basin may be a backbone-topology state that requires a multi-residue concerted backbone perturbation single-window DBT misses.
 
-### Design forks (TBD when Step 9 lands)
+### Design forks — LOCKED (2026-06-23, Step 9)
 
-Detailed design-fork tables for C.1 (window count / size), C.2 (closure equations — Coutsias 2004 generalised), C.3 (Jacobian — joint Wu-Deem), C.4 (composition with single-window DBT) — left open until Step 9.
+Combo probe (above) ruled out the Move A + Move B combination; `max_missed_bw`
+pinned at 0.724 across all side-chain/ω experiments → the dominant basin needs a
+larger concerted *backbone* rearrangement. Forks locked:
+
+| fork | locked choice | rationale |
+|---|---|---|
+| **C.1 Topology** | Larger single window — drive one backbone dihedral, re-close a bigger window. | Directly reuses the Step-7 variable-W closure; far simpler than two-disjoint-window joint closure (deferred as a heavier follow-up if a single large window isn't enough). Matches the W=10 DBT-widening lever already endorsed. |
+| **C.1 Window size** | **W=16 (~5 residues)** default; validation sweeps W ∈ {10, 13, 16}. | Most aggressive within the plan's 5–6 residue cap — spans 5 of cremp_sharp's 6 residues for the largest concerted rearrangement (12 free dihedrals after the drive). User-accepted trade-off: broader rearrangement over acceptance rate. |
+| **C.2 Closure** | Reuse the numerical W-generalised `least_squares` closure with the `trf` solver. | Already built/tested in Step 7; the larger window is under-determined (12 free vs 6 constraints) so `trf` (not `lm`). No analytical Coutsias derivation needed. |
+| **C.3 Jacobian** | Reuse the finite-difference Wu–Deem Jacobian (`‖∂free/∂drive‖`). | Generalises to any free-dihedral count; the single-window case needs no joint/analytical Jacobian (that was the two-window route, deferred). |
+| **C.4 Composition** | Separate 6th sub-proposer via a `window_size`-parameterised `make_mcmm_proposer`; route W=16 DBT with its own `large_window_dbt_weight` alongside the W=7 DBT. | Keeps the local W=7 move and adds the large-window move, mixed per step, cleanly ablatable. Also delivers the configurable-window lever. |
+
+**Graceful-degradation requirement (same class as the ω-flip non-NMe fix):**
+W=16 only fits macrocycle rings ≥ 16 atoms (6-residue peptides). On smaller
+rings (e.g. cremp_typical, 12-atom/4-residue) `enumerate_backbone_windows`
+returns no W=16 windows, so `get_mol_PE_mcmm` must drop the large-window
+sub-proposer and fold `large_window_dbt_weight` into the W=7 DBT residual rather
+than constructing a factory that raises.
+
+**Implementation surface (Step 10):** parameterise `enumerate_backbone_windows(mol, window_size=7)`
+and `make_mcmm_proposer(..., window_size=7)`; add a `solver_method` to
+`propose_move` (default `'lm'` for W=7, `'trf'` for larger under-determined
+windows); thread `large_window_dbt_weight` + `large_window_size` through
+`make_default_mcmm_composite` (→ 6-way), `get_mol_PE_mcmm` (with the
+small-ring graceful drop), and the `sampler_benchmark.py` CLI.
+
+### Findings 2026-06-24 — Step 10 validation: Move C does NOT close cremp_sharp
+
+Implementation shipped (full suite 497 passed, +13 tests, no regressions);
+`scripts/sweep_v0_3_move_c.sh` swept W ∈ {10,13,16} at large_window_dbt_weight
+0.34 on the v0.2 base, cremp_sharp, kabsch, n_seeds=10000:
+
+| W | cov_bw_ceil | max_missed_bw | sampler n_basins | time |
+|---|---|---|---|---|
+| 7 (baseline B1) | 0.000 | 0.724 | 2 | — |
+| 10 | 0.000 | 0.724 | 9 | 48 min |
+| 13 | 0.000 | 0.724 | 2 | 58 min |
+| 16 | 0.000 | 0.724 | 4 | 63 min |
+
+**Move C ruled out.** Larger concerted backbone windows enrich the basin set
+(W=10: 9 basins) but never reach the dominant basin.
+
+**Key observation — the 0.724 wall is move-independent.** `max_missed_bw` is
+pinned at *exactly* 0.724 across every v0.3 experiment: Move A, Move B, A+B
+combo, and Move C at all three window sizes. Bit-identical invariance across
+side-chain, backbone-amide, AND large concerted-backbone moves means no run
+ever lands within RMSD threshold of the one dominant ceiling conformer (72% of
+the CREST population). That points away from "missing the right move" and toward
+**"that ceiling basin is not a reachable minimum under our MMFF+MACE pipeline"**
+— consistent with the Step-16 CREMP-overcounts / MMFF-basin-collapse finding.
+
+**Decision: diagnose the dominant ceiling basin before building Move D.** Push
+the specific 72% ceiling conformer (`results/cremp_ceiling_sdfs/`) through the
+MMFF→MACE→Kabsch pipeline (Step-16 `cremp_collapse_test.py` machinery). If it
+collapses / relaxes away / scores far above our basins on MACE → it is a
+reference-pipeline mismatch, not a sampling gap; Move D would hit the same wall
+and the right action is to redefine the ceiling against our own pipeline. If it
+stays a distinct low-MACE basin we never visit → genuine sampling gap, Move D
+(or seeding from it) is justified.
+
+### Findings 2026-06-24 — ceiling-basin diagnostic: genuine sampling gap, NOT artifact → re-frame as a SEEDING problem
+
+Pushed the dominant cremp_sharp ceiling basin (conf0, bw=0.724) through our own
+MMFF→MACE pipeline:
+
+| check | result | meaning |
+|---|---|---|
+| MMFF-relax displacement | **0.020 Å** heavy-atom RMSD | conf0 is a *stable* minimum of our MMFF inner loop — does not collapse |
+| MACE ΔE on MMFF relax | **−39 meV** (stays low) | not a GFN2-xTB-specific geometry; genuine under MACE too |
+| conf0 vs sampler e_min | **398 meV (~15 kT) below** our best basin | our walk never finds the true low-energy fold |
+| nearest Move-C basin RMSD | **2.33 Å** (≫ 0.125–0.5 Å thresholds) | our walk never gets geometrically close |
+
+**The "artifact / redefine the ceiling" branch is ruled out** — conf0 is a real,
+stable, much-lower-energy minimum of our exact pipeline that the sampler never
+reaches. So the gap is genuine.
+
+**But it re-frames the problem: this is a SEEDING / connectivity gap, not a
+missing move type.** Our sampler's global minimum sits ~400 meV / 2.3 Å from the
+true fold — the MC walk never enters that region of conformation space *at all*,
+which is why Moves A/B/C and the A+B combo every hit the identical 0.724 wall
+(local moves can't bridge a ~2.3 Å / ~15 kT gap from the seed region). Building
+Move D (another local move type) would almost certainly hit the same wall.
+
+**Recommended next step (before Move D): a seeding probe.** Test whether ETKDG /
+exhaustive-ETKDG / CREMP can produce a conformer near conf0, and whether seeding
+the MC walk from a real low-energy pool (MCMM currently starts from 8 fresh
+ETKDG embeds) closes the gap. If a pool reaches conf0 → the fix is seeding, ~no
+new move code. If nothing reaches it → genuinely deep; Move D, biased moves, or
+direct CREMP-seeding then warranted.
 
 ---
 

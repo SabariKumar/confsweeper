@@ -25,6 +25,11 @@ from confsweeper import (
 # has 12 backbone atoms and 30 atoms total with explicit Hs.
 TEST_SMILES = "C[C@@H]1NC(=O)[C@@H](C)NC(=O)[C@@H](C)NC(=O)[C@@H](C)NC1=O"
 
+# cyclo(Sar)4 — cyclic tetra-sarcosine; every backbone N is N-methylated, so it
+# HAS ω-flip windows (unlike cyclo(Ala)4 above). Used for the ω-flip tests that
+# need the proposer to be eligible.
+NME_TEST_SMILES = "O=C1N(C)CC(=O)N(C)CC(=O)N(C)CC(=O)N1C"
+
 
 def _mock_etkdg_embed(mols, params, confsPerMolecule, hardwareOptions):
     """CPU drop-in for nvmolkit ETKDG: embed `confsPerMolecule` conformers
@@ -1383,7 +1388,7 @@ def test_mcmm_omega_flip_weight_positive_builds_composite():
         patch("proposers.make_omega_flip_proposer", side_effect=_spy_omega_factory),
     ):
         get_mol_PE_mcmm(
-            TEST_SMILES,
+            NME_TEST_SMILES,  # has NMe → ω-flip eligible
             get_embed_params(),
             hardware_opts=None,
             calc=MagicMock(),
@@ -1396,6 +1401,46 @@ def test_mcmm_omega_flip_weight_positive_builds_composite():
     assert dbt_factory_calls["n"] == 1
     assert omega_factory_calls["n"] == 1
     assert cart_factory_calls["n"] == 0
+
+
+def test_mcmm_omega_flip_weight_no_nme_degrades_gracefully():
+    """omega_flip_weight>0 on a peptide with NO N-methylated amide must NOT
+    crash: the ω sub-proposer is dropped (its factory not called) and its
+    weight folds into DBT, so the run completes normally. Regression test
+    for the non-NMe crash found in the Step-8 Move B sweep."""
+    omega_factory_calls = {"n": 0}
+
+    def _spy_omega_factory(mol, **kwargs):
+        del mol, kwargs
+        omega_factory_calls["n"] += 1
+        return _stub_proposer_factory(None, None, None)
+
+    mock_mace = _make_seq_mock_mace()
+    with (
+        patch("confsweeper.embed.EmbedMolecules", side_effect=_mock_etkdg_embed),
+        patch("confsweeper._mace_batch_energies", side_effect=mock_mace),
+        patch(
+            "nvmolkit.mmffOptimization.MMFFOptimizeMoleculesConfs",
+            return_value=[[]],
+        ),
+        patch("confsweeper.make_mcmm_proposer", side_effect=_stub_proposer_factory),
+        patch("proposers.make_omega_flip_proposer", side_effect=_spy_omega_factory),
+    ):
+        # cyclo(Ala)4 (TEST_SMILES) has no NMe amide — must not raise.
+        mol, conf_ids, energies = get_mol_PE_mcmm(
+            TEST_SMILES,
+            get_embed_params(),
+            hardware_opts=None,
+            calc=MagicMock(),
+            n_walkers_per_temp=1,
+            n_temperatures=2,
+            n_steps=1,
+            omega_flip_weight=0.5,
+            rmsd_threshold=0.0,
+        )
+    # ω factory never constructed (no NMe windows); run still produced output.
+    assert omega_factory_calls["n"] == 0
+    assert len(conf_ids) == len(energies)
 
 
 def test_mcmm_omega_flip_weight_negative_raises():
@@ -1415,5 +1460,141 @@ def test_mcmm_omega_flip_weight_negative_raises():
                 n_temperatures=2,
                 n_steps=1,
                 omega_flip_weight=-0.1,
+                rmsd_threshold=0.0,
+            )
+
+
+# ---------------------------------------------------------------------------
+# large_window_dbt_weight kwarg threading (v0.3 Move C / issue #17)
+# ---------------------------------------------------------------------------
+
+
+def _spy_window_sizes_factory(recorder):
+    """make_mcmm_proposer spy that records the window_size of each call
+    (default 7 for the W=7 DBT proposer; the large-window proposer passes
+    a larger window_size). Returns a stub proposer."""
+
+    def _spy(mol, **kwargs):
+        recorder.append(kwargs.get("window_size", 7))
+        return _stub_proposer_factory(mol, None, None)
+
+    return _spy
+
+
+def test_mcmm_large_window_weight_zero_skips_large_factory():
+    """Default large_window_dbt_weight=0.0 → only the W=7 DBT proposer is
+    built; no large-window (window_size>7) construction."""
+    window_sizes: list = []
+    mock_mace = _make_seq_mock_mace()
+    with (
+        patch("confsweeper.embed.EmbedMolecules", side_effect=_mock_etkdg_embed),
+        patch("confsweeper._mace_batch_energies", side_effect=mock_mace),
+        patch(
+            "nvmolkit.mmffOptimization.MMFFOptimizeMoleculesConfs",
+            return_value=[[]],
+        ),
+        patch(
+            "confsweeper.make_mcmm_proposer",
+            side_effect=_spy_window_sizes_factory(window_sizes),
+        ),
+    ):
+        get_mol_PE_mcmm(
+            TEST_SMILES,
+            get_embed_params(),
+            hardware_opts=None,
+            calc=MagicMock(),
+            n_walkers_per_temp=1,
+            n_temperatures=2,
+            n_steps=1,
+            rmsd_threshold=0.0,
+        )
+    assert window_sizes == [7]  # only the DBT proposer
+
+
+def test_mcmm_large_window_weight_positive_builds_large_proposer():
+    """large_window_dbt_weight>0 with a ring >= large_window_size builds a
+    second make_mcmm_proposer at the larger window_size."""
+    window_sizes: list = []
+    mock_mace = _make_seq_mock_mace()
+    with (
+        patch("confsweeper.embed.EmbedMolecules", side_effect=_mock_etkdg_embed),
+        patch("confsweeper._mace_batch_energies", side_effect=mock_mace),
+        patch(
+            "nvmolkit.mmffOptimization.MMFFOptimizeMoleculesConfs",
+            return_value=[[]],
+        ),
+        patch(
+            "confsweeper.make_mcmm_proposer",
+            side_effect=_spy_window_sizes_factory(window_sizes),
+        ),
+    ):
+        # TEST_SMILES is a 12-atom ring → use large_window_size=10 (<=12).
+        get_mol_PE_mcmm(
+            TEST_SMILES,
+            get_embed_params(),
+            hardware_opts=None,
+            calc=MagicMock(),
+            n_walkers_per_temp=1,
+            n_temperatures=2,
+            n_steps=1,
+            large_window_dbt_weight=0.5,
+            large_window_size=10,
+            rmsd_threshold=0.0,
+        )
+    assert 7 in window_sizes  # the W=7 DBT
+    assert 10 in window_sizes  # the large-window DBT
+
+
+def test_mcmm_large_window_weight_small_ring_degrades_gracefully():
+    """large_window_dbt_weight>0 but the ring is smaller than
+    large_window_size → drop the large-window proposer (no large call),
+    fold weight into DBT, run completes without raising."""
+    window_sizes: list = []
+    mock_mace = _make_seq_mock_mace()
+    with (
+        patch("confsweeper.embed.EmbedMolecules", side_effect=_mock_etkdg_embed),
+        patch("confsweeper._mace_batch_energies", side_effect=mock_mace),
+        patch(
+            "nvmolkit.mmffOptimization.MMFFOptimizeMoleculesConfs",
+            return_value=[[]],
+        ),
+        patch(
+            "confsweeper.make_mcmm_proposer",
+            side_effect=_spy_window_sizes_factory(window_sizes),
+        ),
+    ):
+        # TEST_SMILES 12-atom ring < default large_window_size=16 → degrade.
+        mol, conf_ids, energies = get_mol_PE_mcmm(
+            TEST_SMILES,
+            get_embed_params(),
+            hardware_opts=None,
+            calc=MagicMock(),
+            n_walkers_per_temp=1,
+            n_temperatures=2,
+            n_steps=1,
+            large_window_dbt_weight=0.5,
+            rmsd_threshold=0.0,
+        )
+    assert window_sizes == [7]  # large-window proposer never built
+    assert len(conf_ids) == len(energies)
+
+
+def test_mcmm_large_window_weight_negative_raises():
+    mock_mace = _make_seq_mock_mace()
+    with (
+        patch("confsweeper.embed.EmbedMolecules", side_effect=_mock_etkdg_embed),
+        patch("confsweeper._mace_batch_energies", side_effect=mock_mace),
+        patch("confsweeper.make_mcmm_proposer", side_effect=_stub_proposer_factory),
+    ):
+        with pytest.raises(ValueError, match="large_window_dbt_weight must be >= 0"):
+            get_mol_PE_mcmm(
+                TEST_SMILES,
+                get_embed_params(),
+                hardware_opts=None,
+                calc=MagicMock(),
+                n_walkers_per_temp=1,
+                n_temperatures=2,
+                n_steps=1,
+                large_window_dbt_weight=-0.1,
                 rmsd_threshold=0.0,
             )
