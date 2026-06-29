@@ -17,11 +17,7 @@ import torch
 from rdkit import Chem
 from rdkit.Chem import rdDistGeom
 
-from torsional_sampling import (
-    embed_constrained,
-    get_backbone_dihedrals,
-    set_dihedral_bounds,
-)
+from torsional_sampling import embed_constrained, set_dihedral_bounds
 
 from .model import DihedralPredictor
 from .residues import (
@@ -29,6 +25,7 @@ from .residues import (
     neighbor_augment,
     omega_bin_to_center,
     omega_quads,
+    ordered_backbone_dihedrals,
     residue_features,
 )
 
@@ -58,7 +55,7 @@ def predict_dihedrals(
 ) -> tuple[list[float], list[float], list[float]]:
     """
     Predict per-residue (phi, psi, omega) target angles (degrees) for the dominant
-    conformer, in get_backbone_dihedrals order.
+    conformer, in ring order (matching residue_features / ordered_backbone_dihedrals).
 
     Params:
         mol: Chem.Mol : peptide with explicit Hs
@@ -98,7 +95,7 @@ def make_bounds_phi_psi_omega(
     Returns:
         bounds matrix, or None if any constraint is infeasible
     """
-    defs = get_backbone_dihedrals(mol)
+    defs = ordered_backbone_dihedrals(mol)
     oq = omega_quads(mol)
     if not (len(defs) == len(phi) == len(psi) == len(omega) == len(oq)):
         raise ValueError("dihedral list lengths must match the residue count")

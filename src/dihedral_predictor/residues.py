@@ -84,9 +84,40 @@ def omega_bin_to_center(bin_idx: int) -> float:
 # --- backbone atom bookkeeping ------------------------------------------
 
 
+def ordered_backbone_dihedrals(mol: Chem.Mol) -> list[tuple]:
+    """
+    Return get_backbone_dihedrals defs reordered into ring-connectivity order.
+
+    `get_backbone_dihedrals` returns residues in SMARTS-match (atom-index) order,
+    which is NOT ring-sequential for many macrocycles (notably cyclic
+    tetrapeptides). Ring order matters here: omega links consecutive residues and
+    the cyclic neighbour augmentation assumes adjacency. Each residue's psi tuple
+    carries n_next (the next residue's amide N), so we chain residues by matching
+    n_next → the residue whose N equals it. Falls back to the original order if the
+    chain cannot be completed (atypical connectivity).
+
+    Params:
+        mol: Chem.Mol : peptide with explicit Hs
+    Returns:
+        list of (phi_atoms, psi_atoms) tuples in ring order
+    """
+    defs = get_backbone_dihedrals(mol)
+    n_to_res = {psi[0]: i for i, (_phi, psi) in enumerate(defs)}
+    n_next = [psi[3] for (_phi, psi) in defs]
+    order, seen, cur = [0], {0}, 0
+    for _ in range(len(defs) - 1):
+        nxt = n_to_res.get(n_next[cur])
+        if nxt is None or nxt in seen:
+            return defs  # fall back to original order
+        order.append(nxt)
+        seen.add(nxt)
+        cur = nxt
+    return [defs[i] for i in order]
+
+
 def residue_atoms(mol: Chem.Mol) -> list[tuple[int, int, int]]:
     """
-    Return (N, Ca, C) backbone atom indices per residue, in get_backbone_dihedrals order.
+    Return (N, Ca, C) backbone atom indices per residue, in ring order.
 
     Params:
         mol: Chem.Mol : peptide with explicit Hs
@@ -94,7 +125,7 @@ def residue_atoms(mol: Chem.Mol) -> list[tuple[int, int, int]]:
         list of (n_idx, ca_idx, c_idx) tuples
     """
     out = []
-    for _phi, psi in get_backbone_dihedrals(mol):
+    for _phi, psi in ordered_backbone_dihedrals(mol):
         n, ca, c, _n_next = psi
         out.append((n, ca, c))
     return out
@@ -112,7 +143,7 @@ def omega_quads(mol: Chem.Mol) -> list[tuple[int, int, int, int]]:
     Returns:
         list of 4-tuples of atom indices, one per residue
     """
-    defs = get_backbone_dihedrals(mol)
+    defs = ordered_backbone_dihedrals(mol)
     n_res = len(defs)
     quads = []
     for i in range(n_res):
@@ -138,7 +169,7 @@ def backbone_dihedral_values(
         tuple (phi, psi, omega), each np.ndarray of shape (n_res,) in degrees
     """
     conf = mol.GetConformer(conf_id)
-    defs = get_backbone_dihedrals(mol)
+    defs = ordered_backbone_dihedrals(mol)
     oq = omega_quads(mol)
     phi = np.array([rdMolTransforms.GetDihedralDeg(conf, *d[0]) for d in defs])
     psi = np.array([rdMolTransforms.GetDihedralDeg(conf, *d[1]) for d in defs])
