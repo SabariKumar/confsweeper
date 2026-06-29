@@ -40,9 +40,10 @@ coverage of the CREST ceiling), `match_rmsd = 0.125 Å`.
 | 3 | Lever 1 + 4 — de-novo reachability of conf0 vs seed budget and sampling distribution | ✓ complete (2026-06-25; uniform/less-biased sampling RULED OUT — worse than ETKDG prior; all plateau ~1 Å, none reach conf0) |
 | 4 | MACE-optimization wall-clock cost benchmark (user request) | ✓ complete (2026-06-25; ~580× MMFF; inner-loop ~11 h/peptide → de-novo fix stays out; final-relax ~14 min feasible but can't reach unsampled conf0) |
 | 4b | geomeTRIC (internal-coord TRIC) vs ASE LBFGS for MACE relaxation — does a better-conditioned optimizer cut the step count / wall-clock (Step 4 was step-count-bound)? | ✓ complete (2026-06-25; RULED OUT — same step count, ~26× slower wall-clock; ASE LBFGS stays) |
-| 5 | Inversion pre-screen: cheap predictor of which peptides suffer the inversion (so users know when de-novo output is unreliable / a reference is needed) | in progress |
-| 5b | **Lever 5 — learned dihedral prediction.** Explore a lightweight ML model trained on CREMP sharp peptides' minimum-energy conformers to predict the MMFF-/ETKDG-inaccessible dihedrals, then seed the sampler from the prediction (a de-novo fix needing the trained model, not a per-peptide reference). | pending |
-| 6 | Productionize reference-seeding (Lever 1) + document the structural ceiling (Lever 3) + figures; wrap-up | pending |
+| 5 | Inversion pre-screen: cheap predictor of which peptides suffer the inversion | ✓ complete (2026-06-25; `scripts/inversion_prescreen.py`; inversion is pervasive (~63% relaxed dMMFF>2) & NOT feature-predictable; necessary-not-sufficient for coverage — calibration gap flagged) |
+| 5b | Lever 5 — learned dihedral prediction (feasibility) | ✓ complete (2026-06-25; cis-ω ruled out as signature; inaccessible feature is SPARSE (median 2 backbone-dihedral flips, 67% ≤3) → viable but a real structured-predictor ML build, not a trivial add-on) |
+| 6 | ~~Productionize reference-seeding (Lever 1) + document ceiling + figures~~ | **dropped (2026-06-25)** — reference-seeding needs a per-peptide CREST ensemble, so it cannot generalize to molecules distinct from CREMP (the actual goal). Superseded by Lever 5. |
+| 7 | **Lever 5 — learned dihedral prediction → promoted to its own issue/branch.** The generalizable de-novo fix: predict the dominant conformer's sparse backbone dihedrals from sequence/topology, seed via constrained-DG. Needs only the trained model at inference, not a reference. | in progress (issue drafted) |
 
 ## Lever menu (cheap, no MACE relaxation)
 
@@ -138,8 +139,85 @@ infeasible) stands. (Caveat: float64 MACE might let geomeTRIC converge cleaner /
 fewer steps, but its ~660 ms/step overhead would still dominate at this molecule
 size — not competitive.)
 
+### Findings 2026-06-25 — Step 5: MMFF↔CREST inversion is pervasive, not feature-predictable
+
+`scripts/inversion_prescreen.py` (CPU; 600-peptide stratified CREMP sample, 300
+sharp + 300 control). For each peptide, MMFF-score every CREST conformer and
+measure `dMMFF(dominant) = MMFF(CREST-dominant) − min MMFF`, both single-point
+(on the GFN2-xTB geometry) and MMFF-relaxed.
+
+| dMMFF(dominant) | median | 75th | 90th | max |
+|---|---|---|---|---|
+| single-point | 7.29 | 15.30 | 20.97 | 43.79 |
+| MMFF-relaxed | 2.98 | 5.82 | 9.02 | 16.01 |
+
+Anchors (separate cleanly): cremp_typical 0.18, cremp_sharp 7.10 kcal/mol (relaxed).
+
+- **Single-point inflates relaxed by 2.4×** — cross-method strain (GFN2-xTB
+  geometries aren't MMFF minima). The relaxed metric is the sampling-relevant
+  one; both columns kept in the CSV to document the disparity.
+- **The inversion is pervasive:** relaxed dMMFF >1 kcal/mol in 75% of peptides,
+  >2 in 63%, >3 in 50%. MMFF and GFN2-xTB(CREST) disagree on the dominant
+  conformer for most macrocyclic peptides — this is the norm, not a cremp_sharp
+  one-off. (Plausible: classical FF vs semi-empirical QM diverge by several
+  kcal/mol on flexible H-bonding macrocycles.)
+- **No cheap predictor:** sharp vs control shows NO separation (non-sharp
+  slightly higher); flagged-vs-not differ negligibly on poplowestpct (44 vs 49%),
+  n_nme (0.9 vs 0.6), aromatic (61 vs 53%). A sequence-feature pre-screen for
+  inversion risk is not feasible.
+
+**Crucial caveat — calibration gap.** `dMMFF` measures energy-model
+*disagreement*, which is *necessary but not sufficient* for a *coverage* failure:
+the sampler can still reach a disfavoured dominant basin if it is geometrically
+reachable (cremp_sharp's was disfavoured AND narrow). We have coverage labels for
+only 2 peptides (typical 0.99, sharp 0.000), so the fraction of the ~63% flagged
+that *actually* fail coverage is unknown. Two readings, both important:
+(a) most flagged peptides still get good coverage → dMMFF over-flags, a
+reachability term is needed; (b) coverage really is poor on a majority → the
+package's CREST-reproduction is worse than the 2-point picture suggested. **A
+coverage-labelled sample (run sampler + union_basin_count on ~30–50 peptides
+spanning the dMMFF range) is the missing calibration** — recorded as a deferred
+follow-up. This also raises the value of Lever 5 (learned dihedral prediction):
+if the inversion is pervasive, a model that generalises would help broadly, not
+just on rare cases.
+
+### Findings 2026-06-25 — Step 5b: Lever 5 feasibility — sparse target, viable but a real ML build
+
+Two probes on inverted peptides (relaxed dMMFF > 2 from the Step-5 screen):
+
+1. **cis-ω is NOT the signature.** Inverted vs control CREST-dominant ω geometry:
+   mean cis-ω/peptide 0.40 vs 0.20; only **25%** of inverted peptides have *any*
+   cis-ω; cis fraction at NMe ω is actually *lower* in inverted (18% vs 27%);
+   corr(dMMFF, #cis-ω) = −0.12. So cremp_sharp's cis-ω angle is not
+   representative — ~75% of inverted peptides invert for other reasons. The
+   inaccessible feature is not a simple sparse dihedral *type*.
+2. **But the inaccessible feature is SPARSE.** Backbone dihedrals differing >60°
+   between the CREST-dominant and the MMFF-best conformer (120 inverted peptides;
+   median 12 backbone dihedrals/peptide): **median 2, mean 2.7, 75th 4, max 12;
+   67% differ by ≤3, 32% by ≤1.** The CREST-dominant is usually a *local* change
+   (~2 dihedral flips) from the easily-found MMFF-best, not a global refold.
+
+**Verdict: Lever 5 is viable but a genuine (modest) ML project, not a lightweight
+add-on.** Pro: the target is sparse (median 2 flips), and the MMFF-best is a
+strong prior, so a model needs only a few dihedrals right; the constrained-DG
+seeding machinery already exists (`torsional_sampling` Pool B). Con: it's not a
+fixed rule (cis-ω ruled out), so the model must predict *variable* per-residue
+backbone dihedral states (φ/ψ/ω) from sequence/topology — a structured predictor
+needing CREMP training-data prep, a train/val generalization split, and seeding
+integration. ~1/3 of cases are more diffuse (heavier tail) → it would help the
+sparse majority, not all. Being a new ML model = a new major feature → its own
+branch + issue per the project workflow before any build.
+
 ## Deferred follow-ups
 
+- **Coverage-label calibration of the inversion pre-screen (2026-06-25).** Step 5
+  shows energy disagreement (relaxed dMMFF) is pervasive but only 2 peptides have
+  coverage labels, so the dMMFF→coverage-failure mapping is uncalibrated. Run the
+  sampler + `union_basin_count` on ~30–50 CREMP peptides spanning the dMMFF range
+  to (a) learn what dMMFF threshold predicts cov_bw_ceil≈0 and (b) measure the
+  package's actual CREST-reproduction rate (currently a 2-point picture). **Trigger:**
+  needed before claiming an inversion *prevalence* or shipping dMMFF as a
+  reliability flag; GPU cost ~30–50 sampler runs.
 - **NVIDIA Alchemi BGR for batched GPU inner-loop relaxation (2026-06-25, user
   pointer) — potentially reopens the de-novo fix.** Alchemi BGR (NIM microservice)
   provides a GPU-batched FIRE2 optimizer with dynamic batching — exactly the
