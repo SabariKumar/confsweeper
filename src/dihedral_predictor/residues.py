@@ -177,6 +177,90 @@ def backbone_dihedral_values(
     return phi, psi, omega
 
 
+# --- side-chain chi dihedrals -------------------------------------------
+
+MAX_CHI = 4  # chi slots per residue (chi1..chi4); covers all standard side chains
+
+
+def sidechain_chi_quads(mol: Chem.Mol, max_chi: int = MAX_CHI) -> list[list[tuple]]:
+    """
+    Per-residue list of side-chain chi dihedral atom-quads (chi1, chi2, ...).
+
+    Walks the side chain from Cβ outward, defining chi_k as the dihedral whose
+    central (rotated) bond is the k-th side-chain bond: chi1 = (N, Cα, Cβ, Cγ),
+    chi2 = (Cα, Cβ, Cγ, Cδ), ... A chi is emitted only if its rotated bond is NOT
+    in a ring (so the dihedral that rotates a side chain *into* an aromatic ring —
+    e.g. Trp chi2, central bond Cβ-Cγ — is kept, but bonds within the ring are not).
+    Branches are resolved deterministically (lowest atom index). Each chi is
+    settable via rdMolTransforms.SetDihedralDeg, so predicted chi can seed the
+    side chain directly (side-chain bonds are not ring-closure-constrained).
+
+    Params:
+        mol: Chem.Mol : peptide with explicit Hs
+        max_chi: int : maximum chi slots per residue
+    Returns:
+        list (per residue, ring order) of lists of 4-tuples (0 to max_chi each)
+    """
+    out = []
+    for n, ca, c in residue_atoms(mol):
+        cb = next(
+            (
+                nb.GetIdx()
+                for nb in mol.GetAtomWithIdx(ca).GetNeighbors()
+                if nb.GetAtomicNum() > 1 and nb.GetIdx() not in (n, c)
+            ),
+            None,
+        )
+        if cb is None:  # glycine
+            out.append([])
+            continue
+        path = [n, ca, cb]
+        while len(path) < max_chi + 3:
+            bb, aa = path[-1], path[-2]
+            nbrs = sorted(
+                nb.GetIdx()
+                for nb in mol.GetAtomWithIdx(bb).GetNeighbors()
+                if nb.GetAtomicNum() > 1 and nb.GetIdx() not in path
+            )
+            if not nbrs:
+                break
+            q = nbrs[0]
+            path.append(q)
+            if mol.GetBondBetweenAtoms(bb, q).IsInRing():
+                break  # include one ring atom as reference, then stop
+        chis = []
+        for k in range(1, len(path) - 2):
+            if not mol.GetBondBetweenAtoms(path[k], path[k + 1]).IsInRing():
+                chis.append((path[k - 1], path[k], path[k + 1], path[k + 2]))
+            if len(chis) >= max_chi:
+                break
+        out.append(chis)
+    return out
+
+
+def sidechain_chi_values(mol: Chem.Mol, conf_id: int, max_chi: int = MAX_CHI):
+    """
+    Side-chain chi dihedral values (degrees) and a presence mask per residue.
+
+    Params:
+        mol: Chem.Mol : peptide with the conformer
+        conf_id: int : conformer id
+        max_chi: int : chi slots per residue
+    Returns:
+        tuple (chi (n_res, max_chi) float NaN-padded, mask (n_res, max_chi) bool)
+    """
+    conf = mol.GetConformer(conf_id)
+    quads = sidechain_chi_quads(mol, max_chi=max_chi)
+    n_res = len(quads)
+    chi = np.full((n_res, max_chi), np.nan, dtype=np.float64)
+    mask = np.zeros((n_res, max_chi), dtype=bool)
+    for i, qs in enumerate(quads):
+        for k, q in enumerate(qs):
+            chi[i, k] = rdMolTransforms.GetDihedralDeg(conf, *q)
+            mask[i, k] = True
+    return chi, mask
+
+
 # --- per-residue features ------------------------------------------------
 
 FEATURE_NAMES = [

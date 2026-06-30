@@ -10,6 +10,13 @@ can start from (and retain) the otherwise MMFF-inaccessible dominant basin.
 The existing `make_constrained_bounds` only constrains phi/psi; here we build the
 bounds directly so omega (cis/trans) is constrained too — the Step-5b probe
 showed omega matters for a meaningful minority of inverted peptides.
+
+Tolerance note: the constraint half-width defaults to 60°, not the 30° used for
+Pool-B Ramachandran sampling. Tight bounds make from-scratch distance geometry
+thrash (measured: ~90 s/embed at 30° with omega vs ~2-5 s at 60°), and ±60° is
+the right precision anyway — rotamer states sit ~120° apart, so ±60° windows just
+separate them, and the prediction itself is only accurate to ~±15-22°. MMFF
+relaxation downstream snaps each seed to the nearest basin minimum.
 """
 
 import numpy as np
@@ -81,8 +88,8 @@ def make_bounds_phi_psi_omega(
     phi: list[float],
     psi: list[float],
     omega: list[float],
-    tol_phi_psi: float = 30.0,
-    tol_omega: float = 30.0,
+    tol_phi_psi: float = 60.0,
+    tol_omega: float = 60.0,
 ) -> "np.ndarray | None":
     """
     Build a bounds matrix constraining phi, psi, and omega per residue.
@@ -119,8 +126,8 @@ def seed_conformers(
     model: DihedralPredictor,
     window: int = 1,
     n_attempts: int = 20,
-    tol_phi_psi: float = 30.0,
-    tol_omega: float = 30.0,
+    tol_phi_psi: float = 60.0,
+    tol_omega: float = 60.0,
     seed: int = 0,
     device: str = "cpu",
 ) -> list[int]:

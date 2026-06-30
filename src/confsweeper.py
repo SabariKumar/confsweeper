@@ -1134,6 +1134,8 @@ def get_mol_PE_mcmm(
     minimize: bool = True,
     mmff_backend: str = "gpu",
     n_init_confs: int = 1,
+    extra_seed_coords: "list | None" = None,
+    relax_seeds: bool = True,
     dedup_mode: str = "kabsch",
     energy_threshold_eV: float = 0.05,
     rotconst_anisotropy_threshold: float = 0.01,
@@ -1322,6 +1324,21 @@ def get_mol_PE_mcmm(
             distinct basins after walker construction (deduped per
             `rmsd_threshold`), giving MCMM a head start over the
             single-seed default. Lever C9 in docs/mcmm_plan.md.
+        extra_seed_coords: list | None : optional list of (n_atoms, 3)
+            coordinate arrays to add as additional seed conformers
+            alongside the ETKDG seeds (default None). Used by the learned
+            dihedral predictor (issue #20 / Lever 5) to inject
+            constrained-DG seeds at the predicted dominant backbone so the
+            MC walk starts from and remembers the MMFF-inaccessible
+            inversion basin. Coords must be in this mol's atom order — build
+            them on `Chem.AddHs(Chem.MolFromSmiles(smi))` with the same smi.
+        relax_seeds: bool : whether to MMFF-relax the injected `extra_seed_coords`
+            (default True). True: seeds join the ETKDG seed pool, are MMFF-relaxed,
+            and drive the MC walk. False: seeds are NOT MMFF-relaxed — for an
+            inverted peptide the dominant basin is MMFF-disfavoured, so relaxation
+            pushes a good seed off it; instead the unrelaxed seeds are MACE-scored
+            and appended to the output basins as protected basins after the tail
+            (issue #20). No effect when `extra_seed_coords` is None.
         seed: int : base seed; derived seeds are produced for each
             walker, the proposer, and the swap RNG by adding fixed
             offsets, so two runs with the same seed are deterministic
@@ -1351,6 +1368,23 @@ def get_mol_PE_mcmm(
     )
     if mol.GetNumConformers() == 0:
         return mol, [], []
+
+    # Inject learned-dihedral seed conformers (issue #20 / Lever 5). With
+    # relax_seeds=True they join the ETKDG seed pool here, so they are MMFF-relaxed
+    # and the MC walkers start from (and basin memory remembers) the predicted
+    # basin. With relax_seeds=False they are NOT added here — for an inverted
+    # peptide the dominant basin is MMFF-disfavoured, so MMFF relaxation pushes a
+    # good seed off it; instead the unrelaxed seeds are MACE-scored and appended to
+    # the output basins after the tail (see end of function). Coords must be in this
+    # mol's atom order (build the seeds on Chem.AddHs(Chem.MolFromSmiles(smi))).
+    if extra_seed_coords and relax_seeds:
+        from rdkit.Geometry import Point3D
+
+        for coords in extra_seed_coords:
+            conf = Chem.Conformer(mol.GetNumAtoms())
+            for i, (x, y, z) in enumerate(coords):
+                conf.SetAtomPosition(i, Point3D(float(x), float(y), float(z)))
+            mol.AddConformer(conf, assignId=True)
 
     if minimize:
         if mmff_backend == "gpu":
@@ -1666,7 +1700,7 @@ def get_mol_PE_mcmm(
         return mol, [], []
 
     # 7. Pass through the shared MMFF + MACE + filter + dedup tail.
-    return _minimize_score_filter_dedup(
+    out_mol, out_cids, out_energies = _minimize_score_filter_dedup(
         mol,
         all_conf_ids,
         hardware_opts,
@@ -1680,6 +1714,32 @@ def get_mol_PE_mcmm(
         energy_threshold_eV=energy_threshold_eV,
         rotconst_anisotropy_threshold=rotconst_anisotropy_threshold,
     )
+
+    # 8. No-relax seed path (issue #20): for inverted peptides MMFF relaxation
+    # corrupts the dominant-basin seed, so append the seeds at their predicted
+    # geometry, MACE-scored (no MMFF relaxation, bypassing the tail), as protected
+    # basins. The de-novo MC basins above still come from the MMFF/MACE pipeline.
+    if extra_seed_coords and not relax_seeds:
+        from rdkit.Geometry import Point3D
+
+        atomic_nums = [a.GetAtomicNum() for a in out_mol.GetAtoms()]
+        new_cids = []
+        for coords in extra_seed_coords:
+            conf = Chem.Conformer(out_mol.GetNumAtoms())
+            for i, (x, y, z) in enumerate(coords):
+                conf.SetAtomPosition(i, Point3D(float(x), float(y), float(z)))
+            new_cids.append(out_mol.AddConformer(conf, assignId=True))
+        seed_atoms = [
+            ase.Atoms(
+                positions=out_mol.GetConformer(c).GetPositions(), numbers=atomic_nums
+            )
+            for c in new_cids
+        ]
+        seed_e = [float(e) for e in _mace_batch_energies(calc, seed_atoms)]
+        out_cids = list(out_cids) + new_cids
+        out_energies = list(out_energies) + seed_e
+
+    return out_mol, out_cids, out_energies
 
 
 def get_mol_PE_mmff(
