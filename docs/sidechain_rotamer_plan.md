@@ -48,7 +48,7 @@ and the raw-CREST, CREST-Boltzmann-weighted, single-provenance coverage harness
 
 | Step | Description | Status |
 |------|-------------|--------|
-| 1 | Quantify side-chain floppiness across CREMP: per residue type / χ slot, what fraction of χ are effectively unimodal vs multi-rotamer over the CREST ensemble (bounds how much of the ~0.15 χ ceiling is genuine multimodality vs model capacity) | pending |
+| 1 | Quantify side-chain floppiness across CREMP | ✓ complete (2026-06-30; only 56% of χ are unimodal — ~44% genuinely multi-rotamer; aromatic χ floppiest at 36%; most of the ~0.15 χ ceiling is genuine multimodality → distribution/top-K target justified) |
 | 2 | Reframe the χ target to the rotamer **distribution / top-K** (per-residue rotamer probabilities or top-K rotamer sets) instead of a single argmax; train + evaluate against the multi-rotamer ensemble | pending |
 | 3 | **Rotamer-search + MACE-scoring stage** on the seeded (recovered) backbone — prior-guided enumeration/sampling of rotamer combinations, per-residue greedy / branch-and-bound (not the independent sampling prototyped in #20), MACE-scored, keep the best | pending |
 | 4 | Higher-accuracy side-chain model — richer side-chain context features and/or explicit rotamer-library priors; revisit as backbone accuracy improves | pending |
@@ -72,6 +72,35 @@ and the raw-CREST, CREST-Boltzmann-weighted, single-provenance coverage harness
   harness.
 - **Downstream:** closing the all-atom gap makes learned seeding reproduce the full CREST
   distribution, feeding better conformer ensembles to the peptide_electrostatics pipeline.
+
+### Findings 2026-06-30 — Step 1: ~44% of side-chain χ are genuinely multi-rotamer
+
+`scripts/sidechain_floppiness.py` (1500 CREMP peptides, 9641 residue×χ-slot instances).
+For each (residue, χ slot), assign every CREST conformer's χ to the nearest sp3 well
+(-60/+60/180), Boltzmann-weight, report dominant-well fraction + effective #rotamers
+(1/Σp²). "Unimodal" = dominant_frac > 0.8.
+
+| group | unimodal | median dom-frac | mean eff_rotamers |
+|---|---|---|---|
+| overall | 56% | 0.84 | 1.48 |
+| χ1 | 63% | 0.88 | 1.43 |
+| χ2 | 42% | 0.75 | 1.59 |
+| χ3 | 70% | 0.92 | 1.35 |
+| aromatic side chains | 36% | — | 1.66 |
+| non-aromatic | 66% | — | 1.39 |
+
+- Only **56%** of χ are effectively unimodal — **~44% are genuinely multi-rotamer** in the
+  CREST ensemble (mean ~1.5 wells populated).
+- χ1 (near backbone) is more determined (63%) than χ2 (42%); **aromatic side chains are the
+  floppiest (36%)** — the NMe-Trp χ in cremp_sharp is exactly this case.
+- **This explains the χ ceiling quantitatively:** `chi_peptide_ok` needs every χ right at
+  once, but with ~44% of χ multimodal, almost every peptide has ≥1 χ slot where "the
+  dominant conformer's rotamer" is ill-defined (≈0.56^(#χ) → a few %). So most of the ~0.15
+  ceiling is genuine multimodality, not model weakness.
+
+**Implication:** the single-dominant χ target is fundamentally ill-posed for ~44% of slots.
+Reframe to the rotamer **distribution / top-K** (Step 2) and seed multiple rotamer sets — the
+goal is to reproduce the CREST rotamer *distribution*, not one conformer.
 
 ## Deferred follow-ups
 
