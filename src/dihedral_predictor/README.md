@@ -2,98 +2,117 @@
 
 ## Purpose
 
-Predict a macrocyclic peptide's **dominant-conformer backbone dihedrals** from
-per-residue topology, and seed constrained distance-geometry from the prediction.
+Predict a macrocyclic peptide's **dominant-conformer dihedrals** (backbone φ/ψ/ω and
+side-chain χ) from per-residue topology, and seed conformer generation from the
+prediction — so the sampler can reach the CREST-dominant basin it otherwise misses.
 
-This module is the generalizable fix for the MMFF↔CREST energy-rank **inversion**
-characterized in issue #19: for a large fraction of cyclic peptides the
-CREST-dominant conformer is MMFF-disfavoured, so the MMFF/MC explorer never visits
-it and MACE (a re-scorer) cannot recover a basin that was never sampled. Issue #19
-showed (a) the inversion is pervasive and not predictable from cheap features, and
-(b) crucially, the inaccessible feature is **sparse** — the CREST-dominant differs
-from the easily-found MMFF-best conformer by only ~2 backbone dihedrals (median).
-So predicting the dominant fold is tractable, and unlike reference-seeding (which
-needs a per-peptide CREST ensemble) a trained model **generalizes** to novel
-peptides: it needs only the molecular topology at inference.
+This module targets the MMFF↔CREST energy-rank **inversion** (issue #19): for many
+cyclic peptides the CREST-dominant conformer is MMFF-disfavoured, so the MMFF/MC
+explorer never visits it and MACE (a re-scorer) cannot recover an unsampled basin.
+The project goal is to reproduce the **CREST conformer distribution** cheaply; unlike
+per-peptide reference-seeding, a trained model **generalizes** — it needs only the
+molecule's topology at inference.
 
-The predicted dihedrals are turned into seed conformers via the constrained-DG
-machinery in [`torsional_sampling.py`](../torsional_sampling.py); those seeds are
-added to the sampler pool so the MC walk can start from and retain the dominant
-basin.
+**Backbone and side-chain χ are two SEPARATE models** (`DihedralPredictor` and
+`ChiPredictor`), trained independently with no shared weights, so adding χ cannot
+regress backbone fidelity. At seeding, the backbone model drives constrained
+distance-geometry (φ/ψ/ω) and the χ model sets side chains via `SetDihedralDeg`.
+
+### Status (2026-06-30)
+
+The end-to-end mechanism is **validated**: injecting the true CREST-dominant geometry as
+a seed reproduces the dominant basin (`cov_bw_ceil` ≈ the dominant's CREST weight). The
+current **learned** prediction, however, is not yet accurate enough to land the strict
+0.5 Å all-atom basin match on the hardest peptides — binned-dihedral error compounds
+across the molecule. A key reframing: for cremp_sharp the inversion is **side-chain-rotamer
+driven** (the backbone fold is already reachable de-novo), so χ precision is the active
+lever there. See `docs/dihedral_predictor_plan.md` for the full findings ledger.
 
 ## Module contents
 
-- **`residues.py`** — feature and target extraction. Everything is derived from
-  the RDKit mol in `get_backbone_dihedrals` order, so per-residue inputs and
-  (phi, psi, omega) targets are aligned by construction (no sequence-string ↔
-  atom-index matching). `residue_features` builds per-residue physico-chemical
-  descriptors (N-methylation, glycine, D/L chirality, proline, side-chain heavy
-  count / aromaticity / H-bond donors+acceptors); these are mol-derived so they
-  generalize to non-standard residues. `neighbor_augment` concatenates cyclic
-  ±window neighbour descriptors (neighbours strongly drive backbone propensities).
-  `omega_quads` builds omega atom-quads from consecutive residues (aligned by
-  construction); `backbone_dihedral_values` reads phi/psi/omega for a conformer.
-  Binning helpers (`angle_to_bin`/`bin_to_center`, `omega_to_bin`/
-  `omega_bin_to_center`) discretise the circular targets for classification.
+- **`residues.py`** — feature and dihedral extraction, all derived from the RDKit mol in
+  **ring order** (`ordered_backbone_dihedrals` chains residues by their amide
+  connectivity; `get_backbone_dihedrals` alone is NOT ring-sequential for many
+  macrocycles, which would corrupt ω and the cyclic neighbour features). `residue_features`
+  builds per-residue physico-chemical descriptors (NMe, Gly, D/L, proline, side-chain
+  heavy count / aromaticity / H-bond donors+acceptors); `neighbor_augment` concatenates
+  cyclic ±window neighbour descriptors. `omega_quads` builds ω from consecutive residues;
+  `sidechain_chi_quads`/`sidechain_chi_values` enumerate side-chain χ (χ1…χ`MAX_CHI`),
+  walking from Cβ outward and emitting a χ only when its rotated bond is non-ring, with
+  **canonical-rank** branch tie-breaking so a χ slot is the same chemical dihedral on the
+  CREMP extraction mol and the smi seed mol. Binning helpers discretise the circular
+  targets (φ/ψ/χ into `PHI_PSI_BINS`, ω into cis/trans).
 
-- **`data.py`** — `extract_record` builds one record per peptide (base features +
-  the **dominant**, i.e. max-Boltzmann-weight, conformer's binned dihedrals).
-  `build_dataset` runs this over CREMP and saves a peptide-split pickle (split is
-  by peptide so no sequence leaks). `DihedralDataset` applies cyclic neighbour
-  augmentation per peptide on its true length (padding never leaks across the ring
-  closure); `collate` pads per batch with a mask.
+- **`data.py`** — `extract_record` builds one record per peptide (base features + the
+  **dominant** conformer's binned φ/ψ/ω **and** χ targets + a χ presence mask).
+  `build_dataset` runs this over CREMP and saves a peptide-split pickle (no sequence
+  leaks). `DihedralDataset`/`collate` apply per-peptide cyclic augmentation and pad per
+  batch; both backbone and χ targets are carried so one dataset serves both models.
 
-- **`model.py`** — `DihedralPredictor`, a small transformer encoder over residues
-  with three classification heads (phi, psi, omega). Two deliberate choices:
-  **ring size is injected** as a global feature (omega cis/trans is strongly
-  ring-size dependent — strained tetrapeptides favour cis), and there is **no
-  absolute positional encoding** (a head-to-tail macrocycle has no canonical start;
-  local order comes from neighbour augmentation, longer range from attention).
+- **`model.py`** — `DihedralPredictor` (backbone: φ/ψ/ω heads) and `ChiPredictor`
+  (separate: per-residue χ1…χ`MAX_CHI` heads). Both: a small transformer encoder over
+  residues, **ring size injected** as a global feature (ω cis/trans is strongly ring-size
+  dependent), and **no absolute positional encoding** (a macrocycle has no canonical
+  start; local order from neighbour augmentation, longer range from attention).
 
-- **`train.py`** — masked cross-entropy training; reports per-residue exact and
-  within-1-bin accuracy plus the seeding proxy `peptide_all_ok` (fraction of
-  peptides whose every backbone dihedral is within tolerance), against a majority
-  baseline. Checkpoints the best model by `peptide_all_ok`.
+- **`train.py`** — `train` (backbone; checkpoints best by `peptide_all_ok`) and `train_chi`
+  (separate χ model; checkpoints best by `chi_peptide_ok`). Masked cross-entropy; reports
+  within-1-bin accuracy and the per-peptide all-correct seeding proxies.
 
-- **`seed.py`** — `load_model`, `predict_dihedrals` (argmax bin → angle), and
-  `seed_conformers` (predict → constrained-DG embed). Bounds constrain phi, psi
-  **and** omega (the base `make_constrained_bounds` does only phi/psi).
+- **`seed.py`** — `load_model`/`load_chi_model`, `predict_dihedrals`/`predict_chi`, and
+  `seed_conformers`: predict backbone → constrained-DG embed (φ/ψ **and** ω, the base
+  `make_constrained_bounds` does only φ/ψ) → optionally set predicted χ on each seed with
+  `apply_chi` (`SetDihedralDeg`; χ bonds are not ring-closure-constrained). Constraint
+  tolerance defaults to **±60°** (tighter thrashes the from-scratch DG embed: ~90 s vs
+  ~2 s at 30° vs 60°; ±60° is also the right precision since rotamers are 120° apart).
 
-Runnable entry points: `scripts/build_dihedral_dataset.py`,
-`scripts/train_dihedral_predictor.py`.
+Runnable entry points (in `scripts/`): `build_dihedral_dataset.py`,
+`train_dihedral_predictor.py`, `train_chi_predictor.py`, `sweep_dihedral_model.py`
+(capacity/window sweep), `resplit_topology.py` (composition split for generalisation),
+`validate_seeding.py` (RMSD proxy), `validate_seeding_coverage.py` (real-MCMM CREST
+coverage, with `--oracle`/`--no_relax_seed`/`--chi_ckpt`/`--mace_relax_seed`/`--backbone`),
+and `aggregate_seeding_coverage.py` (coverage lift over an inverted test set).
 
 ## Data contracts
 
-- **CREMP pickle** (input to extraction): `{"rd_mol": Chem.Mol with N conformers
-  (explicit Hs), "conformers": [{"boltzmannweight": float}, ... len N]}`.
-- **Dataset pickle** (`build_dataset` output): dict with `seqs` (list[str]),
-  `feats` (list of `(n_res, 8)` float32), `phi_bin`/`psi_bin`/`omega_bin` (lists of
-  `(n_res,)` int64), `split` (object array of 'train'/'val'/'test'), `phi_psi_bins`.
-- **Model I/O**: input `x` `(B, L, F)` float (F = `8 * (2*window+1)`), `mask`
-  `(B, L)` bool; output three logit tensors `(B, L, 24)`, `(B, L, 24)`, `(B, L, 2)`.
-- **`seed_conformers`**: takes an RDKit mol with explicit Hs, adds conformers in
-  place, returns their conformer IDs (empty if the predicted dihedral set is
-  geometrically infeasible — a free ring-closure rejection).
+- **CREMP pickle** (extraction input): `{"rd_mol": Chem.Mol with N conformers (explicit
+  Hs), "conformers": [{"boltzmannweight": float}, … N], "smiles": str}`.
+- **Dataset pickle**: dict with `seqs` (list[str]), `feats` (list of `(n_res, 8)` float32),
+  `phi_bin`/`psi_bin`/`omega_bin` (lists of `(n_res,)` int64), `chi_bin` (list of
+  `(n_res, MAX_CHI)` int64), `chi_mask` (list of `(n_res, MAX_CHI)` bool), `split` (object
+  array), `phi_psi_bins`, `max_chi`.
+- **Backbone model I/O**: input `x` `(B, L, F)` (F = `8*(2*window+1)`), `mask` `(B, L)`;
+  output logits `(B,L,24)`, `(B,L,24)`, `(B,L,2)`.
+- **Chi model I/O**: same input; output logits `(B, L, MAX_CHI, 24)`.
+- **`seed_conformers`**: takes a mol with explicit Hs (built as
+  `Chem.AddHs(Chem.MolFromSmiles(smi))`), adds conformers in place, returns their IDs
+  (empty if the predicted backbone is geometrically infeasible — a free DG rejection).
 
 ## Critical parameters and constraints
 
-- **`window`** must match between training and inference (it sets the input feature
-  dim). It is stored in the checkpoint and returned by `load_model`.
-- **`PHI_PSI_BINS = 24`** (15° bins): a bin is ~the constrained-DG tolerance, so a
-  within-1-bin prediction lands inside the ±30° seeding window. Changing this
-  invalidates existing checkpoints and datasets.
-- **`OMEGA_CIS_CUTOFF = 90°`** defines the cis/trans split for the omega target.
-- **Alignment invariant**: features and targets are both produced in
-  `get_backbone_dihedrals` order. Any new feature/target must preserve this order.
-- The split is by peptide; do not reshuffle a trained checkpoint's dataset or test
-  metrics leak.
+- **`window`** (backbone) and the χ model's window must each match between training and
+  inference; both are stored in the checkpoint and returned by the loaders.
+- **`PHI_PSI_BINS = 24`** (15°), **`OMEGA_CIS_CUTOFF = 90°`**, **`MAX_CHI = 4`** — changing
+  any invalidates existing checkpoints/datasets.
+- **Ring-order + canonical-χ invariant**: features and targets are produced in
+  `ordered_backbone_dihedrals` order, and χ slots are canonical-rank-consistent so a model
+  trained on CREMP mols applies correctly to smi-built seed mols. Preserve both.
+- **Seeding tolerance ±60°** (not the Pool-B 30°) — tighter makes constrained DG thrash.
+- **`get_mol_PE_mcmm(extra_seed_coords=, relax_seeds=)`** (in `confsweeper.py`) is the
+  injection point. `relax_seeds=False` keeps seeds at their predicted geometry (MACE-scored,
+  appended as protected basins) — required for inverted peptides, where MMFF relaxation
+  pushes a good seed off the MMFF-disfavoured dominant.
+- The split is by peptide; do not reshuffle a trained checkpoint's dataset or test metrics
+  leak. `resplit_topology.py` provides a stronger composition (permutation-aware) split.
 
 ## Dependencies on other modules
 
-- Consumes `torsional_sampling.get_backbone_dihedrals` (residue ordering),
-  `set_dihedral_bounds`, and `embed_constrained` (constrained-DG seeding).
-- Consumes the CREMP raw pickles under `data/raw/cremp/`.
-- Produces seed conformers for the confsweeper sampler pool (Pool B augmentation):
-  the downstream consumer is the MMFF/MC + MACE pipeline in `confsweeper.py`.
-- Requires `torch` (model/training) and `rdkit` (features/embedding).
+- Consumes `torsional_sampling` (`ordered`/`get_backbone_dihedrals` ordering,
+  `set_dihedral_bounds`, `embed_constrained`) and the CREMP raw pickles under
+  `data/raw/cremp/`.
+- Produces seed conformers for the confsweeper sampler: injected via
+  `confsweeper.get_mol_PE_mcmm(extra_seed_coords=…)`. Coverage is scored against the
+  raw-CREST, CREST-Boltzmann-weighted ceiling (single-provenance Kabsch).
+- Requires `torch` (models) and `rdkit` (features/embedding); seeding/coverage use the
+  MACE calculator from `confsweeper`.
 ```

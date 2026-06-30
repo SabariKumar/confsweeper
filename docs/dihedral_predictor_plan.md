@@ -28,8 +28,13 @@ model at inference, not a per-peptide CREST reference).
 | 4 | Seeding-speed diagnosis | ✓ complete (2026-06-30; tol30 embed ~90 s → tol60 ~2-5 s; tol60 set as default) |
 | 5 | Seeding validation v1 (RMSD proxy: seed → relax → min RMSD to dominant, vs unconstrained ETKDG) | ✓ complete (2026-06-30; mixed — signal but no clear basin-landing win) |
 | 6 | Tighter-tolerance precision probe | ✓ complete (2026-06-30; tol40 ≈ tol60, baseline still wins <0.5 Å → tolerance is NOT the limiter, prediction accuracy is; kept tol60) |
-| 7 | **Real MCMM + coverage integration** — feed predicted-dihedral seeds into the actual confsweeper sampler (`extra_seed_coords` param, wired + smoke-tested), measure `cov_bw_ceil` via `union_basin_count`. The true test (MC+MACE refine the seed; the RMSD proxy omits this). | in progress |
-| 8 | **Model improvements** — larger model / wider neighbour window / top-K (multi-modal) targets / topology-split generalisation eval, then re-validate. | pending |
+| 7 | Real MCMM + coverage integration (`extra_seed_coords` + `relax_seeds` in `get_mol_PE_mcmm`) | ✓ complete (2026-06-30; coverage metric fixed to raw-CREST + CREST-Boltzmann + single-provenance Kabsch; oracle validates at 0.535; no-relax seed path added; learned seed still 0 → accuracy is the wall) |
+| 8a | Capacity/window sweep | ✓ complete (2026-06-30; peptide_all_ok 0.36 → 0.43, w2_d256_l6 best; capacity is the lever) |
+| 8b | Separate side-chain χ predictor (`ChiPredictor`, own checkpoint — backbone model untouched) + χ seeding via `SetDihedralDeg` | ✓ complete (2026-06-30; chi_within1 0.57, chi_peptide_ok 0.12; backbone+χ and +MACE-relax still cov 0 on cremp_sharp — binned prediction compounds beyond the 0.5 Å match) |
+| 8c | Reframing: backbone-only coverage shows cremp_sharp's inversion is side-chain-driven (backbone reachable de-novo) | ✓ complete (2026-06-30) |
+| 9 | **Aggregate coverage lift** over an inverted test set (all-atom + backbone, baseline vs learned-seeded) — to size the gap and find backbone-driven inversions seeding *can* help (`scripts/aggregate_seeding_coverage.py`) | in progress |
+| 10 | **Side-chain χ precision** — regression vs binning, χ-conditioned-on-backbone, and/or combine seeding with issue-17 concerted-χ MC moves; re-validate | pending |
+| — | Deferred: top-K (multi-modal) targets; topology-split generalisation eval (`resplit_topology.py` built) | pending |
 
 ## Architecture (Steps 1-4)
 
