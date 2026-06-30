@@ -81,6 +81,39 @@ def omega_bin_to_center(bin_idx: int) -> float:
     return 0.0 if bin_idx == 0 else 180.0
 
 
+def backbone_feature_block(phi_deg, psi_deg, omega_trans) -> np.ndarray:
+    """
+    Per-residue backbone descriptor for conditioning the chi predictor.
+
+    Side-chain rotamers are backbone-dependent (Dunbrack), so the chi model is fed
+    the residue's own backbone: [sin φ, cos φ, sin ψ, cos ψ, ω_trans]. sin/cos give
+    a smooth circular encoding; ω as a cis/trans flag. Used with TRUE backbone bins
+    at training and PREDICTED backbone at seeding.
+
+    Params:
+        phi_deg: array-like : per-residue phi in degrees
+        psi_deg: array-like : per-residue psi in degrees
+        omega_trans: array-like : per-residue omega trans flag (1 trans, 0 cis)
+    Returns:
+        np.ndarray of shape (n_res, 5), dtype float32
+    """
+    phi = np.deg2rad(np.asarray(phi_deg, dtype=np.float64))
+    psi = np.deg2rad(np.asarray(psi_deg, dtype=np.float64))
+    return np.stack(
+        [
+            np.sin(phi),
+            np.cos(phi),
+            np.sin(psi),
+            np.cos(psi),
+            np.asarray(omega_trans, dtype=np.float64),
+        ],
+        axis=1,
+    ).astype(np.float32)
+
+
+N_BACKBONE_FEATURES = 5
+
+
 # --- backbone atom bookkeeping ------------------------------------------
 
 

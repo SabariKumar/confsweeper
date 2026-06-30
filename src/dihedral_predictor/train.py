@@ -239,11 +239,15 @@ def train_chi(
     n_layers: int = 6,
     window: int = 2,
     device: str = "cuda",
+    chi_cond: bool = True,
+    chi_cond_neighbors: bool = True,
+    use_pred_backbone: bool = False,
 ) -> dict:
     """
     Train the SEPARATE side-chain chi predictor and checkpoint the best model
     (by chi_peptide_ok). Independent of the backbone DihedralPredictor — no shared
-    weights — so backbone fidelity is unaffected.
+    weights — so backbone fidelity is unaffected. `chi_cond=True` conditions chi on
+    the (true, at train) backbone dihedrals (Dunbrack backbone-dependent rotamers).
 
     Params:
         dataset_path: str : dataset pickle from build_dataset (carries chi targets)
@@ -262,8 +266,22 @@ def train_chi(
 
     dev = torch.device(device if torch.cuda.is_available() else "cpu")
     data = load_dataset(dataset_path)
-    tr = DihedralDataset(data, "train", window=window)
-    va = DihedralDataset(data, "val", window=window)
+    tr = DihedralDataset(
+        data,
+        "train",
+        window=window,
+        chi_cond=chi_cond,
+        chi_cond_neighbors=chi_cond_neighbors,
+        use_pred_backbone=use_pred_backbone,
+    )
+    va = DihedralDataset(
+        data,
+        "val",
+        window=window,
+        chi_cond=chi_cond,
+        chi_cond_neighbors=chi_cond_neighbors,
+        use_pred_backbone=use_pred_backbone,
+    )
     in_features = tr[0]["x"].shape[1]
     tl = DataLoader(tr, batch_size=batch_size, shuffle=True, collate_fn=collate)
     vl = DataLoader(va, batch_size=batch_size, collate_fn=collate)
@@ -300,6 +318,7 @@ def train_chi(
                     "d_model": d_model,
                     "n_layers": n_layers,
                     "window": window,
+                    "chi_cond": chi_cond,
                     "metrics": m,
                 },
                 out_ckpt,

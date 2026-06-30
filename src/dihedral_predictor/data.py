@@ -25,6 +25,8 @@ from .residues import (
     PHI_PSI_BINS,
     angle_to_bin,
     backbone_dihedral_values,
+    backbone_feature_block,
+    bin_to_center,
     neighbor_augment,
     omega_to_bin,
     residue_features,
@@ -152,18 +154,47 @@ def build_dataset(
 class DihedralDataset(torch.utils.data.Dataset):
     """One item per peptide: cyclic-neighbour-augmented features + binned targets."""
 
-    def __init__(self, data: dict, split: str, window: int = 1):
+    def __init__(
+        self,
+        data: dict,
+        split: str,
+        window: int = 1,
+        chi_cond: bool = False,
+        chi_cond_neighbors: bool = True,
+        use_pred_backbone: bool = False,
+    ):
         """
         Params:
             data: dict : dataset dict from build_dataset / load_dataset
             split: str : 'train' | 'val' | 'test'
             window: int : neighbour augmentation half-width
+            chi_cond: bool : if True, condition chi on the backbone block (sin/cos
+                phi,psi + omega-trans, from TRUE bins)
+            chi_cond_neighbors: bool : if True (and chi_cond), the backbone block is
+                concatenated BEFORE neighbour augmentation, so each residue also sees
+                its ±window neighbours' backbones; if False, the block is appended
+                AFTER augmentation (own-backbone only) — an ablation to isolate the
+                neighbour-backbone contribution
         Returns:
             None
         """
         self.window = window
+        self.chi_cond = chi_cond
+        self.chi_cond_neighbors = chi_cond_neighbors
+        # use_pred_backbone: condition chi on the backbone model's PREDICTED bins
+        # (added by add_predicted_backbone.py) instead of the true bins — closes the
+        # teacher-forcing gap so chi training matches seeding inference.
+        self.use_pred_backbone = use_pred_backbone
         idx = [i for i, s in enumerate(data["split"]) if s == split]
         self.feats = [data["feats"][i] for i in idx]
+        bb_src = (
+            ("phi_bin_pred", "psi_bin_pred", "omega_bin_pred")
+            if use_pred_backbone
+            else ("phi_bin", "psi_bin", "omega_bin")
+        )
+        self.phi_c = [data[bb_src[0]][i] for i in idx]  # backbone for conditioning
+        self.psi_c = [data[bb_src[1]][i] for i in idx]
+        self.omega_c = [data[bb_src[2]][i] for i in idx]
         self.phi = [data["phi_bin"][i] for i in idx]
         self.psi = [data["psi_bin"][i] for i in idx]
         self.omega = [data["omega_bin"][i] for i in idx]
@@ -175,7 +206,17 @@ class DihedralDataset(torch.utils.data.Dataset):
         return len(self.feats)
 
     def __getitem__(self, i: int) -> dict:
-        x = neighbor_augment(self.feats[i], window=self.window)
+        feats = self.feats[i]
+        block = None
+        if self.chi_cond:
+            phi_c = np.array([bin_to_center(b) for b in self.phi_c[i]])
+            psi_c = np.array([bin_to_center(b) for b in self.psi_c[i]])
+            block = backbone_feature_block(phi_c, psi_c, self.omega_c[i])
+            if self.chi_cond_neighbors:
+                feats = np.concatenate([feats, block], axis=1)
+        x = neighbor_augment(feats, window=self.window)
+        if block is not None and not self.chi_cond_neighbors:
+            x = np.concatenate([x, block], axis=1)  # own-backbone only (post-augment)
         return {
             "x": torch.from_numpy(x),
             "phi": torch.from_numpy(self.phi[i]),

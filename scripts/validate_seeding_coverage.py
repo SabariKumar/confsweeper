@@ -150,6 +150,12 @@ def _run(smi, hw, calc, extra, n_seeds, sidechain, relax_seeds=True):
     is_flag=True,
     help="measure coverage on backbone atoms (N/Ca/C) only, not all heavy atoms",
 )
+@click.option(
+    "--chi_sample",
+    is_flag=True,
+    help="sample diverse rotamers per seed (chi as prior; for MACE refinement)",
+)
+@click.option("--chi_temp", default=1.0, help="chi sampling temperature")
 def main(
     peptide,
     pickle_dir,
@@ -162,6 +168,8 @@ def main(
     chi_ckpt,
     mace_relax_seed,
     backbone,
+    chi_sample,
+    chi_temp,
 ):
     d = pickle.load(open(f"{pickle_dir}/{peptide}.pickle", "rb"))
     smi = d["smiles"]
@@ -199,6 +207,8 @@ def main(
         n_attempts=n_conf,
         chi_model=chi_model,
         chi_window=chi_window,
+        chi_sample=chi_sample,
+        chi_temperature=chi_temp,
     )
     learned = [seed_src.GetConformer(c).GetPositions() for c in seed_ids]
     if mace_relax_seed and learned:

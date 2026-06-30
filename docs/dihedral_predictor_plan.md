@@ -327,6 +327,100 @@ how much of the *broader* inverted population is backbone-driven vs side-chain-d
 backbone seeding may still help peptides whose inversion is genuinely a backbone refold,
 even though cremp_sharp's is not.
 
+### Findings 2026-06-30 — Step 10: backbone-conditioning ~doubles chi accuracy
+
+Conditioning the chi predictor on the residue's own backbone (sin/cos φ,ψ + ω-trans —
+Dunbrack backbone-dependent rotamers; `residues.backbone_feature_block`,
+`DihedralDataset(chi_cond=True)`, `train_chi(chi_cond=True)`):
+
+| chi model | chi_within1 | chi_peptide_ok |
+|---|---|---|
+| unconditioned | 0.57 | 0.12 |
+| backbone-conditioned (TRUE backbone) | **0.76** | **0.26** |
+
+Roughly doubles the per-peptide seeding proxy. Trained teacher-forced on true backbone;
+at seeding the chi model uses PREDICTED backbone (seed.predict_chi(backbone=...)), so the
+realistic number is lower — measuring the teacher-forcing gap next to decide whether to
+retrain on predicted backbone.
+
+### Findings 2026-06-30 — Step 9: aggregate coverage lift (15 inverted test peptides)
+
+`scripts/aggregate_seeding_coverage.py`, baseline (de-novo) vs learned backbone+chi seeding
+(no-relax), cov_bw_ceil @0.75:
+
+| atoms | baseline | seeded | lift | seeded>base |
+|---|---|---|---|---|
+| all-atom | 0.000 | 0.000 | +0.000 | 13% |
+| backbone | 0.652 | **0.859** | **+0.207** | 40% |
+
+**Backbone seeding works** — +0.21 mean backbone-coverage lift; for backbone-*driven*
+inversions (bb baseline ≈ 0: P.A.Q.I, F.q.Mew.W.Y, Q.P.N.V.A) it lifts 0.00 → 1.00. But
+**all-atom coverage is a universal wall at 0.000** — even where the backbone is recovered,
+side-chain rotamers + the strict ≤0.75 Å all-atom match are not met. So learned seeding has
+real value for backbone-driven inversions; the side-chain rotamers are the remaining gap.
+
+### Findings 2026-06-30 — Step 10: neighbour-backbone conditioning does NOT help chi
+
+Ablation (true backbone): own-backbone-only chi = 0.757 / 0.258 vs neighbour-inclusive
+0.755 / 0.261 — **identical.** The chi-relevant signal is the residue's OWN backbone, not
+its neighbours' (consistent with backbone-dependent rotamer libraries). The real chi lever
+is the teacher-forcing gap: conditioning helps with TRUE backbone (0.26) but barely at
+inference with PREDICTED backbone (chi_peptide_ok 0.145 vs unconditioned 0.12) — training
+chi on predicted/noised backbone is the next thing to try.
+
+### Findings 2026-06-30 — Step 10: teacher-forcing fix does NOT recover the conditioning benefit
+
+Trained the chi model on the backbone model's PREDICTED backbone (train == inference;
+`add_predicted_backbone.py` → `dataset_pred.pkl`, `DihedralDataset(use_pred_backbone=True)`):
+
+| chi model | chi_within1 | chi_peptide_ok |
+|---|---|---|
+| unconditioned | 0.57 | 0.12 |
+| cond on TRUE backbone (teacher-forced, optimistic) | 0.76 | 0.26 |
+| cond on TRUE backbone, eval on predicted | 0.59 | 0.145 |
+| **cond on PREDICTED backbone (train=inference)** | 0.60 | **0.149** |
+
+Training on predicted backbone (0.149) ≈ true-bb-eval-on-predicted (0.145): the fix does
+not help. The limiter is the **backbone prediction noise itself** (within-1-bin 0.72) —
+backbone-conditioning only pays off with an accurate backbone, which we don't have. The
+realistic chi ceiling is ~0.15.
+
+**Synthesis of the side-chain wall:** all-atom coverage requires backbone AND all χ correct
+simultaneously; with backbone peptide_all_ok ~0.43 and chi_peptide_ok ~0.15 (both noisy and
+compounding), the joint probability is low → all-atom cov ≈ 0. Errors compound:
+backbone-accuracy limits χ-accuracy limits all-atom coverage. **Realistic deliverable:
+learned backbone seeding recovers backbone-driven inversions (+0.21 backbone-coverage lift);
+all-atom requires either much higher joint accuracy or a refinement-based side-chain step
+(MACE / issue-17 concerted-χ MC from a good seed), not pure prediction.**
+
+### Findings 2026-06-30 — Step 10: refinement-based side chains also fail the all-atom match
+
+Implemented chi *sampling* (chi model as a rotamer prior: `predict_chi(sample=True)`,
+`seed_conformers(chi_sample=True)`) so each seed gets a DIFFERENT rotamer set, plus
+per-seed MACE-relax, so a downstream relaxation can settle whichever rotamer set is closest.
+Tested on P.A.Q.I (backbone-driven: de-novo misses the backbone, seeding recovers it):
+
+| run | all-atom cov @0.75 |
+|---|---|
+| baseline | 0.000 |
+| seeded (24 sampled-χ + MACE-relax) | **0.000** |
+| oracle (true geometry) | 1.000 |
+
+24 diverse sampled-rotamer seeds + MACE-relax still land >0.75 Å all-atom from the ensemble,
+while the oracle covers fully. So refinement-based side chains (sampled-χ prior + MACE-relax)
+does NOT crack all-atom coverage either — the learned backbone+χ seed is too far in full-atom
+space for MACE to settle onto the dominant.
+
+**Overall Lever-5 conclusion.** Across prediction (backbone, +χ, +backbone-conditioning,
++teacher-forcing fix) and refinement (sampled-χ + MACE-relax), **all-atom CREST coverage of
+inverted peptides was not achieved** — the side-chain rotamer placement at ≤0.75 Å all-atom
+is a persistent wall (compounding backbone×χ error; oracle confirms it is achievable in
+principle). **What works and ships:** learned *backbone* seeding recovers backbone-driven
+inversions (+0.21 backbone-coverage lift, 0→1 where de-novo misses the fold), with a fully
+validated infra/mechanism (oracle → dominant weight). All-atom side chains remain open —
+likely needs a fundamentally higher-accuracy side-chain model or a dedicated rotamer-search
++ MACE-scoring stage, not the current predict-then-seed approach.
+
 ## Deferred follow-ups
 
 - **Top-K / multi-modal targets** — predict more than the single dominant conformer to
