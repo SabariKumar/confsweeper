@@ -201,26 +201,33 @@ def sidechain_chi_quads(mol: Chem.Mol, max_chi: int = MAX_CHI) -> list[list[tupl
     Returns:
         list (per residue, ring order) of lists of 4-tuples (0 to max_chi each)
     """
+    # Break branch ties by canonical atom rank (graph-invariant) so a chi slot is
+    # the same chemical dihedral on the CREMP mol (extraction) and the smi-built
+    # seed mol (where predicted chi are applied) — essential for seeding.
+    ranks = list(Chem.CanonicalRankAtoms(mol, breakTies=True))
     out = []
     for n, ca, c in residue_atoms(mol):
-        cb = next(
+        cb_nbrs = sorted(
             (
                 nb.GetIdx()
                 for nb in mol.GetAtomWithIdx(ca).GetNeighbors()
                 if nb.GetAtomicNum() > 1 and nb.GetIdx() not in (n, c)
             ),
-            None,
+            key=lambda a: ranks[a],
         )
-        if cb is None:  # glycine
+        if not cb_nbrs:  # glycine
             out.append([])
             continue
-        path = [n, ca, cb]
+        path = [n, ca, cb_nbrs[0]]
         while len(path) < max_chi + 3:
-            bb, aa = path[-1], path[-2]
+            bb = path[-1]
             nbrs = sorted(
-                nb.GetIdx()
-                for nb in mol.GetAtomWithIdx(bb).GetNeighbors()
-                if nb.GetAtomicNum() > 1 and nb.GetIdx() not in path
+                (
+                    nb.GetIdx()
+                    for nb in mol.GetAtomWithIdx(bb).GetNeighbors()
+                    if nb.GetAtomicNum() > 1 and nb.GetIdx() not in path
+                ),
+                key=lambda a: ranks[a],
             )
             if not nbrs:
                 break

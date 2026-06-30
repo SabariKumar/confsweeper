@@ -35,7 +35,12 @@ from confsweeper import (  # noqa: E402
     get_mace_calc,
     get_mol_PE_mcmm,
 )
-from dihedral_predictor.seed import load_model, seed_conformers  # noqa: E402
+from dihedral_predictor.residues import residue_atoms  # noqa: E402
+from dihedral_predictor.seed import (  # noqa: E402
+    load_chi_model,
+    load_model,
+    seed_conformers,
+)
 from mcmm import _kabsch_rmsd_pairwise  # noqa: E402
 
 
@@ -130,30 +135,88 @@ def _run(smi, hw, calc, extra, n_seeds, sidechain, relax_seeds=True):
     is_flag=True,
     help="keep seeds at predicted geometry (no MMFF relax)",
 )
-def main(peptide, pickle_dir, ckpt, n_seeds, n_conf, sidechain, oracle, no_relax_seed):
+@click.option(
+    "--chi_ckpt",
+    default=None,
+    help="separate chi model ckpt (sets side-chain chi on seeds)",
+)
+@click.option(
+    "--mace_relax_seed",
+    is_flag=True,
+    help="MACE-relax the predicted seeds before injecting (aligned with target, cheap for few seeds)",
+)
+@click.option(
+    "--backbone",
+    is_flag=True,
+    help="measure coverage on backbone atoms (N/Ca/C) only, not all heavy atoms",
+)
+def main(
+    peptide,
+    pickle_dir,
+    ckpt,
+    n_seeds,
+    n_conf,
+    sidechain,
+    oracle,
+    no_relax_seed,
+    chi_ckpt,
+    mace_relax_seed,
+    backbone,
+):
     d = pickle.load(open(f"{pickle_dir}/{peptide}.pickle", "rb"))
     smi = d["smiles"]
     cmol = d["rd_mol"]
     w = np.array([c["boltzmannweight"] for c in d["conformers"]], float)
     ms = Chem.AddHs(Chem.MolFromSmiles(smi))
-    heavy = [a.GetIdx() for a in ms.GetAtoms() if a.GetAtomicNum() > 1]
+    if backbone:
+        idx = [a for n, ca, c in residue_atoms(ms) for a in (n, ca, c)]
+    else:
+        idx = [a.GetIdx() for a in ms.GetAtoms() if a.GetAtomicNum() > 1]
+    heavy = (
+        idx  # coverage/ceiling atom set (heavy-atom by default, backbone if --backbone)
+    )
     match = cmol.GetSubstructMatch(ms, useChirality=True)
 
     basin_heavy, weights, dom_full = build_crest_ceiling(cmol, w, ms, match, heavy)
     print(
-        f"peptide={peptide}  CREST basins={len(weights)}  dominant CREST weight={weights.max():.3f}",
+        f"peptide={peptide}  atoms={'backbone' if backbone else 'heavy'}  "
+        f"CREST basins={len(weights)}  dominant CREST weight={weights.max():.3f}",
         flush=True,
     )
 
     hw = get_hardware_opts()
     calc = get_mace_calc()
     model, window = load_model(ckpt)
+    chi_model, chi_window = (None, 2)
+    if chi_ckpt:
+        chi_model, chi_window = load_chi_model(chi_ckpt)
     seed_src = Chem.Mol(ms)
     seed_src.RemoveAllConformers()
-    seed_ids = seed_conformers(seed_src, model, window=window, n_attempts=n_conf)
+    seed_ids = seed_conformers(
+        seed_src,
+        model,
+        window=window,
+        n_attempts=n_conf,
+        chi_model=chi_model,
+        chi_window=chi_window,
+    )
     learned = [seed_src.GetConformer(c).GetPositions() for c in seed_ids]
+    if mace_relax_seed and learned:
+        import ase
+        from ase.optimize import LBFGS
+
+        nums = [a.GetAtomicNum() for a in ms.GetAtoms()]
+        relaxed = []
+        for co in learned:
+            a = ase.Atoms(numbers=nums, positions=co)
+            a.calc = calc
+            LBFGS(a, logfile=None).run(fmax=0.05, steps=200)
+            relaxed.append(a.get_positions())
+        learned = relaxed
     print(
-        f"learned seeds: {len(learned)} | side-chain MC moves: {sidechain}", flush=True
+        f"learned seeds: {len(learned)} | chi_model: {chi_ckpt is not None} | "
+        f"mace_relax_seed: {mace_relax_seed} | side-chain MC moves: {sidechain}",
+        flush=True,
     )
 
     relax_seeds = not no_relax_seed

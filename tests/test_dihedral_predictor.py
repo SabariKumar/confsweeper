@@ -10,8 +10,9 @@ from rdkit.Chem import AllChem
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
 from dihedral_predictor.data import DihedralDataset, collate, extract_record
-from dihedral_predictor.model import DihedralPredictor
+from dihedral_predictor.model import ChiPredictor, DihedralPredictor
 from dihedral_predictor.residues import (
+    MAX_CHI,
     N_BASE_FEATURES,
     PHI_PSI_BINS,
     angle_to_bin,
@@ -23,9 +24,13 @@ from dihedral_predictor.residues import (
     omega_to_bin,
     residue_atoms,
     residue_features,
+    sidechain_chi_quads,
+    sidechain_chi_values,
 )
 from dihedral_predictor.seed import (
+    apply_chi,
     make_bounds_phi_psi_omega,
+    predict_chi,
     predict_dihedrals,
     seed_conformers,
 )
@@ -119,6 +124,8 @@ def test_dataset_and_collate():
         "phi_bin": [rec["phi_bin"], rec["phi_bin"]],
         "psi_bin": [rec["psi_bin"], rec["psi_bin"]],
         "omega_bin": [rec["omega_bin"], rec["omega_bin"]],
+        "chi_bin": [rec["chi_bin"], rec["chi_bin"]],
+        "chi_mask": [rec["chi_mask"], rec["chi_mask"]],
         "split": np.array(["train", "train"], dtype=object),
     }
     ds = DihedralDataset(data, "train", window=1)
@@ -126,6 +133,8 @@ def test_dataset_and_collate():
     batch = collate([ds[0], ds[1]])
     assert batch["x"].shape == (2, 4, N_BASE_FEATURES * 3)
     assert batch["mask"].sum().item() == 8
+    assert batch["chi"].shape == (2, 4, MAX_CHI)
+    assert batch["chi_mask"].shape == (2, 4, MAX_CHI)
 
 
 # --- model ---------------------------------------------------------------
@@ -165,4 +174,61 @@ def test_predict_and_seed_pipeline():
     assert bounds is None or isinstance(bounds, np.ndarray)
     # full pipeline must not crash; returns a (possibly empty) list of conf ids
     ids = seed_conformers(Chem.Mol(mol), m, window=1, n_attempts=3)
+    assert isinstance(ids, list)
+
+
+# --- side-chain chi ------------------------------------------------------
+
+# cyclo(Ala-Ser-Ala-Ser): Ser residues have chi1, Ala residues have none
+_CYCLO_AS = "C[C@@H]1NC(=O)[C@@H](CO)NC(=O)[C@@H](C)NC(=O)[C@@H](CO)NC1=O"
+
+
+def _cyclo_as():
+    mol = Chem.AddHs(Chem.MolFromSmiles(_CYCLO_AS))
+    AllChem.EmbedMolecule(mol, randomSeed=42)
+    return mol
+
+
+def test_chi_extraction_no_sidechain():
+    mol = _cycloala4()  # all Ala → no chi
+    quads = sidechain_chi_quads(mol)
+    assert all(len(q) == 0 for q in quads)
+    chi, mask = sidechain_chi_values(mol, mol.GetConformer().GetId())
+    assert chi.shape == (4, MAX_CHI) and mask.shape == (4, MAX_CHI)
+    assert not mask.any()
+
+
+def test_chi_extraction_serine():
+    mol = _cyclo_as()  # 2 Ala (0 chi), 2 Ser (chi1)
+    counts = sorted(len(q) for q in sidechain_chi_quads(mol))
+    assert counts == [0, 0, 1, 1]
+    _chi, mask = sidechain_chi_values(mol, mol.GetConformer().GetId())
+    assert mask.sum() == 2  # two chi1 present
+
+
+def test_chi_model_forward():
+    m = ChiPredictor(in_features=N_BASE_FEATURES * 3, d_model=32, n_layers=2)
+    x = torch.randn(2, 4, N_BASE_FEATURES * 3)
+    mask = torch.ones(2, 4, dtype=torch.bool)
+    out = m(x, mask)
+    assert out.shape == (2, 4, MAX_CHI, PHI_PSI_BINS)
+
+
+def test_chi_predict_and_apply():
+    mol = _cyclo_as()
+    cm = ChiPredictor(in_features=N_BASE_FEATURES * 3, d_model=32, n_layers=2)
+    chi_angles = predict_chi(mol, cm, window=1)
+    quads = sidechain_chi_quads(mol)
+    assert len(chi_angles) == len(quads)
+    assert all(len(a) == len(q) for a, q in zip(chi_angles, quads))
+    apply_chi(mol, mol.GetConformer().GetId(), chi_angles)  # must not raise
+
+
+def test_seed_with_chi_model_runs():
+    mol = _cyclo_as()
+    bb = DihedralPredictor(in_features=N_BASE_FEATURES * 3, d_model=32, n_layers=2)
+    cm = ChiPredictor(in_features=N_BASE_FEATURES * 3, d_model=32, n_layers=2)
+    ids = seed_conformers(
+        Chem.Mol(mol), bb, window=1, n_attempts=3, chi_model=cm, chi_window=1
+    )
     assert isinstance(ids, list)

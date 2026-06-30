@@ -253,6 +253,75 @@ is still 0.000: its seeds are added as protected basins but stay ~2 Å heavy-ato
 side chains). **The architecture is now sound; the sole remaining gap is prediction quality —
 specifically side-chain χ placement (next Step-8 lever).**
 
+### Findings 2026-06-30 — Step 8: separate chi model built; binned prediction can't hit the 0.5 Å match
+
+Built a SEPARATE side-chain chi predictor (`ChiPredictor`, own checkpoint — backbone model
+untouched, so no fidelity risk): chi extraction (`residues.sidechain_chi_quads`, canonical-rank
+tie-breaking so chi slots are consistent between the CREMP extraction mol and the smi seed
+mol), chi dataset targets, `train_chi`, and seeding via `SetDihedralDeg`
+(`seed_conformers(chi_model=...)`). 17 tests pass.
+
+Chi model (d256/l6/window2, val): **chi_within1 = 0.57, chi_peptide_ok = 0.12** — harder than
+backbone (rotamers depend on packing context the per-residue features capture less of).
+
+Coverage with backbone+chi seeding (cremp_sharp, no-relax path):
+
+| run | cov @0.5 | @0.75 | @1.0 |
+|---|---|---|---|
+| baseline | 0.000 | 0.000 | 0.000 |
+| seeded (backbone+chi) | **0.000** | 0.000 | 0.000 |
+| oracle (true dominant) | 0.535 | 0.576 | 0.581 |
+
+**Key finding: binned-dihedral prediction fundamentally cannot reach the 0.5 Å heavy-atom
+basin match.** Even all-dihedrals-within-1-bin (±22°) compounds across ~12 backbone + ~8 chi
+dihedrals to ~1-2 Å heavy-atom. The oracle covers only because it is the *exact* geometry.
+
+**The missing piece — MACE-relax the seed (not MMFF).** MACE's global min for cremp_sharp IS
+the dominant, so MACE-relaxing an approximately-correct predicted seed should pull it onto the
+dominant, correcting the binning error. Affordable for a handful of seeds (~3.8 s each) even
+though MACE-relax over the whole MCMM is infeasible (~600× MMFF). This is the next test.
+
+### Findings 2026-06-30 — MACE-relax-seed also fails on cremp_sharp; accuracy is the wall
+
+MACE-relaxing the backbone+chi seed before injection (cheap: ~20 seeds × ~3.8 s) still gives
+cov 0.000 at all thresholds (oracle 0.535). cov@1.0 = 0 means the seed is >1 Å heavy-atom
+from the dominant — it sits in a *neighbouring* MACE basin, so MACE-relax descends to that
+neighbour, not conf0. Complete chain: oracle 0.535 ✓ | backbone-only 0 | backbone+chi 0 |
+backbone+chi+MACE-relax 0.
+
+**Conclusion:** the Lever-5 infrastructure and mechanism are fully validated (a correct seed
+reproduces the dominant end-to-end), but the learned prediction is not accurate enough to
+land in cremp_sharp's dominant attraction basin. cremp_sharp is the hardest case (the
+canonical deep inversion, dominant CREST weight 0.535). Open directions: (a) measure
+*aggregate* coverage lift over many inverted test peptides — seeding may help the broader,
+milder-inversion population even if it misses the extreme case; (b) substantially improve
+prediction (regression for finer angles, chi conditioned on predicted backbone, more
+capacity/data); (c) document the validated infrastructure + the accuracy wall.
+
+### Findings 2026-06-30 — REFRAMING: cremp_sharp's inversion is a side-chain problem, not backbone
+
+Coverage uses heavy-atom (all non-H) RMSD. Re-measuring on BACKBONE atoms only (N/Cα/C,
+`--backbone`) is revealing:
+
+| atoms=backbone | cov @0.5 | @0.75 | @1.0 |
+|---|---|---|---|
+| baseline (de-novo) | 0.002 | **1.000** | 1.000 |
+| oracle | 1.000 | 1.000 | 1.000 |
+
+The cremp_sharp CREST ensemble is **0.995 one backbone fold** (10 backbone basins, one
+dominant), and **de-novo MMFF/MC already covers that backbone fold (cov 1.0 @0.75 Å).** So
+the backbone was never the bottleneck — the all-atom failure (0.000) is *entirely*
+side-chain rotamers. This aligns with issue-17 (cremp_sharp needs concerted Trp-χ moves).
+
+**Reframing:** for cremp_sharp, learned *backbone* seeding cannot help (backbone already
+reachable). The lever is precise *side-chain χ* placement, and the current χ accuracy
+(peptide_ok 0.12) plus the strict 0.5 Å all-atom match is the wall. (Note Step 5b's
+"~2 backbone-dihedral flips" measured CREST-dominant vs MMFF-*best*; MMFF/MC *exploration*
+still reaches the backbone even if the single MMFF-best differs.) Open question this raises:
+how much of the *broader* inverted population is backbone-driven vs side-chain-driven —
+backbone seeding may still help peptides whose inversion is genuinely a backbone refold,
+even though cremp_sharp's is not.
+
 ## Deferred follow-ups
 
 - **Top-K / multi-modal targets** — predict more than the single dominant conformer to

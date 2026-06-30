@@ -19,7 +19,7 @@ Design notes:
 import torch
 from torch import nn
 
-from .residues import OMEGA_BINS, PHI_PSI_BINS
+from .residues import MAX_CHI, OMEGA_BINS, PHI_PSI_BINS
 
 # Ring-size scale for the injected n_res feature (n_res / RING_NORM). This is a
 # soft normaliser to keep the feature ~O(1), NOT a cap: larger macrocycles map to
@@ -82,3 +82,66 @@ class DihedralPredictor(nn.Module):
         h = self.input(torch.cat([x, ringfeat], dim=-1))
         h = self.encoder(h, src_key_padding_mask=~mask)
         return self.phi_head(h), self.psi_head(h), self.omega_head(h)
+
+
+class ChiPredictor(nn.Module):
+    """Separate transformer for side-chain chi prediction (issue #20, Step 8).
+
+    Deliberately a standalone model — NOT chi heads bolted onto DihedralPredictor —
+    so training chi cannot regress backbone-prediction fidelity. Same architecture
+    and per-residue inputs as the backbone model; predicts every chi slot
+    (chi1..max_chi) per residue as an independent circular-bin classification.
+    Residues with fewer chi (or none) are handled by the per-(residue, slot) mask
+    at train/eval time. At seeding the predicted chi are set with SetDihedralDeg.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        d_model: int = 128,
+        n_layers: int = 3,
+        n_heads: int = 4,
+        dropout: float = 0.1,
+        phi_psi_bins: int = PHI_PSI_BINS,
+        max_chi: int = MAX_CHI,
+    ):
+        """
+        Params:
+            in_features: int : per-residue augmented feature dim (before ring size)
+            d_model: int : transformer hidden width
+            n_layers: int : number of encoder layers
+            n_heads: int : attention heads
+            dropout: float : dropout probability
+            phi_psi_bins: int : number of circular bins per chi
+            max_chi: int : chi slots per residue
+        Returns:
+            None
+        """
+        super().__init__()
+        self.max_chi = max_chi
+        self.phi_psi_bins = phi_psi_bins
+        self.input = nn.Linear(in_features + 1, d_model)
+        layer = nn.TransformerEncoderLayer(
+            d_model,
+            n_heads,
+            dim_feedforward=4 * d_model,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(layer, n_layers)
+        self.chi_head = nn.Linear(d_model, max_chi * phi_psi_bins)
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """
+        Params:
+            x: torch.Tensor : (B, L, F) augmented per-residue features
+            mask: torch.Tensor : (B, L) bool, True for real residues
+        Returns:
+            chi logits, shape (B, L, max_chi, phi_psi_bins)
+        """
+        ring = mask.sum(dim=1, keepdim=True).float() / RING_NORM
+        ringfeat = ring.unsqueeze(-1).expand(-1, x.shape[1], 1)
+        h = self.input(torch.cat([x, ringfeat], dim=-1))
+        h = self.encoder(h, src_key_padding_mask=~mask)
+        b, n_len, _ = h.shape
+        return self.chi_head(h).reshape(b, n_len, self.max_chi, self.phi_psi_bins)

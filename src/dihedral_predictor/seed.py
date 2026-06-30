@@ -22,11 +22,11 @@ relaxation downstream snaps each seed to the nearest basin minimum.
 import numpy as np
 import torch
 from rdkit import Chem
-from rdkit.Chem import rdDistGeom
+from rdkit.Chem import rdDistGeom, rdMolTransforms
 
 from torsional_sampling import embed_constrained, set_dihedral_bounds
 
-from .model import DihedralPredictor
+from .model import ChiPredictor, DihedralPredictor
 from .residues import (
     bin_to_center,
     neighbor_augment,
@@ -34,6 +34,7 @@ from .residues import (
     omega_quads,
     ordered_backbone_dihedrals,
     residue_features,
+    sidechain_chi_quads,
 )
 
 
@@ -54,6 +55,69 @@ def load_model(ckpt_path: str, device: str = "cpu") -> tuple[DihedralPredictor, 
     model.load_state_dict(ck["model"])
     model.eval()
     return model, ck["window"]
+
+
+def load_chi_model(ckpt_path: str, device: str = "cpu") -> tuple[ChiPredictor, int]:
+    """
+    Load the separate side-chain chi predictor from a checkpoint.
+
+    Params:
+        ckpt_path: str : checkpoint path from train_chi()
+        device: str : torch device string
+    Returns:
+        tuple (chi model in eval mode, neighbour window used at training time)
+    """
+    ck = torch.load(ckpt_path, map_location=device)
+    model = ChiPredictor(
+        ck["in_features"], d_model=ck["d_model"], n_layers=ck["n_layers"]
+    ).to(device)
+    model.load_state_dict(ck["model"])
+    model.eval()
+    return model, ck["window"]
+
+
+@torch.no_grad()
+def predict_chi(
+    mol: Chem.Mol, chi_model: ChiPredictor, window: int = 2, device: str = "cpu"
+) -> list[list[float]]:
+    """
+    Predict per-residue side-chain chi angles (degrees), one inner list per residue
+    in ring order, each of length = that residue's chi count (sidechain_chi_quads).
+
+    Params:
+        mol: Chem.Mol : peptide with explicit Hs
+        chi_model: ChiPredictor : trained chi model
+        window: int : neighbour augmentation half-width (must match training)
+        device: str : torch device
+    Returns:
+        list (per residue) of chi target angles in degrees
+    """
+    x = neighbor_augment(residue_features(mol), window=window)
+    xt = torch.from_numpy(x).unsqueeze(0).to(device)
+    mask = torch.ones(1, x.shape[0], dtype=torch.bool, device=device)
+    bins = chi_model(xt, mask)[0].argmax(-1)  # (n_res, MAX_CHI)
+    quads = sidechain_chi_quads(mol)
+    return [
+        [bin_to_center(int(bins[i, k])) for k in range(len(qs))]
+        for i, qs in enumerate(quads)
+    ]
+
+
+def apply_chi(mol: Chem.Mol, conf_id: int, chi_angles: list[list[float]]) -> None:
+    """
+    Set predicted side-chain chi on one conformer via SetDihedralDeg.
+
+    Params:
+        mol: Chem.Mol : peptide with the conformer (smi-built; same chi quads as prediction)
+        conf_id: int : conformer id to modify in place
+        chi_angles: list[list[float]] : per-residue chi angles from predict_chi
+    Returns:
+        None
+    """
+    conf = mol.GetConformer(conf_id)
+    for qs, angs in zip(sidechain_chi_quads(mol), chi_angles):
+        for q, a in zip(qs, angs):
+            rdMolTransforms.SetDihedralDeg(conf, *q, a)
 
 
 @torch.no_grad()
@@ -130,22 +194,29 @@ def seed_conformers(
     tol_omega: float = 60.0,
     seed: int = 0,
     device: str = "cpu",
+    chi_model: "ChiPredictor | None" = None,
+    chi_window: int = 2,
 ) -> list[int]:
     """
     Predict the dominant dihedrals and embed seed conformers via constrained DG.
+    Optionally also set predicted side-chain chi on each seed (separate chi model).
 
     Conformers are added to `mol` in place. Returns [] if the predicted dihedral
     set is geometrically infeasible (free ring-closure rejection).
 
     Params:
         mol: Chem.Mol : peptide with explicit Hs (modified in place)
-        model: DihedralPredictor : trained model
-        window: int : neighbour augmentation half-width (must match training)
+        model: DihedralPredictor : trained backbone model
+        window: int : backbone neighbour augmentation half-width (must match training)
         n_attempts: int : ETKDGv3 embedding attempts
         tol_phi_psi: float : phi/psi constraint half-width (deg)
         tol_omega: float : omega constraint half-width (deg)
         seed: int : RNG seed
         device: str : torch device
+        chi_model: ChiPredictor | None : optional separate chi predictor; when given,
+            its predicted chi are set on every embedded seed via SetDihedralDeg
+            (side-chain bonds are not ring-closure-constrained, so this is safe)
+        chi_window: int : neighbour window for the chi model (must match its training)
     Returns:
         list of conformer IDs added to mol
     """
@@ -153,4 +224,9 @@ def seed_conformers(
     bounds = make_bounds_phi_psi_omega(mol, phi, psi, omega, tol_phi_psi, tol_omega)
     if bounds is None:
         return []
-    return embed_constrained(mol, bounds, n_attempts=n_attempts, seed=seed)
+    conf_ids = embed_constrained(mol, bounds, n_attempts=n_attempts, seed=seed)
+    if chi_model is not None and conf_ids:
+        chi_angles = predict_chi(mol, chi_model, window=chi_window, device=device)
+        for cid in conf_ids:
+            apply_chi(mol, cid, chi_angles)
+    return conf_ids

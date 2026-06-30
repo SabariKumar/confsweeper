@@ -21,12 +21,14 @@ import numpy as np
 import torch
 
 from .residues import (
+    MAX_CHI,
     PHI_PSI_BINS,
     angle_to_bin,
     backbone_dihedral_values,
     neighbor_augment,
     omega_to_bin,
     residue_features,
+    sidechain_chi_values,
 )
 
 
@@ -48,14 +50,23 @@ def extract_record(mol, boltzmann_weights: np.ndarray) -> dict | None:
     if mol.GetNumConformers() != len(boltzmann_weights):
         return None
     dom = int(np.asarray(boltzmann_weights).argmax())
-    phi, psi, omega = backbone_dihedral_values(mol, mol.GetConformers()[dom].GetId())
+    dom_id = mol.GetConformers()[dom].GetId()
+    phi, psi, omega = backbone_dihedral_values(mol, dom_id)
     if len(phi) != n_res:
         return None
+    chi_deg, chi_mask = sidechain_chi_values(mol, dom_id)  # (n_res, MAX_CHI)
+    chi_bin = np.zeros((n_res, MAX_CHI), dtype=np.int64)
+    for i in range(n_res):
+        for k in range(MAX_CHI):
+            if chi_mask[i, k]:
+                chi_bin[i, k] = angle_to_bin(chi_deg[i, k])
     return {
         "feats": feats,
         "phi_bin": np.array([angle_to_bin(a) for a in phi], dtype=np.int64),
         "psi_bin": np.array([angle_to_bin(a) for a in psi], dtype=np.int64),
         "omega_bin": np.array([omega_to_bin(a) for a in omega], dtype=np.int64),
+        "chi_bin": chi_bin,
+        "chi_mask": chi_mask,
     }
 
 
@@ -85,7 +96,7 @@ def build_dataset(
     rows = list(csv.DictReader(open(summary_csv)))
     if limit:
         rows = rows[:limit]
-    seqs, feats, phi, psi, omega = [], [], [], [], []
+    seqs, feats, phi, psi, omega, chi, chi_mask = [], [], [], [], [], [], []
     n_skip = 0
     for r in rows:
         seq = r["sequence"]
@@ -102,6 +113,8 @@ def build_dataset(
             phi.append(rec["phi_bin"])
             psi.append(rec["psi_bin"])
             omega.append(rec["omega_bin"])
+            chi.append(rec["chi_bin"])
+            chi_mask.append(rec["chi_mask"])
         except Exception:  # noqa: BLE001
             n_skip += 1
 
@@ -120,8 +133,11 @@ def build_dataset(
         "phi_bin": phi,
         "psi_bin": psi,
         "omega_bin": omega,
+        "chi_bin": chi,
+        "chi_mask": chi_mask,
         "split": split,
         "phi_psi_bins": PHI_PSI_BINS,
+        "max_chi": MAX_CHI,
     }
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     with open(out_path, "wb") as fh:
@@ -151,6 +167,8 @@ class DihedralDataset(torch.utils.data.Dataset):
         self.phi = [data["phi_bin"][i] for i in idx]
         self.psi = [data["psi_bin"][i] for i in idx]
         self.omega = [data["omega_bin"][i] for i in idx]
+        self.chi = [data["chi_bin"][i] for i in idx]
+        self.chi_mask = [data["chi_mask"][i] for i in idx]
         self.seqs = [data["seqs"][i] for i in idx]
 
     def __len__(self) -> int:
@@ -163,6 +181,8 @@ class DihedralDataset(torch.utils.data.Dataset):
             "phi": torch.from_numpy(self.phi[i]),
             "psi": torch.from_numpy(self.psi[i]),
             "omega": torch.from_numpy(self.omega[i]),
+            "chi": torch.from_numpy(self.chi[i]),  # (n_res, MAX_CHI)
+            "chi_mask": torch.from_numpy(self.chi_mask[i]),  # (n_res, MAX_CHI) bool
         }
 
 
@@ -177,10 +197,13 @@ def collate(batch: list[dict]) -> dict:
     """
     L = max(b["x"].shape[0] for b in batch)
     B, F = len(batch), batch[0]["x"].shape[1]
+    n_chi = batch[0]["chi"].shape[1]
     x = torch.zeros(B, L, F)
     phi = torch.zeros(B, L, dtype=torch.long)
     psi = torch.zeros(B, L, dtype=torch.long)
     omega = torch.zeros(B, L, dtype=torch.long)
+    chi = torch.zeros(B, L, n_chi, dtype=torch.long)
+    chi_mask = torch.zeros(B, L, n_chi, dtype=torch.bool)
     mask = torch.zeros(B, L, dtype=torch.bool)
     for i, b in enumerate(batch):
         n = b["x"].shape[0]
@@ -188,8 +211,18 @@ def collate(batch: list[dict]) -> dict:
         phi[i, :n] = b["phi"]
         psi[i, :n] = b["psi"]
         omega[i, :n] = b["omega"]
+        chi[i, :n] = b["chi"]
+        chi_mask[i, :n] = b["chi_mask"]
         mask[i, :n] = True
-    return {"x": x, "phi": phi, "psi": psi, "omega": omega, "mask": mask}
+    return {
+        "x": x,
+        "phi": phi,
+        "psi": psi,
+        "omega": omega,
+        "chi": chi,
+        "chi_mask": chi_mask,
+        "mask": mask,
+    }
 
 
 def load_dataset(path: str) -> dict:

@@ -14,7 +14,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from .data import DihedralDataset, collate, load_dataset
-from .model import DihedralPredictor
+from .model import ChiPredictor, DihedralPredictor
 from .residues import PHI_PSI_BINS
 
 
@@ -189,4 +189,126 @@ def train(
                 f"om {m['omega_acc']:.2f} | pep_ok {m['peptide_all_ok']:.3f}{flag}"
             )
     print("best val:", {k: round(v, 3) for k, v in best.items()})
+    return best
+
+
+# --- side-chain chi predictor (separate model) --------------------------
+
+
+@torch.no_grad()
+def evaluate_chi(model, loader, device) -> dict:
+    """
+    Chi metrics over a loader: per-chi within-1-bin accuracy and the seeding proxy
+    chi_peptide_ok (fraction of peptides whose every present chi is within 1 bin).
+
+    Params:
+        model: ChiPredictor : the chi model
+        loader: DataLoader : eval data
+        device: torch.device : compute device
+    Returns:
+        dict of metrics
+    """
+    model.eval()
+    n_chi = n_pep = chi_w1 = pep_ok = 0
+    for b in loader:
+        x, mask = b["x"].to(device), b["mask"].to(device)
+        chi_t = b["chi"].to(device)  # (B, L, MAX_CHI)
+        cmask = b["chi_mask"].to(device) & mask.unsqueeze(-1)  # (B, L, MAX_CHI)
+        logits = model(x, mask)  # (B, L, MAX_CHI, bins)
+        pred = logits.argmax(-1)
+        w1 = (_bin_dist(pred, chi_t, PHI_PSI_BINS) <= 1) & cmask
+        chi_w1 += w1.sum().item()
+        n_chi += cmask.sum().item()
+        # per-peptide: all present chi within 1 bin
+        ok = (w1 | ~cmask).reshape(x.shape[0], -1).all(dim=1)
+        pep_ok += ok.sum().item()
+        n_pep += x.shape[0]
+    return {
+        "chi_within1": chi_w1 / max(n_chi, 1),
+        "chi_peptide_ok": pep_ok / n_pep,
+    }
+
+
+def train_chi(
+    dataset_path: str,
+    out_ckpt: str,
+    epochs: int = 50,
+    batch_size: int = 64,
+    lr: float = 3e-4,
+    d_model: int = 256,
+    n_layers: int = 6,
+    window: int = 2,
+    device: str = "cuda",
+) -> dict:
+    """
+    Train the SEPARATE side-chain chi predictor and checkpoint the best model
+    (by chi_peptide_ok). Independent of the backbone DihedralPredictor — no shared
+    weights — so backbone fidelity is unaffected.
+
+    Params:
+        dataset_path: str : dataset pickle from build_dataset (carries chi targets)
+        out_ckpt: str : output checkpoint path
+        epochs: int : training epochs
+        batch_size: int : batch size
+        lr: float : Adam learning rate
+        d_model: int : model width
+        n_layers: int : transformer layers
+        window: int : neighbour augmentation half-width
+        device: str : 'cuda' or 'cpu'
+    Returns:
+        dict of best validation metrics
+    """
+    import os
+
+    dev = torch.device(device if torch.cuda.is_available() else "cpu")
+    data = load_dataset(dataset_path)
+    tr = DihedralDataset(data, "train", window=window)
+    va = DihedralDataset(data, "val", window=window)
+    in_features = tr[0]["x"].shape[1]
+    tl = DataLoader(tr, batch_size=batch_size, shuffle=True, collate_fn=collate)
+    vl = DataLoader(va, batch_size=batch_size, collate_fn=collate)
+
+    model = ChiPredictor(in_features, d_model=d_model, n_layers=n_layers).to(dev)
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    best = {"chi_peptide_ok": -1.0}
+    for ep in range(epochs):
+        model.train()
+        tot = 0.0
+        for b in tl:
+            x, mask = b["x"].to(dev), b["mask"].to(dev)
+            chi_t = b["chi"].to(dev)
+            cmask = (b["chi_mask"].to(dev) & mask.unsqueeze(-1)).float()
+            logits = model(x, mask)
+            bins = logits.shape[-1]
+            loss = F.cross_entropy(
+                logits.reshape(-1, bins), chi_t.reshape(-1), reduction="none"
+            ).reshape(chi_t.shape)
+            loss = (loss * cmask).sum() / cmask.sum().clamp(min=1)
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+            tot += loss.item()
+        m = evaluate_chi(model, vl, dev)
+        flag = ""
+        if m["chi_peptide_ok"] > best["chi_peptide_ok"]:
+            best = m
+            os.makedirs(os.path.dirname(out_ckpt), exist_ok=True)
+            torch.save(
+                {
+                    "model": model.state_dict(),
+                    "in_features": in_features,
+                    "d_model": d_model,
+                    "n_layers": n_layers,
+                    "window": window,
+                    "metrics": m,
+                },
+                out_ckpt,
+            )
+            flag = " *"
+        if ep % 2 == 0 or flag:
+            print(
+                f"ep{ep:3d} loss {tot/len(tl):.3f} | "
+                f"chi_w1 {m['chi_within1']:.2f} | chi_pep_ok {m['chi_peptide_ok']:.3f}{flag}"
+            )
+    print("best chi val:", {k: round(v, 3) for k, v in best.items()})
     return best
